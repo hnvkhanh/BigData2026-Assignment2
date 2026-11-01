@@ -1,0 +1,2 @@
+# Optional official S2P2 implementation (EasyTPP), pinned for reproducibility.
+easy-tpp @ git+https://github.com/UCIDataLab/state_space_point_process.git@c3933240f16a22b43d80d09bda272475526ff24b

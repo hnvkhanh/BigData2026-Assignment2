@@ -1,9 +1,10 @@
-"""Train, backtest, and run a LightGBM baseline for weekly GitHub activity."""
+"""Train, backtest, and predict weekly GitHub activity with temporal models."""
 
 from __future__ import annotations
 
 import argparse
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -242,6 +243,51 @@ def predict_probabilities(
     return probabilities
 
 
+def load_s2p2_adapter() -> tuple[Any, Any]:
+    if __package__:
+        from .s2p2 import S2P2TemporalModel, select_device
+    else:
+        from s2p2 import S2P2TemporalModel, select_device
+    return S2P2TemporalModel, select_device
+
+
+def fit_temporal_model(
+    temporal_model: str,
+    train: pd.DataFrame,
+    histories: dict[str, pd.DataFrame],
+    feature_columns: list[str],
+    model_params: dict[str, int | float],
+    s2p2_params: dict[str, int],
+    device_name: str,
+) -> tuple[Any, Any]:
+    if temporal_model == "lightgbm":
+        return fit_models(train, feature_columns, model_params), None
+    if temporal_model != "s2p2":
+        raise ValueError(f"Unknown temporal model: {temporal_model}")
+
+    s2p2_class, select_s2p2_device = load_s2p2_adapter()
+    model = s2p2_class(
+        device=select_s2p2_device(device_name),
+        **s2p2_params,
+    )
+    return model.fit(train, histories), model
+
+
+def predict_temporal_probabilities(
+    temporal_model: str,
+    models: Any,
+    s2p2_model: Any,
+    frame: pd.DataFrame,
+    feature_columns: list[str],
+    histories: dict[str, pd.DataFrame],
+) -> dict[str, np.ndarray]:
+    if temporal_model == "lightgbm":
+        return predict_probabilities(models, frame, feature_columns)
+    if temporal_model == "s2p2":
+        return s2p2_model.predict(frame, histories)
+    raise ValueError(f"Unknown temporal model: {temporal_model}")
+
+
 def f1_score(y_true: np.ndarray, predicted: np.ndarray) -> float:
     tp = int(np.sum((y_true == 1) & (predicted == 1)))
     fp = int(np.sum((y_true == 0) & (predicted == 1)))
@@ -285,16 +331,21 @@ def chronological_splits(cutoffs: list[pd.Timestamp]) -> tuple[pd.Timestamp, pd.
 
 
 def save_models(
-    models: dict[str, lgb.LGBMClassifier | None],
+    models: Any,
     thresholds: dict[str, float],
     output_dir: Path,
     metadata: dict[str, Any],
+    temporal_model: str = "lightgbm",
+    s2p2_model: Any = None,
 ) -> None:
     model_dir = output_dir / "models"
     model_dir.mkdir(parents=True, exist_ok=True)
-    for label, model in models.items():
-        if model is not None:
-            model.booster_.save_model(str(model_dir / f"{label}.txt"))
+    if temporal_model == "s2p2":
+        s2p2_model.save(model_dir / "s2p2.pt")
+    else:
+        for label, model in models.items():
+            if model is not None:
+                model.booster_.save_model(str(model_dir / f"{label}.txt"))
     metadata["thresholds"] = thresholds
     (output_dir / "metadata.json").write_text(
         json.dumps(metadata, indent=2, default=str) + "\n",
@@ -302,13 +353,23 @@ def save_models(
     )
 
 
+def create_run_output_dir(command: str, temporal_model: str) -> Path:
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    output_dir = DEFAULT_OUTPUT_DIR / f"{command}_{temporal_model}_{timestamp}"
+    output_dir.mkdir(parents=True, exist_ok=False)
+    return output_dir
+
+
 def run_backtest(
     db_dir: Path,
     output_dir: Path,
     start_cutoff: pd.Timestamp,
     model_params: dict[str, int | float],
+    temporal_model: str = "lightgbm",
+    s2p2_params: dict[str, int] | None = None,
+    device_name: str = "auto",
 ) -> None:
-    data, _, _ = build_training_data(db_dir, start_cutoff)
+    data, histories, _ = build_training_data(db_dir, start_cutoff)
     unique_cutoffs = sorted(data["cutoff"].unique())
     cutoffs = [pd.Timestamp(value) for value in unique_cutoffs]
     train_end, calibration_end = chronological_splits(cutoffs)
@@ -324,9 +385,23 @@ def run_backtest(
         f"calibrate < {calibration_end.date()}, holdout >= {calibration_end.date()}"
     )
 
-    models = fit_models(train, feature_columns, model_params)
-    calibration_probabilities = predict_probabilities(
-        models, calibration, feature_columns
+    s2p2_options = s2p2_params or {}
+    models, s2p2_model = fit_temporal_model(
+        temporal_model,
+        train,
+        histories,
+        feature_columns,
+        model_params,
+        s2p2_options,
+        device_name,
+    )
+    calibration_probabilities = predict_temporal_probabilities(
+        temporal_model,
+        models,
+        s2p2_model,
+        calibration,
+        feature_columns,
+        histories,
     )
     thresholds = {
         label: choose_threshold(
@@ -335,7 +410,9 @@ def run_backtest(
         )
         for label in LABELS
     }
-    holdout_probabilities = predict_probabilities(models, holdout, feature_columns)
+    holdout_probabilities = predict_temporal_probabilities(
+        temporal_model, models, s2p2_model, holdout, feature_columns, histories
+    )
     results = evaluate_predictions(holdout, holdout_probabilities, thresholds)
     results["split"] = {
         "train_weeks": int(train["cutoff"].nunique()),
@@ -343,7 +420,14 @@ def run_backtest(
         "holdout_weeks": int(holdout["cutoff"].nunique()),
         "holdout_start": str(calibration_end),
     }
-    results["model_params"] = model_params
+    results["temporal_model"] = temporal_model
+    if temporal_model == "lightgbm":
+        results["model_params"] = model_params
+    else:
+        results["s2p2_params"] = {
+            **s2p2_options,
+            "device": str(s2p2_model.device),
+        }
 
     output_dir.mkdir(parents=True, exist_ok=True)
     (output_dir / "backtest_metrics.json").write_text(
@@ -362,6 +446,9 @@ def run_prediction(
     cutoff: pd.Timestamp,
     start_cutoff: pd.Timestamp,
     model_params: dict[str, int | float],
+    temporal_model: str = "lightgbm",
+    s2p2_params: dict[str, int] | None = None,
+    device_name: str = "auto",
 ) -> None:
     data, histories, cohort_user_ids = build_training_data(db_dir, start_cutoff)
     cutoffs = [pd.Timestamp(value) for value in sorted(data["cutoff"].unique())]
@@ -370,9 +457,23 @@ def run_prediction(
 
     train = data.loc[data["cutoff"] < train_end]
     calibration = data.loc[data["cutoff"] >= train_end]
-    models = fit_models(train, feature_columns, model_params)
-    calibration_probabilities = predict_probabilities(
-        models, calibration, feature_columns
+    s2p2_options = s2p2_params or {}
+    models, s2p2_model = fit_temporal_model(
+        temporal_model,
+        train,
+        histories,
+        feature_columns,
+        model_params,
+        s2p2_options,
+        device_name,
+    )
+    calibration_probabilities = predict_temporal_probabilities(
+        temporal_model,
+        models,
+        s2p2_model,
+        calibration,
+        feature_columns,
+        histories,
     )
     thresholds = {
         label: choose_threshold(
@@ -401,7 +502,14 @@ def run_prediction(
 
     inference = row_for_cutoff(cutoff, histories, cohort_user_ids)
     inference = inference.set_index("user_id").loc[internal_ids].reset_index()
-    probabilities = predict_probabilities(models, inference, feature_columns)
+    probabilities = predict_temporal_probabilities(
+        temporal_model,
+        models,
+        s2p2_model,
+        inference,
+        feature_columns,
+        histories,
+    )
     output = pd.DataFrame({USER_COLUMN: target_users[USER_COLUMN]})
     for label in LABELS:
         output[label] = (probabilities[label] >= thresholds[label]).astype("int8")
@@ -409,19 +517,29 @@ def run_prediction(
     output_dir.mkdir(parents=True, exist_ok=True)
     prediction_path = output_dir / "predictions.csv"
     output.to_csv(prediction_path, index=False)
+    metadata = {
+        "temporal_model": temporal_model,
+        "prediction_cutoff_utc": str(cutoff),
+        "training_start_cutoff_utc": str(start_cutoff),
+        "training_weeks": int(train["cutoff"].nunique()),
+        "calibration_weeks": int(calibration["cutoff"].nunique()),
+        "feature_columns": feature_columns,
+        "labels": list(LABELS),
+    }
+    if temporal_model == "lightgbm":
+        metadata["model_params"] = model_params
+    else:
+        metadata["s2p2_params"] = {
+            **s2p2_options,
+            "device": str(s2p2_model.device),
+        }
     save_models(
         models,
         thresholds,
         output_dir,
-        {
-            "prediction_cutoff_utc": str(cutoff),
-            "training_start_cutoff_utc": str(start_cutoff),
-            "training_weeks": int(train["cutoff"].nunique()),
-            "calibration_weeks": int(calibration["cutoff"].nunique()),
-            "feature_columns": feature_columns,
-            "labels": list(LABELS),
-            "model_params": model_params,
-        },
+        metadata,
+        temporal_model,
+        s2p2_model,
     )
     print(f"Saved predictions for {len(output):,} users to {prediction_path}")
     print(f"Saved model files and thresholds to {output_dir}")
@@ -434,7 +552,31 @@ def parse_args() -> argparse.Namespace:
     for command in ("backtest", "predict"):
         subparser = subparsers.add_parser(command)
         subparser.add_argument("--db-dir", type=Path, default=DEFAULT_DB_DIR)
-        subparser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
+        subparser.add_argument(
+            "--output-dir",
+            type=Path,
+            default=None,
+            help="output folder (default: a new timestamped folder under outputs/)",
+        )
+        subparser.add_argument(
+            "--temporal-model",
+            choices=("lightgbm", "s2p2"),
+            default="lightgbm",
+            help="temporal feature model; S2P2 requires its optional dependencies",
+        )
+        subparser.add_argument(
+            "--device",
+            choices=("auto", "cpu", "cuda"),
+            default="auto",
+            help="S2P2 device; auto selects the least-loaded CUDA GPU or CPU",
+        )
+        subparser.add_argument("--s2p2-epochs", type=int, default=3)
+        subparser.add_argument("--s2p2-batch-size", type=int, default=128)
+        subparser.add_argument("--s2p2-max-sequence-length", type=int, default=128)
+        subparser.add_argument("--s2p2-hidden-size", type=int, default=32)
+        subparser.add_argument("--s2p2-state-size", type=int, default=8)
+        subparser.add_argument("--s2p2-num-layers", type=int, default=2)
+        subparser.add_argument("--s2p2-integral-samples", type=int, default=8)
         subparser.add_argument(
             "--start-cutoff",
             type=pd.Timestamp,
@@ -461,6 +603,9 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    output_dir = args.output_dir or create_run_output_dir(
+        args.command, args.temporal_model
+    )
     model_params: dict[str, int | float] = {
         "n_estimators": args.n_estimators,
         "learning_rate": args.learning_rate,
@@ -471,16 +616,36 @@ def main() -> None:
         "colsample_bytree": args.colsample_bytree,
         "reg_lambda": args.reg_lambda,
     }
+    s2p2_params = {
+        "epochs": args.s2p2_epochs,
+        "batch_size": args.s2p2_batch_size,
+        "max_sequence_length": args.s2p2_max_sequence_length,
+        "hidden_size": args.s2p2_hidden_size,
+        "state_size": args.s2p2_state_size,
+        "num_layers": args.s2p2_num_layers,
+        "integral_samples": args.s2p2_integral_samples,
+    }
     if args.command == "backtest":
-        run_backtest(args.db_dir, args.output_dir, args.start_cutoff, model_params)
+        run_backtest(
+            args.db_dir,
+            output_dir,
+            args.start_cutoff,
+            model_params,
+            args.temporal_model,
+            s2p2_params,
+            args.device,
+        )
     else:
         run_prediction(
             args.db_dir,
             args.test_input,
-            args.output_dir,
+            output_dir,
             args.cutoff,
             args.start_cutoff,
             model_params,
+            args.temporal_model,
+            s2p2_params,
+            args.device,
         )
 
 
