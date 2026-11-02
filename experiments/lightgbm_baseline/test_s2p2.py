@@ -144,7 +144,10 @@ class CliTests(unittest.TestCase):
             capture_output=True,
             text=True,
         )
-        self.assertIn("--temporal-model {lightgbm,s2p2}", result.stdout)
+        self.assertIn(
+            "--temporal-model {lightgbm,frequency_nn,s2p2}", result.stdout
+        )
+        self.assertIn("--nn-output-mode {per_label,multi_label}", result.stdout)
         self.assertIn("--device {auto,cpu,cuda}", result.stdout)
 
     def test_default_run_directories_are_timestamped_and_unique(self) -> None:

@@ -2,19 +2,248 @@ from __future__ import annotations
 
 import unittest
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
+import joblib
 import pandas as pd
 
 from experiments.lightgbm_baseline.run import (
     _lifecycle_history,
+    LABELS,
+    LOOKBACK_DAYS,
+    fit_frequency_nn_models,
+    frequency_feature_columns,
     load_histories,
+    predict_frequency_nn_probabilities,
     row_for_cutoff,
+    save_models,
     training_data_before,
 )
 
 
 class LifecycleFeatureTests(unittest.TestCase):
+    def test_frequency_nn_uses_only_frequency_inputs_and_returns_probabilities(self) -> None:
+        feature_columns = [
+            f"{label}_frequency_per_day_{days}d"
+            for days in LOOKBACK_DAYS
+            for label in LABELS
+        ]
+        columns = ["user_id", "cutoff", *LABELS, *feature_columns]
+        selected_features = frequency_feature_columns(columns)
+        self.assertEqual(selected_features, feature_columns)
+        self.assertNotIn("user_id", selected_features)
+        self.assertFalse(any(label in selected_features for label in LABELS))
+
+        train = pd.DataFrame(
+            {
+                column: [float((row + index) % 5) for row in range(24)]
+                for index, column in enumerate(feature_columns)
+            }
+        )
+        for label_index, label in enumerate(LABELS):
+            train[label] = [(row + label_index) % 2 for row in range(24)]
+
+        models = fit_frequency_nn_models(train, selected_features)
+        probabilities = predict_frequency_nn_probabilities(
+            models, train, selected_features
+        )
+
+        self.assertEqual(set(probabilities), set(LABELS))
+        for values in probabilities.values():
+            self.assertEqual(values.shape, (24,))
+            self.assertTrue(((values >= 0) & (values <= 1)).all())
+
+    def test_frequency_nn_can_share_one_six_label_output_layer(self) -> None:
+        feature_columns = [
+            f"{label}_frequency_per_day_{days}d"
+            for days in LOOKBACK_DAYS
+            for label in LABELS
+        ]
+        train = pd.DataFrame(
+            {
+                column: [float((row + index) % 5) for row in range(24)]
+                for index, column in enumerate(feature_columns)
+            }
+        )
+        for label_index, label in enumerate(LABELS):
+            train[label] = [(row + label_index) % 2 for row in range(24)]
+
+        model = fit_frequency_nn_models(train, feature_columns, "multi_label")
+        probabilities = predict_frequency_nn_probabilities(
+            model, train, feature_columns, "multi_label"
+        )
+
+        self.assertEqual(set(probabilities), set(LABELS))
+        for values in probabilities.values():
+            self.assertEqual(values.shape, (24,))
+            self.assertTrue(((values >= 0) & (values <= 1)).all())
+
+        with TemporaryDirectory() as temporary_dir:
+            output_dir = Path(temporary_dir)
+            save_models(
+                model,
+                {},
+                output_dir,
+                {},
+                temporal_model="frequency_nn",
+                nn_output_mode="multi_label",
+            )
+            saved_model = joblib.load(
+                output_dir / "models" / "frequency_nn_multilabel.joblib"
+            )
+            saved_probabilities = predict_frequency_nn_probabilities(
+                saved_model, train, feature_columns, "multi_label"
+            )
+        for label in LABELS:
+            self.assertEqual(
+                probabilities[label].tolist(), saved_probabilities[label].tolist()
+            )
+
+    def test_action_totals_shares_and_frequencies_are_cutoff_safe(self) -> None:
+        cutoff = pd.Timestamp("2024-04-01")
+        histories = {
+            label: pd.DataFrame(
+                {
+                    "user_id": [7] * len(action_dates),
+                    "repo_id": [1] * len(action_dates),
+                    "action_at": pd.to_datetime(action_dates),
+                    "available_at": pd.to_datetime(available_dates),
+                }
+            )
+            for label, action_dates, available_dates in (
+                (
+                    "open_pr",
+                    ["2024-03-01"],
+                    ["2024-03-01"],
+                ),
+                (
+                    "open_issue",
+                    [],
+                    [],
+                ),
+                (
+                    "issue_comment",
+                    ["2024-02-01", "2024-02-15"],
+                    ["2024-02-01", "2024-02-15"],
+                ),
+                (
+                    "pr_review",
+                    [],
+                    [],
+                ),
+                (
+                    "pr_review_comment",
+                    [],
+                    [],
+                ),
+                (
+                    "push",
+                    [
+                        "2024-03-10",
+                        "2024-03-11",
+                        "2024-03-12",
+                        "2024-03-20",
+                    ],
+                    [
+                        "2024-03-10",
+                        "2024-03-11",
+                        "2024-03-12",
+                        "2024-04-02",
+                    ],
+                ),
+            )
+        }
+
+        features = row_for_cutoff(cutoff, histories, [7, 8]).set_index("user_id")
+
+        self.assertEqual(int(features.loc[7, "total_actions_count_90d"]), 6)
+        self.assertAlmostEqual(float(features.loc[7, "push_share_90d"]), 0.5)
+        self.assertAlmostEqual(float(features.loc[7, "open_pr_share_90d"]), 1 / 6)
+        self.assertAlmostEqual(
+            float(features.loc[7, "issue_comment_share_90d"]), 2 / 6
+        )
+        self.assertAlmostEqual(
+            float(features.loc[7, "push_frequency_per_day_90d"]), 3 / 90
+        )
+        self.assertEqual(int(features.loc[8, "total_actions_count_90d"]), 0)
+        self.assertEqual(float(features.loc[8, "push_share_90d"]), 0.0)
+        self.assertEqual(
+            float(features.loc[8, "push_frequency_per_day_90d"]), 0.0
+        )
+
+    def test_median_daily_activity_includes_zero_days_and_respects_availability(self) -> None:
+        cutoff = pd.Timestamp("2024-04-08")
+        histories = {
+            "push": pd.DataFrame(
+                {
+                    "user_id": [7] * 5,
+                    "repo_id": [1] * 5,
+                    "action_at": pd.to_datetime(
+                        [
+                            "2024-04-01",
+                            "2024-04-02",
+                            "2024-04-03",
+                            "2024-04-04",
+                            "2024-04-07",
+                        ]
+                    ),
+                    "available_at": pd.to_datetime(
+                        [
+                            "2024-04-01",
+                            "2024-04-02",
+                            "2024-04-03",
+                            "2024-04-04",
+                            "2024-04-09",
+                        ]
+                    ),
+                }
+            ),
+            "issue_comment": pd.DataFrame(
+                {
+                    "user_id": [7] * 8,
+                    "repo_id": [1] * 8,
+                    "action_at": pd.to_datetime(
+                        [
+                            "2024-04-04",
+                            "2024-04-04",
+                            "2024-04-05",
+                            "2024-04-05",
+                            "2024-04-06",
+                            "2024-04-06",
+                            "2024-04-07",
+                            "2024-04-07",
+                        ]
+                    ),
+                    "available_at": pd.to_datetime(
+                        [
+                            "2024-04-04",
+                            "2024-04-04",
+                            "2024-04-05",
+                            "2024-04-05",
+                            "2024-04-06",
+                            "2024-04-06",
+                            "2024-04-07",
+                            "2024-04-07",
+                        ]
+                    ),
+                }
+            ),
+        }
+
+        features = row_for_cutoff(cutoff, histories, [7, 8]).set_index("user_id")
+
+        self.assertEqual(
+            float(features.loc[7, "push_median_actions_per_day_7d"]), 1.0
+        )
+        self.assertEqual(
+            float(features.loc[7, "issue_comment_median_actions_per_day_7d"]), 2.0
+        )
+        self.assertEqual(
+            float(features.loc[7, "total_median_actions_per_day_7d"]), 2.0
+        )
+        self.assertEqual(float(features.loc[8, "total_median_actions_per_day_7d"]), 0)
+
     def test_lifecycle_events_require_event_and_row_availability_before_cutoff(self) -> None:
         raw = pd.DataFrame(
             {

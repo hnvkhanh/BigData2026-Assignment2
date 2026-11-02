@@ -15,6 +15,8 @@ features.
   contains the temporal tabular baseline:
   - **LightGBM** is the default model. It trains one binary classifier for each
     of the six labels.
+  - **frequency_nn** is a small neural network that uses only per-action
+    frequencies to predict all six labels; it never uses user IDs as inputs.
   - **S2P2** is an optional marked temporal point-process model, provided
     through the pinned EasyTPP dependency.
 - [`experiments/relgt/`](./experiments/relgt/README.md) contains a compact,
@@ -26,7 +28,9 @@ The temporal experiments use chronological training/calibration/holdout
 periods rather than random row splits. Prediction runs train and calibrate only
 on examples whose complete seven-day label window ends by the requested
 prediction cutoff. Feature snapshots also exclude actions, rows, and lifecycle
-transitions that were not yet available at each historical cutoff.
+transitions that were not yet available at each historical cutoff. LightGBM
+also uses per-action and combined median daily activity counts over its
+lookback windows; inactive days count as zero.
 
 ## Setup
 
@@ -61,6 +65,17 @@ Select S2P2 instead:
 ```powershell
 python experiments/lightgbm_baseline/run.py backtest --temporal-model s2p2
 ```
+
+Run the frequency-only neural network:
+
+```powershell
+python experiments/lightgbm_baseline/run.py backtest --temporal-model frequency_nn
+python experiments/lightgbm_baseline/run.py backtest --temporal-model frequency_nn --nn-output-mode multi_label
+```
+
+By default, it trains six classifiers; `--nn-output-mode multi_label` trains
+one network that predicts a six-label probability vector. Its prediction run
+also saves probabilities in `probabilities.csv`.
 
 Run RelGT, or combine it with S2P2, LightGBM, or both:
 

@@ -1,11 +1,11 @@
 # Temporal activity models
 
-This experiment supports two selectable temporal models for the six weekly
-activity labels: LightGBM (the default) and S2P2, the state-space marked temporal
-point process from UCI DataLab's EasyTPP repository. Both use historical
-user-week examples and chronological validation. Historical user-week rows are
-restricted to users with at least five recorded activity rows in the preceding
-90 days, matching the test-list activity filter.
+This experiment supports LightGBM (the default), a frequency-only neural
+network, and S2P2, the state-space marked temporal point process from UCI
+DataLab's EasyTPP repository. All predict the six weekly activity labels using
+historical user-week examples and chronological validation. Historical
+user-week rows are restricted to users with at least five recorded activity
+rows in the preceding 90 days, matching the test-list activity filter.
 
 ## Setup
 
@@ -43,6 +43,30 @@ python experiments/lightgbm_baseline/run.py backtest \
   --s2p2-epochs 3 --output-dir experiments/lightgbm_baseline/outputs/s2p2
 ```
 
+Choose the small neural network with:
+
+```bash
+python experiments/lightgbm_baseline/run.py backtest \
+  --temporal-model frequency_nn
+```
+
+The network has one 32-unit hidden layer and trains one binary classifier per
+activity label. It receives only per-action daily frequencies over the 7-, 30-,
+90-, and 365-day windows; user IDs, counts, shares, and other features are
+excluded. Training, calibration, and holdout remain chronological. By default,
+it trains six separate classifiers. To train one network with a shared hidden
+layer and a six-value output vector instead, use:
+
+```bash
+python experiments/lightgbm_baseline/run.py backtest \
+  --temporal-model frequency_nn --nn-output-mode multi_label
+```
+
+The same option is available for `predict`. Each output value is the
+probability for one activity label; calibration thresholds turn those
+probabilities into the six binary predictions. The single model is saved as
+`models/frequency_nn_multilabel.joblib`.
+
 The script uses weekly forecast cutoffs beginning on 2026-03-01. It trains on the
 oldest 70% of weeks, selects per-label F1 thresholds on the next 15%, and reports
 the untouched final 15% holdout. Metrics are written to
@@ -75,6 +99,22 @@ Change one or two settings at a time, keep the same cutoff/data/split, and use
 the chronological holdout only for comparing a small number of final candidates.
 Repeatedly tuning to that holdout can overfit it.
 
+## Export LightGBM holdout failures
+
+From the repository root, run:
+
+```bash
+python exam_fail_case.py
+```
+
+The script uses the same chronological train/calibration/holdout split as the
+LightGBM backtest. It saves holdout metrics and `failure_cases.csv` under a new
+timestamped folder in `experiments/lightgbm_baseline/outputs/`. The CSV has one
+row per misclassified user-week-label, including actual/predicted values,
+probability, threshold, failure type, user IDs, cutoff, and feature values.
+Override the output folder or LightGBM parameters with the script's CLI flags.
+Failure interpretation is intentionally left as a TODO in the script.
+
 Supported LightGBM options are `--n-estimators`, `--learning-rate`,
 `--num-leaves`, `--min-child-samples`, `--subsample`, `--colsample-bytree`,
 and `--reg-lambda`. The baseline defaults are 300, 0.03, 15, 40, 0.85, 0.85,
@@ -82,6 +122,21 @@ and 2.0 respectively. Row subsampling is enabled with a sampling frequency of 1.
 S2P2 options are `--s2p2-epochs`, `--s2p2-batch-size`,
 `--s2p2-max-sequence-length`, `--s2p2-hidden-size`, `--s2p2-state-size`,
 `--s2p2-num-layers`, and `--s2p2-integral-samples`.
+
+For each historical cutoff, LightGBM also receives total action counts across
+the six activity types for the preceding 7, 30, 90, and 365 days. For each
+period, it receives each action's share of that total and its per-day frequency
+(count divided by the period length). Shares are zero when the user has no
+actions in that window. These features use only actions available before the
+cutoff and are included automatically in LightGBM training, prediction, and
+RelGT+LightGBM ensembles.
+
+LightGBM also receives each action's median daily count and the combined
+median daily count across all six actions for those same lookback windows.
+These medians include zero-activity days, use complete 24-hour bins anchored to
+the prediction cutoff, and exclude events or rows unavailable at that cutoff.
+The frequency-only neural network continues to use only its per-action daily
+frequency inputs.
 
 S2P2 represents each user's six activity types as marked events. It trains on
 historical sequences containing the prior 90-day context and the labeled
@@ -112,6 +167,20 @@ python experiments/lightgbm_baseline/run.py predict \
   --temporal-model s2p2 --device auto \
   --output-dir experiments/lightgbm_baseline/outputs/s2p2_prediction
 ```
+
+To generate neural-network predictions and probabilities:
+
+```bash
+python experiments/lightgbm_baseline/run.py predict \
+  --temporal-model frequency_nn
+```
+
+For one six-output neural network, add `--nn-output-mode multi_label`.
+
+This writes evaluator-format binary labels to `predictions.csv` and per-label
+probabilities to `probabilities.csv`. The six trained models are saved as
+`models/<label>.joblib`; multi-label mode saves one
+`models/frequency_nn_multilabel.joblib` model instead.
 
 For S2P2, the model file is `models/s2p2.pt`. The default LightGBM model choice
 remains unchanged.

@@ -11,6 +11,9 @@ from typing import Any
 import lightgbm as lgb
 import numpy as np
 import pandas as pd
+from sklearn.neural_network import MLPClassifier
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -143,6 +146,34 @@ def _lifecycle_history(
     ).reset_index(drop=True)
 
 
+def _median_daily_count(
+    daily_counts: pd.Series,
+    days: int,
+    user_ids: list[int],
+) -> np.ndarray:
+    medians = np.zeros(len(user_ids), dtype=np.float32)
+    user_positions = {user_id: index for index, user_id in enumerate(user_ids)}
+
+    for user_id, counts in daily_counts.groupby(level="user_id"):
+        sorted_counts = np.sort(counts.to_numpy(dtype=np.int32))
+        zero_days = days - len(sorted_counts)
+        lower_index = (days - 1) // 2
+        upper_index = days // 2
+        lower = (
+            0
+            if lower_index < zero_days
+            else sorted_counts[lower_index - zero_days]
+        )
+        upper = (
+            0
+            if upper_index < zero_days
+            else sorted_counts[upper_index - zero_days]
+        )
+        medians[user_positions[int(user_id)]] = (lower + upper) / 2
+
+    return medians
+
+
 def row_for_cutoff(
     cutoff: pd.Timestamp,
     histories: dict[str, pd.DataFrame],
@@ -151,6 +182,12 @@ def row_for_cutoff(
     """Create one feature row per user using only rows available before cutoff."""
     feature_values: dict[str, object] = {"user_id": user_ids}
     user_index = pd.Index(user_ids)
+    action_counts: dict[str, dict[int, np.ndarray]] = {
+        label: {} for label in LABELS
+    }
+    daily_action_counts: dict[str, dict[int, pd.Series]] = {
+        label: {} for label in LABELS
+    }
     for label, history in histories.items():
         known = history.loc[
             (history["available_at"] < cutoff)
@@ -162,7 +199,22 @@ def row_for_cutoff(
                 known["action_at"] >= cutoff - pd.Timedelta(days=days)
             ]
             counts = window.groupby("user_id").size().reindex(user_index, fill_value=0)
-            feature_values[f"{label}_count_{days}d"] = counts.to_numpy(dtype=np.int32)
+            count_values = counts.to_numpy(dtype=np.int32)
+            feature_values[f"{label}_count_{days}d"] = count_values
+            if label in action_counts:
+                action_counts[label][days] = count_values
+                day_bins = np.floor(
+                    np.nextafter(
+                        (cutoff - window["action_at"]).dt.total_seconds().to_numpy()
+                        / 86_400,
+                        -np.inf,
+                    )
+                ).astype(np.int16)
+                daily_action_counts[label][days] = (
+                    window.assign(_day_bin=day_bins)
+                    .groupby(["user_id", "_day_bin"])
+                    .size()
+                )
 
         recent = known.loc[
             known["action_at"] >= cutoff - pd.Timedelta(days=90)
@@ -188,6 +240,58 @@ def row_for_cutoff(
         recency = (cutoff - last_action).dt.total_seconds() / 86_400
         feature_values[f"{label}_days_since_last"] = (
             recency.fillna(3660).clip(upper=3660).to_numpy(dtype=np.float32)
+        )
+
+    for days in LOOKBACK_DAYS:
+        counts_by_action = {
+            label: action_counts[label].get(
+                days, np.zeros(len(user_ids), dtype=np.int32)
+            )
+            for label in LABELS
+        }
+        total_actions = np.sum(
+            list(counts_by_action.values()), axis=0, dtype=np.int64
+        )
+        feature_values[f"total_actions_count_{days}d"] = total_actions
+        total_daily_counts: pd.Series | None = None
+        for label, counts in counts_by_action.items():
+            feature_values[f"{label}_share_{days}d"] = np.divide(
+                counts,
+                total_actions,
+                out=np.zeros(len(user_ids), dtype=np.float32),
+                where=total_actions > 0,
+            )
+            feature_values[f"{label}_frequency_per_day_{days}d"] = (
+                counts.astype(np.float32) / float(days)
+            )
+            daily_counts = daily_action_counts[label].get(days)
+            if daily_counts is not None:
+                total_daily_counts = (
+                    daily_counts
+                    if total_daily_counts is None
+                    else total_daily_counts.add(daily_counts, fill_value=0)
+                )
+            action_daily_counts = daily_action_counts[label].get(days)
+            if action_daily_counts is None:
+                action_daily_counts = pd.Series(
+                    dtype=np.int64,
+                    index=pd.MultiIndex.from_arrays(
+                        [[], []], names=["user_id", "_day_bin"]
+                    ),
+                )
+            feature_values[f"{label}_median_actions_per_day_{days}d"] = (
+                _median_daily_count(action_daily_counts, days, user_ids)
+            )
+
+        if total_daily_counts is None:
+            total_daily_counts = pd.Series(
+                dtype=np.int64,
+                index=pd.MultiIndex.from_arrays(
+                    [[], []], names=["user_id", "_day_bin"]
+                ),
+            )
+        feature_values[f"total_median_actions_per_day_{days}d"] = (
+            _median_daily_count(total_daily_counts, days, user_ids)
         )
 
     feature_values["cutoff"] = cutoff
@@ -276,6 +380,19 @@ def choose_threshold(y_true: np.ndarray, probabilities: np.ndarray) -> float:
     return float(candidates[int(np.argmax(scores))])
 
 
+def frequency_feature_columns(columns: list[str]) -> list[str]:
+    """Return only the per-action frequencies, excluding identifiers and labels."""
+    expected = [
+        f"{label}_frequency_per_day_{days}d"
+        for days in LOOKBACK_DAYS
+        for label in LABELS
+    ]
+    missing = [column for column in expected if column not in columns]
+    if missing:
+        raise ValueError(f"Missing frequency features: {', '.join(missing)}")
+    return expected
+
+
 def fit_models(
     train: pd.DataFrame,
     feature_columns: list[str],
@@ -303,6 +420,94 @@ def fit_models(
         print(f"{label}: trained on {int(y_train.sum()):,} positive rows.")
 
     return models
+
+
+def fit_frequency_nn_models(
+    train: pd.DataFrame,
+    feature_columns: list[str],
+    output_mode: str = "per_label",
+) -> Any:
+    """Fit frequency-only neural classifiers with separate or shared outputs."""
+    if output_mode not in {"per_label", "multi_label"}:
+        raise ValueError(f"Unknown frequency NN output mode: {output_mode}")
+
+    x_train = train[feature_columns]
+    if output_mode == "multi_label":
+        model = make_pipeline(
+            StandardScaler(),
+            MLPClassifier(
+                hidden_layer_sizes=(32,),
+                activation="relu",
+                solver="adam",
+                alpha=1e-4,
+                batch_size=min(256, len(train)),
+                learning_rate_init=1e-3,
+                max_iter=100,
+                random_state=42,
+                early_stopping=False,
+            ),
+        )
+        model.fit(x_train, train[list(LABELS)].to_numpy(dtype=np.int8))
+        print("Trained one frequency NN with a six-label output vector.")
+        return model
+
+    models: dict[str, Any] = {}
+
+    for label in LABELS:
+        y_train = train[label]
+        if y_train.nunique() < 2:
+            models[label] = None
+            print(f"{label}: only one class in training data; using constant predictions.")
+            continue
+
+        model = make_pipeline(
+            StandardScaler(),
+            MLPClassifier(
+                hidden_layer_sizes=(32,),
+                activation="relu",
+                solver="adam",
+                alpha=1e-4,
+                batch_size=min(256, len(train)),
+                learning_rate_init=1e-3,
+                max_iter=100,
+                random_state=42,
+                early_stopping=False,
+            ),
+        )
+        model.fit(x_train, y_train)
+        models[label] = model
+        print(f"{label}: trained frequency NN on {int(y_train.sum()):,} positive rows.")
+
+    return models
+
+
+def predict_frequency_nn_probabilities(
+    models: Any,
+    frame: pd.DataFrame,
+    feature_columns: list[str],
+    output_mode: str = "per_label",
+) -> dict[str, np.ndarray]:
+    if output_mode == "multi_label":
+        values = models.predict_proba(frame[feature_columns])
+        if values.shape != (len(frame), len(LABELS)):
+            raise ValueError(
+                "Multi-label frequency NN returned probabilities with shape "
+                f"{values.shape}; expected {(len(frame), len(LABELS))}."
+            )
+        return {label: values[:, index] for index, label in enumerate(LABELS)}
+    if output_mode != "per_label":
+        raise ValueError(f"Unknown frequency NN output mode: {output_mode}")
+
+    probabilities = {}
+    for label, model in models.items():
+        if model is None:
+            probabilities[label] = np.zeros(len(frame), dtype=np.float32)
+        else:
+            positive_index = list(model.classes_).index(1)
+            probabilities[label] = model.predict_proba(frame[feature_columns])[
+                :, positive_index
+            ]
+    return probabilities
 
 
 def predict_probabilities(
@@ -335,9 +540,14 @@ def fit_temporal_model(
     model_params: dict[str, int | float],
     s2p2_params: dict[str, int],
     device_name: str,
+    nn_output_mode: str = "per_label",
 ) -> tuple[Any, Any]:
     if temporal_model == "lightgbm":
         return fit_models(train, feature_columns, model_params), None
+    if temporal_model == "frequency_nn":
+        return fit_frequency_nn_models(
+            train, feature_columns, nn_output_mode
+        ), None
     if temporal_model != "s2p2":
         raise ValueError(f"Unknown temporal model: {temporal_model}")
 
@@ -356,9 +566,14 @@ def predict_temporal_probabilities(
     frame: pd.DataFrame,
     feature_columns: list[str],
     histories: dict[str, pd.DataFrame],
+    nn_output_mode: str = "per_label",
 ) -> dict[str, np.ndarray]:
     if temporal_model == "lightgbm":
         return predict_probabilities(models, frame, feature_columns)
+    if temporal_model == "frequency_nn":
+        return predict_frequency_nn_probabilities(
+            models, frame, feature_columns, nn_output_mode
+        )
     if temporal_model == "s2p2":
         return s2p2_model.predict(frame, histories)
     raise ValueError(f"Unknown temporal model: {temporal_model}")
@@ -413,11 +628,21 @@ def save_models(
     metadata: dict[str, Any],
     temporal_model: str = "lightgbm",
     s2p2_model: Any = None,
+    nn_output_mode: str = "per_label",
 ) -> None:
     model_dir = output_dir / "models"
     model_dir.mkdir(parents=True, exist_ok=True)
     if temporal_model == "s2p2":
         s2p2_model.save(model_dir / "s2p2.pt")
+    elif temporal_model == "frequency_nn":
+        import joblib
+
+        if nn_output_mode == "multi_label":
+            joblib.dump(models, model_dir / "frequency_nn_multilabel.joblib")
+        else:
+            for label, model in models.items():
+                if model is not None:
+                    joblib.dump(model, model_dir / f"{label}.joblib")
     else:
         for label, model in models.items():
             if model is not None:
@@ -444,12 +669,15 @@ def run_backtest(
     temporal_model: str = "lightgbm",
     s2p2_params: dict[str, int] | None = None,
     device_name: str = "auto",
+    nn_output_mode: str = "per_label",
 ) -> None:
     data, histories, _ = build_training_data(db_dir, start_cutoff)
     unique_cutoffs = sorted(data["cutoff"].unique())
     cutoffs = [pd.Timestamp(value) for value in unique_cutoffs]
     train_end, calibration_end = chronological_splits(cutoffs)
     feature_columns = [column for column in data.columns if column not in {"user_id", "cutoff", *LABELS}]
+    if temporal_model == "frequency_nn":
+        feature_columns = frequency_feature_columns(feature_columns)
 
     train = data.loc[data["cutoff"] < train_end]
     calibration = data.loc[
@@ -470,6 +698,7 @@ def run_backtest(
         model_params,
         s2p2_options,
         device_name,
+        nn_output_mode,
     )
     calibration_probabilities = predict_temporal_probabilities(
         temporal_model,
@@ -478,6 +707,7 @@ def run_backtest(
         calibration,
         feature_columns,
         histories,
+        nn_output_mode,
     )
     thresholds = {
         label: choose_threshold(
@@ -487,7 +717,13 @@ def run_backtest(
         for label in LABELS
     }
     holdout_probabilities = predict_temporal_probabilities(
-        temporal_model, models, s2p2_model, holdout, feature_columns, histories
+        temporal_model,
+        models,
+        s2p2_model,
+        holdout,
+        feature_columns,
+        histories,
+        nn_output_mode,
     )
     results = evaluate_predictions(holdout, holdout_probabilities, thresholds)
     results["split"] = {
@@ -499,6 +735,18 @@ def run_backtest(
     results["temporal_model"] = temporal_model
     if temporal_model == "lightgbm":
         results["model_params"] = model_params
+    elif temporal_model == "frequency_nn":
+        results["model_params"] = {
+            "architecture": [
+                len(feature_columns),
+                32,
+                len(LABELS) if nn_output_mode == "multi_label" else 1,
+            ],
+            "output_mode": nn_output_mode,
+            "input_features": "per-action daily frequencies over 7, 30, 90, and 365 days only",
+            "user_id_used_as_feature": False,
+            "max_iter": 100,
+        }
     else:
         results["s2p2_params"] = {
             **s2p2_options,
@@ -525,12 +773,15 @@ def run_prediction(
     temporal_model: str = "lightgbm",
     s2p2_params: dict[str, int] | None = None,
     device_name: str = "auto",
+    nn_output_mode: str = "per_label",
 ) -> None:
     data, histories, cohort_user_ids = build_training_data(db_dir, start_cutoff)
     data = training_data_before(data, cutoff)
     cutoffs = [pd.Timestamp(value) for value in sorted(data["cutoff"].unique())]
     train_end, _ = chronological_splits(cutoffs)
     feature_columns = [column for column in data.columns if column not in {"user_id", "cutoff", *LABELS}]
+    if temporal_model == "frequency_nn":
+        feature_columns = frequency_feature_columns(feature_columns)
 
     train = data.loc[data["cutoff"] < train_end]
     calibration = data.loc[data["cutoff"] >= train_end]
@@ -543,6 +794,7 @@ def run_prediction(
         model_params,
         s2p2_options,
         device_name,
+        nn_output_mode,
     )
     calibration_probabilities = predict_temporal_probabilities(
         temporal_model,
@@ -551,6 +803,7 @@ def run_prediction(
         calibration,
         feature_columns,
         histories,
+        nn_output_mode,
     )
     thresholds = {
         label: choose_threshold(
@@ -586,6 +839,7 @@ def run_prediction(
         inference,
         feature_columns,
         histories,
+        nn_output_mode,
     )
     output = pd.DataFrame({USER_COLUMN: target_users[USER_COLUMN]})
     for label in LABELS:
@@ -594,6 +848,11 @@ def run_prediction(
     output_dir.mkdir(parents=True, exist_ok=True)
     prediction_path = output_dir / "predictions.csv"
     output.to_csv(prediction_path, index=False)
+    if temporal_model == "frequency_nn":
+        probability_output = pd.DataFrame({USER_COLUMN: target_users[USER_COLUMN]})
+        for label in LABELS:
+            probability_output[label] = probabilities[label]
+        probability_output.to_csv(output_dir / "probabilities.csv", index=False)
     metadata = {
         "temporal_model": temporal_model,
         "prediction_cutoff_utc": str(cutoff),
@@ -605,6 +864,18 @@ def run_prediction(
     }
     if temporal_model == "lightgbm":
         metadata["model_params"] = model_params
+    elif temporal_model == "frequency_nn":
+        metadata["model_params"] = {
+            "architecture": [
+                len(feature_columns),
+                32,
+                len(LABELS) if nn_output_mode == "multi_label" else 1,
+            ],
+            "output_mode": nn_output_mode,
+            "input_features": "per-action daily frequencies over 7, 30, 90, and 365 days only",
+            "user_id_used_as_feature": False,
+            "max_iter": 100,
+        }
     else:
         metadata["s2p2_params"] = {
             **s2p2_options,
@@ -617,6 +888,7 @@ def run_prediction(
         metadata,
         temporal_model,
         s2p2_model,
+        nn_output_mode,
     )
     print(f"Saved predictions for {len(output):,} users to {prediction_path}")
     print(f"Saved model files and thresholds to {output_dir}")
@@ -637,9 +909,15 @@ def parse_args() -> argparse.Namespace:
         )
         subparser.add_argument(
             "--temporal-model",
-            choices=("lightgbm", "s2p2"),
+            choices=("lightgbm", "frequency_nn", "s2p2"),
             default="lightgbm",
-            help="temporal feature model; S2P2 requires its optional dependencies",
+            help="model; S2P2 requires its optional dependencies",
+        )
+        subparser.add_argument(
+            "--nn-output-mode",
+            choices=("per_label", "multi_label"),
+            default="per_label",
+            help="frequency_nn: use six models or one six-output model",
         )
         subparser.add_argument(
             "--device",
@@ -680,6 +958,8 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    if args.nn_output_mode != "per_label" and args.temporal_model != "frequency_nn":
+        raise ValueError("--nn-output-mode applies only to --temporal-model frequency_nn.")
     output_dir = args.output_dir or create_run_output_dir(
         args.command, args.temporal_model
     )
@@ -711,6 +991,7 @@ def main() -> None:
             args.temporal_model,
             s2p2_params,
             args.device,
+            args.nn_output_mode,
         )
     else:
         run_prediction(
@@ -723,6 +1004,7 @@ def main() -> None:
             args.temporal_model,
             s2p2_params,
             args.device,
+            args.nn_output_mode,
         )
 
 
