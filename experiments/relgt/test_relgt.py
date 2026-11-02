@@ -20,8 +20,12 @@ from experiments.relgt.model import RelGTInspired
 from experiments.relgt.run import (
     CudaDeviceInfo,
     _least_loaded_cuda_device,
+    choose_fusion_weight,
     create_run_output_dir,
+    fuse_probabilities,
+    s2p2_examples_for_rows,
 )
+from experiments.relgt.data import GraphTokens, TrainingExamples
 
 
 class TemporalSnapshotTests(unittest.TestCase):
@@ -118,6 +122,60 @@ class RelGTInspiredModelTests(unittest.TestCase):
         self.assertTrue(torch.isfinite(logits).all())
         logits.sum().backward()
         self.assertIsNotNone(model.centroids.grad)
+
+
+class HybridFusionTests(unittest.TestCase):
+    def test_fuses_probabilities_and_selects_calibration_weight(self) -> None:
+        labels = np.array(
+            [
+                [1, 0, 1, 0, 1, 0],
+                [0, 1, 0, 1, 0, 1],
+                [1, 0, 1, 0, 1, 0],
+                [0, 1, 0, 1, 0, 1],
+            ],
+            dtype=np.uint8,
+        )
+        graph = labels.astype(np.float32) * 0.02 + 0.49
+        s2p2 = 1.0 - labels.astype(np.float32) * 0.98 - 0.01
+        fused = fuse_probabilities(graph, s2p2, graph_weight=1.0)
+        weight, thresholds, metrics = choose_fusion_weight(labels, graph, s2p2)
+
+        np.testing.assert_array_equal(fused, graph)
+        self.assertEqual(weight, 1.0)
+        self.assertEqual(set(thresholds), set(LABELS))
+        self.assertAlmostEqual(metrics["score"], 1.0)
+
+    def test_rejects_misaligned_probability_shapes(self) -> None:
+        with self.assertRaisesRegex(ValueError, "matching shapes"):
+            fuse_probabilities(np.zeros((2, 6)), np.zeros((3, 6)), 0.5)
+
+    def test_aligns_s2p2_rows_to_graph_user_and_cutoff(self) -> None:
+        tokens = GraphTokens(
+            user_ids=np.array([4, 8], dtype=np.int32),
+            entity_ids=np.zeros((2, 1), dtype=np.int32),
+            node_type_ids=np.zeros((2, 1), dtype=np.uint8),
+            relation_ids=np.zeros((2, 1), dtype=np.uint8),
+            hop_ids=np.zeros((2, 1), dtype=np.uint8),
+            node_features=np.zeros((2, 1, 4), dtype=np.float32),
+            relative_days=np.zeros((2, 1), dtype=np.float32),
+        )
+        examples = TrainingExamples(
+            tokens=tokens,
+            labels=np.zeros((2, len(LABELS)), dtype=np.uint8),
+            cutoff_days=np.array(
+                [
+                    pd.Timestamp("2026-03-01").value // pd.Timedelta(days=1).value,
+                    pd.Timestamp("2026-03-08").value // pd.Timedelta(days=1).value,
+                ],
+                dtype=np.int32,
+            ),
+            num_entities=10,
+        )
+
+        rows = s2p2_examples_for_rows(examples, np.array([1]))
+
+        self.assertEqual(rows["user_id"].tolist(), [8])
+        self.assertEqual(rows["cutoff"].tolist(), [pd.Timestamp("2026-03-08")])
 
 
 class DeviceAndOutputTests(unittest.TestCase):

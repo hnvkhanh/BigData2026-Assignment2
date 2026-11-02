@@ -62,6 +62,20 @@ explicitly use `--device cuda` to select the least-loaded CUDA GPU, or choose
 warns and uses free GPU memory as the selection fallback. The code does not
 require PyTorch Geometric or a Stanford RelGT clone.
 
+The optional `hybrid` mode also requires the pinned S2P2/EasyTPP dependency:
+
+```bash
+python -m pip install -r experiments/lightgbm_baseline/s2p2-requirements.txt
+```
+
+In hybrid mode RelGT learns from the temporal graph snapshots while S2P2 learns
+from each user's six-mark action sequence. Both branches train on the same
+chronological training weeks. A shared probability-fusion weight is selected
+from `0.0` to `1.0` on calibration weeks, along with per-label thresholds; the
+holdout is used only for final evaluation. S2P2 uses CPU when CUDA is
+unavailable because its upstream implementation warns against MPS. On CUDA,
+automatic device selection chooses the least-utilized GPU.
+
 ## Run a chronological backtest
 
 From the project root:
@@ -82,6 +96,23 @@ For a quick first run with fewer training epochs:
 ```bash
 python -m experiments.relgt.run backtest --epochs 1 --batch-size 128
 ```
+
+Run the combined RelGT + S2P2 model with:
+
+```bash
+python -m experiments.relgt.run backtest \
+  --temporal-model hybrid \
+  --device auto \
+  --epochs 1 \
+  --s2p2-epochs 1
+```
+
+The run report includes the calibration-selected RelGT/S2P2 fusion weights.
+`holdout_probabilities.csv` records the aligned RelGT, S2P2, and fused
+probabilities for each holdout user-week, and the run folder contains both
+trained model weights. S2P2 training settings can be adjusted with
+`--s2p2-batch-size`, `--s2p2-max-sequence-length`, `--s2p2-hidden-size`,
+`--s2p2-state-size`, `--s2p2-num-layers`, and `--s2p2-integral-samples`.
 
 Each run gets its own cache to keep concurrent runs isolated. Use
 `--output-dir` to choose a specific folder when you want to organize or rerun
@@ -141,8 +172,8 @@ predictions from overwriting one another.
 
 ## Compare with LightGBM
 
-Run the existing baseline and this graph branch on the same cutoff dates and
+Compare LightGBM, RelGT, and hybrid runs using the same cutoff dates and
 chronological split. Compare the assignment score `(macro-F1 + micro-F1) / 2`
-on the untouched holdout. The graph branch is not expected to improve the score
-without measurement. The saved probabilities are available for a later fusion
-experiment, but this setup does not yet tune or apply a fusion weight.
+on the untouched holdout. The hybrid is an experiment, not an assumed
+improvement; retain it only if it improves the measured holdout score over the
+individual branches.

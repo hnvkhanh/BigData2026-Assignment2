@@ -403,6 +403,102 @@ def calculate_metrics(
     }
 
 
+def fuse_probabilities(
+    graph_probabilities: np.ndarray,
+    s2p2_probabilities: np.ndarray,
+    graph_weight: float,
+) -> np.ndarray:
+    if graph_probabilities.shape != s2p2_probabilities.shape:
+        raise ValueError("RelGT and S2P2 probability arrays must have matching shapes.")
+    if graph_probabilities.ndim != 2 or graph_probabilities.shape[1] != len(LABELS):
+        raise ValueError(f"Probability arrays must have shape (n, {len(LABELS)}).")
+    if not 0.0 <= graph_weight <= 1.0:
+        raise ValueError("The RelGT fusion weight must be between 0 and 1.")
+    if not (
+        np.isfinite(graph_probabilities).all()
+        and np.isfinite(s2p2_probabilities).all()
+    ):
+        raise ValueError("RelGT and S2P2 probabilities must be finite.")
+    return (
+        graph_weight * graph_probabilities
+        + (1.0 - graph_weight) * s2p2_probabilities
+    )
+
+
+def choose_fusion_weight(
+    labels: np.ndarray,
+    graph_probabilities: np.ndarray,
+    s2p2_probabilities: np.ndarray,
+) -> tuple[float, dict[str, float], dict[str, Any]]:
+    best_weight = 0.0
+    best_thresholds: dict[str, float] = {}
+    best_metrics: dict[str, Any] | None = None
+    for graph_weight in np.linspace(0.0, 1.0, 11):
+        fused = fuse_probabilities(
+            graph_probabilities, s2p2_probabilities, float(graph_weight)
+        )
+        thresholds = choose_thresholds(labels, fused)
+        metrics = calculate_metrics(labels, fused, thresholds)
+        if best_metrics is None or metrics["score"] > best_metrics["score"]:
+            best_weight = float(graph_weight)
+            best_thresholds = thresholds
+            best_metrics = metrics
+    if best_metrics is None:
+        raise ValueError("Cannot calibrate fusion without calibration examples.")
+    return best_weight, best_thresholds, best_metrics
+
+
+def s2p2_examples_for_rows(
+    examples: TrainingExamples, indices: np.ndarray
+) -> pd.DataFrame:
+    """Preserve each graph example's user/cutoff alignment for the S2P2 branch."""
+    return pd.DataFrame(
+        {
+            "user_id": examples.tokens.user_ids[indices].astype(np.int64),
+            "cutoff": pd.to_datetime(
+                examples.cutoff_days[indices], unit="D"
+            ),
+        }
+    )
+
+
+def fit_s2p2_branch(
+    args: argparse.Namespace,
+    examples: TrainingExamples,
+    train_indices: np.ndarray,
+    cohort_user_ids: list[int],
+) -> tuple[Any, dict[str, pd.DataFrame], torch.device]:
+    try:
+        from experiments.lightgbm_baseline.run import load_histories
+        from experiments.lightgbm_baseline.s2p2 import (
+            S2P2TemporalModel,
+            select_device as select_s2p2_device,
+        )
+    except ImportError as error:
+        raise ImportError(
+            "The hybrid RelGT+S2P2 mode requires the optional EasyTPP dependency. "
+            "Install it with: python -m pip install -r "
+            "experiments/lightgbm_baseline/s2p2-requirements.txt"
+        ) from error
+
+    s2p2_device_request = "cpu" if args.device == "mps" else args.device
+    s2p2_device = select_s2p2_device(s2p2_device_request)
+    histories = load_histories(args.db_dir, cohort_user_ids)
+    model = S2P2TemporalModel(
+        device=s2p2_device,
+        epochs=args.s2p2_epochs,
+        batch_size=args.s2p2_batch_size,
+        max_sequence_length=args.s2p2_max_sequence_length,
+        hidden_size=args.s2p2_hidden_size,
+        state_size=args.s2p2_state_size,
+        num_layers=args.s2p2_num_layers,
+        integral_samples=args.s2p2_integral_samples,
+        seed=args.seed,
+    )
+    model.fit(s2p2_examples_for_rows(examples, train_indices), histories)
+    return model, histories, s2p2_device
+
+
 def run_backtest(args: argparse.Namespace) -> None:
     examples = load_or_build_examples(args.db_dir, args.output_dir, args.start_cutoff)
     train_end, calibration_end = chronological_splits(examples.cutoff_days)
@@ -434,15 +530,84 @@ def run_backtest(args: argparse.Namespace) -> None:
         args.dropout,
         args.seed,
     )
-    calibration_probabilities = predict_probabilities(
+    graph_calibration_probabilities = predict_probabilities(
         model, examples.tokens, calibration_indices, device, args.batch_size
     )
-    thresholds = choose_thresholds(
-        examples.labels[calibration_indices], calibration_probabilities
-    )
-    holdout_probabilities = predict_probabilities(
+    graph_holdout_probabilities = predict_probabilities(
         model, examples.tokens, holdout_indices, device, args.batch_size
     )
+    if args.temporal_model == "hybrid":
+        cohort_user_ids = pd.read_parquet(
+            args.db_dir / "Users.parquet", columns=["user_id", "is_cohort"]
+        ).loc[lambda users: users["is_cohort"], "user_id"].astype(int).tolist()
+        s2p2_model, histories, s2p2_device = fit_s2p2_branch(
+            args, examples, train_indices, cohort_user_ids
+        )
+        calibration_frame = s2p2_examples_for_rows(examples, calibration_indices)
+        holdout_frame = s2p2_examples_for_rows(examples, holdout_indices)
+        s2p2_calibration_by_label = s2p2_model.predict(calibration_frame, histories)
+        s2p2_holdout_by_label = s2p2_model.predict(holdout_frame, histories)
+        s2p2_calibration_probabilities = np.column_stack(
+            [s2p2_calibration_by_label[label] for label in LABELS]
+        )
+        s2p2_holdout_probabilities = np.column_stack(
+            [s2p2_holdout_by_label[label] for label in LABELS]
+        )
+        graph_weight, thresholds, calibration_metrics = choose_fusion_weight(
+            examples.labels[calibration_indices],
+            graph_calibration_probabilities,
+            s2p2_calibration_probabilities,
+        )
+        graph_only_thresholds = choose_thresholds(
+            examples.labels[calibration_indices], graph_calibration_probabilities
+        )
+        s2p2_only_thresholds = choose_thresholds(
+            examples.labels[calibration_indices], s2p2_calibration_probabilities
+        )
+        graph_only_metrics = calculate_metrics(
+            examples.labels[holdout_indices],
+            graph_holdout_probabilities,
+            graph_only_thresholds,
+        )
+        s2p2_only_metrics = calculate_metrics(
+            examples.labels[holdout_indices],
+            s2p2_holdout_probabilities,
+            s2p2_only_thresholds,
+        )
+        holdout_probabilities = fuse_probabilities(
+            graph_holdout_probabilities,
+            s2p2_holdout_probabilities,
+            graph_weight,
+        )
+        torch.save(model.state_dict(), args.output_dir / "relgt_model.pt")
+        s2p2_model.save(args.output_dir / "s2p2_model.pt")
+        pd.DataFrame(
+            {
+                "user_id": examples.tokens.user_ids[holdout_indices],
+                "cutoff": s2p2_examples_for_rows(examples, holdout_indices)["cutoff"],
+                **{
+                    f"relgt_{label}": graph_holdout_probabilities[:, column]
+                    for column, label in enumerate(LABELS)
+                },
+                **{
+                    f"s2p2_{label}": s2p2_holdout_probabilities[:, column]
+                    for column, label in enumerate(LABELS)
+                },
+                **{
+                    f"fused_{label}": holdout_probabilities[:, column]
+                    for column, label in enumerate(LABELS)
+                },
+            }
+        ).to_csv(args.output_dir / "holdout_probabilities.csv", index=False)
+    else:
+        s2p2_model = None
+        s2p2_device = None
+        graph_weight = 1.0
+        calibration_metrics = None
+        thresholds = choose_thresholds(
+            examples.labels[calibration_indices], graph_calibration_probabilities
+        )
+        holdout_probabilities = graph_holdout_probabilities
     results = calculate_metrics(
         examples.labels[holdout_indices], holdout_probabilities, thresholds
     )
@@ -456,9 +621,23 @@ def run_backtest(args: argparse.Namespace) -> None:
         "holdout_start": str(pd.Timestamp(calibration_end, unit="D")),
     }
     results["device"] = str(device)
+    results["temporal_model"] = args.temporal_model
     results["epochs"] = args.epochs
     results["experiment"] = args.output_dir.name
     results["architecture"] = "RelGT-inspired sampled temporal neighborhood encoder"
+    if args.temporal_model == "hybrid":
+        results["fusion"] = {
+            "method": "calibration-selected probability averaging",
+            "graph_weight": graph_weight,
+            "s2p2_weight": 1.0 - graph_weight,
+            "calibration_score": calibration_metrics["score"],
+            "s2p2_device": str(s2p2_device),
+            "s2p2_epochs": args.s2p2_epochs,
+        }
+        results["branch_holdout"] = {
+            "relgt": graph_only_metrics,
+            "s2p2": s2p2_only_metrics,
+        }
     args.output_dir.mkdir(parents=True, exist_ok=True)
     metrics_path = args.output_dir / "backtest_metrics.json"
     metrics_path.write_text(json.dumps(results, indent=2) + "\n", encoding="utf-8")
@@ -488,12 +667,34 @@ def run_prediction(args: argparse.Namespace) -> None:
         args.dropout,
         args.seed,
     )
-    calibration_probabilities = predict_probabilities(
+    graph_calibration_probabilities = predict_probabilities(
         model, examples.tokens, calibration_indices, device, args.batch_size
     )
-    thresholds = choose_thresholds(
-        examples.labels[calibration_indices], calibration_probabilities
-    )
+    s2p2_model = None
+    histories = None
+    graph_weight = 1.0
+    if args.temporal_model == "hybrid":
+        cohort_user_ids = pd.read_parquet(
+            args.db_dir / "Users.parquet", columns=["user_id", "is_cohort"]
+        ).loc[lambda users: users["is_cohort"], "user_id"].astype(int).tolist()
+        s2p2_model, histories, s2p2_device = fit_s2p2_branch(
+            args, examples, train_indices, cohort_user_ids
+        )
+        s2p2_calibration_by_label = s2p2_model.predict(
+            s2p2_examples_for_rows(examples, calibration_indices), histories
+        )
+        s2p2_calibration_probabilities = np.column_stack(
+            [s2p2_calibration_by_label[label] for label in LABELS]
+        )
+        graph_weight, thresholds, calibration_metrics = choose_fusion_weight(
+            examples.labels[calibration_indices],
+            graph_calibration_probabilities,
+            s2p2_calibration_probabilities,
+        )
+    else:
+        thresholds = choose_thresholds(
+            examples.labels[calibration_indices], graph_calibration_probabilities
+        )
 
     target_users = pd.read_csv(args.test_input, dtype={"UserID": "int64"})
     if target_users["UserID"].duplicated().any():
@@ -517,9 +718,25 @@ def run_prediction(args: argparse.Namespace) -> None:
     )
     inference_tokens = snapshot_tokens(events, args.cutoff, internal_ids, vocabulary)
     row_indices = np.arange(len(internal_ids), dtype=np.int64)
-    probabilities = predict_probabilities(
+    graph_probabilities = predict_probabilities(
         model, inference_tokens, row_indices, device, args.batch_size
     )
+    if args.temporal_model == "hybrid":
+        inference_frame = pd.DataFrame(
+            {
+                "user_id": internal_ids.astype(np.int64),
+                "cutoff": args.cutoff,
+            }
+        )
+        s2p2_by_label = s2p2_model.predict(inference_frame, histories)
+        s2p2_probabilities = np.column_stack(
+            [s2p2_by_label[label] for label in LABELS]
+        )
+        probabilities = fuse_probabilities(
+            graph_probabilities, s2p2_probabilities, graph_weight
+        )
+    else:
+        probabilities = graph_probabilities
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     output = pd.DataFrame({"UserID": target_users["UserID"]})
@@ -528,14 +745,34 @@ def run_prediction(args: argparse.Namespace) -> None:
     prediction_path = args.output_dir / "predictions.csv"
     output.to_csv(prediction_path, index=False)
 
-    probability_output = pd.DataFrame(
-        probabilities, columns=[f"{label}_probability" for label in LABELS]
-    )
+    probability_values = {
+        f"{label}_probability": probabilities[:, column]
+        for column, label in enumerate(LABELS)
+    }
+    if args.temporal_model == "hybrid":
+        probability_values.update(
+            {
+                f"relgt_{label}_probability": graph_probabilities[:, column]
+                for column, label in enumerate(LABELS)
+            }
+        )
+        probability_values.update(
+            {
+                f"s2p2_{label}_probability": s2p2_probabilities[:, column]
+                for column, label in enumerate(LABELS)
+            }
+        )
+    probability_output = pd.DataFrame(probability_values)
     probability_output.insert(0, "UserID", target_users["UserID"].to_numpy())
     probability_path = args.output_dir / "probabilities.csv"
     probability_output.to_csv(probability_path, index=False)
 
-    torch.save(model.state_dict(), args.output_dir / "model.pt")
+    relgt_model_path = (
+        "relgt_model.pt" if args.temporal_model == "hybrid" else "model.pt"
+    )
+    torch.save(model.state_dict(), args.output_dir / relgt_model_path)
+    if args.temporal_model == "hybrid":
+        s2p2_model.save(args.output_dir / "s2p2_model.pt")
     metadata = {
         "prediction_cutoff_utc": str(args.cutoff),
         "training_start_cutoff_utc": str(args.start_cutoff),
@@ -544,6 +781,7 @@ def run_prediction(args: argparse.Namespace) -> None:
         "labels": list(LABELS),
         "thresholds": thresholds,
         "device": str(device),
+        "temporal_model": args.temporal_model,
         "experiment": args.output_dir.name,
         "epochs": args.epochs,
         "batch_size": args.batch_size,
@@ -553,6 +791,14 @@ def run_prediction(args: argparse.Namespace) -> None:
         "architecture": "RelGT-inspired sampled temporal neighborhood encoder",
         "official_relgt": "https://github.com/snap-stanford/relgt",
     }
+    if args.temporal_model == "hybrid":
+        metadata["s2p2_device"] = str(s2p2_device)
+        metadata["fusion"] = {
+            "method": "calibration-selected probability averaging",
+            "graph_weight": graph_weight,
+            "s2p2_weight": 1.0 - graph_weight,
+            "calibration_score": calibration_metrics["score"],
+        }
     (args.output_dir / "metadata.json").write_text(
         json.dumps(metadata, indent=2) + "\n", encoding="utf-8"
     )
@@ -583,6 +829,19 @@ def add_common_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--num-layers", type=int, default=2)
     parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--temporal-model",
+        choices=["relgt", "hybrid"],
+        default="relgt",
+        help="use RelGT alone or fuse it with S2P2 temporal predictions",
+    )
+    parser.add_argument("--s2p2-epochs", type=int, default=3)
+    parser.add_argument("--s2p2-batch-size", type=int, default=128)
+    parser.add_argument("--s2p2-max-sequence-length", type=int, default=128)
+    parser.add_argument("--s2p2-hidden-size", type=int, default=32)
+    parser.add_argument("--s2p2-state-size", type=int, default=8)
+    parser.add_argument("--s2p2-num-layers", type=int, default=2)
+    parser.add_argument("--s2p2-integral-samples", type=int, default=8)
 
 
 def parse_args() -> argparse.Namespace:
@@ -606,6 +865,10 @@ def parse_args() -> argparse.Namespace:
         parser.error("--batch-size must be positive.")
     if args.num_layers < 1:
         parser.error("--num-layers must be positive.")
+    if args.s2p2_epochs < 1 or args.s2p2_batch_size < 1:
+        parser.error("--s2p2-epochs and --s2p2-batch-size must be positive.")
+    if args.s2p2_max_sequence_length < 2:
+        parser.error("--s2p2-max-sequence-length must be at least 2.")
     return args
 
 
