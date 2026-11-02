@@ -8,6 +8,8 @@ from unittest.mock import patch
 import numpy as np
 import pandas as pd
 
+from experiments.lightgbm_baseline import run as baseline_run
+
 try:
     import torch
 
@@ -132,6 +134,18 @@ class S2P2SequenceTests(unittest.TestCase):
 
 
 class CliTests(unittest.TestCase):
+    def test_scale_pos_weight_cli_defaults_on_and_can_be_disabled(self) -> None:
+        with patch(
+            "sys.argv",
+            ["run.py", "backtest"],
+        ):
+            self.assertTrue(baseline_run.parse_args().scale_pos_weight)
+        with patch(
+            "sys.argv",
+            ["run.py", "backtest", "--no-scale-pos-weight"],
+        ):
+            self.assertFalse(baseline_run.parse_args().scale_pos_weight)
+
     def test_cli_accepts_s2p2_selection(self) -> None:
         result = subprocess.run(
             [
@@ -148,7 +162,9 @@ class CliTests(unittest.TestCase):
             "--temporal-model {lightgbm,frequency_nn,s2p2}", result.stdout
         )
         self.assertIn("--nn-output-mode {per_label,multi_label}", result.stdout)
+        self.assertIn("--calibrated-threshold", result.stdout)
         self.assertIn("--device {auto,cpu,cuda}", result.stdout)
+        self.assertIn("--no-scale-pos-weight", result.stdout)
 
     def test_default_run_directories_are_timestamped_and_unique(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_dir:

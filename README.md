@@ -23,6 +23,10 @@ features.
   assignment-specific **RelGT-inspired** graph model. It is not a drop-in
   execution of Stanford's RelGT/RelBench implementation.
   - Its optional **hybrid** mode combines RelGT and S2P2 probabilities.
+- [`experiments/gru_relational_ple/`](./experiments/gru_relational_ple/README.md)
+  contains an experimental **GRU + relational attention + PLE** model that
+  combines daily activity sequences and graph neighborhoods for six-label
+  prediction.
 
 The temporal experiments use chronological training/calibration/holdout
 periods rather than random row splits. Prediction runs train and calibrate only
@@ -30,9 +34,7 @@ on examples whose complete seven-day label window ends by the requested
 prediction cutoff. Feature snapshots also exclude actions, rows, and lifecycle
 transitions that were not yet available at each historical cutoff. LightGBM
 also uses per-action and combined median daily activity counts over its
-lookback windows; inactive days count as zero. Its tabular branch also uses
-the user's `is_bot` flag when the Users row is known by the cutoff; the
-frequency-only neural network remains frequency-only.
+lookback windows; inactive days count as zero.
 
 ## Setup
 
@@ -62,6 +64,10 @@ Run a LightGBM chronological backtest:
 python experiments/lightgbm_baseline/run.py backtest
 ```
 
+By default, the fixed decision thresholds are `0.30` for all labels except
+push (`0.45`). Add `--calibrated-threshold` to select thresholds from
+chronological calibration data for backtests and predictions.
+
 Select S2P2 instead:
 
 ```powershell
@@ -86,6 +92,7 @@ python -m experiments.relgt.run backtest
 python -m experiments.relgt.run backtest --temporal-model hybrid
 python -m experiments.relgt.run backtest --temporal-model relgt_lightgbm
 python -m experiments.relgt.run backtest --temporal-model relgt_lightgbm_s2p2
+python -m experiments.gru_relational_ple.run
 ```
 
 The three-model mode requires the optional S2P2/EasyTPP dependency. To
@@ -112,6 +119,7 @@ under its experiment's `outputs/` directory:
 
 - `experiments/lightgbm_baseline/outputs/`
 - `experiments/relgt/outputs/`
+- `experiments/gru_relational_ple/outputs/`
 
 These output directories are ignored by Git. Specify `--output-dir` to choose a
 stable location; for example:
@@ -132,6 +140,7 @@ Typical outputs:
 | RelGT + LightGBM prediction | Fused prediction/probability files, `relgt_model.pt`, `lightgbm_<label>.txt` files, and `metadata.json` |
 | RelGT + LightGBM + S2P2 prediction | Fused and branch probability files, `relgt_model.pt`, `s2p2_model.pt`, LightGBM model files, and `metadata.json` |
 | RelGT backtest | `backtest_metrics.json`; combined runs also save branch/fused holdout probabilities and both model weights |
+| GRU + relational attention + PLE backtest | `backtest_metrics.json`, `holdout_probabilities.csv`, and `gru_relational_ple_model.pt` |
 
 RelGT runs also cache weekly graph examples under the run folder at
 `cache/weekly_graph_examples.npz`, with a neighboring JSON file describing the

@@ -5,7 +5,8 @@ network, and S2P2, the state-space marked temporal point process from UCI
 DataLab's EasyTPP repository. All predict the six weekly activity labels using
 historical user-week examples and chronological validation. Historical
 user-week rows are restricted to users with at least five recorded activity
-rows in the preceding 90 days, matching the test-list activity filter.
+rows in the preceding 90 days, matching the test-list activity filter. That
+90-day period is used only for sample eligibility, not as a model feature.
 
 ## Setup
 
@@ -51,11 +52,11 @@ python experiments/lightgbm_baseline/run.py backtest \
 ```
 
 The network has one 32-unit hidden layer and trains one binary classifier per
-activity label. It receives only per-action daily frequencies over the 7-, 30-,
-90-, and 365-day windows; user IDs, counts, shares, and other features are
-excluded. Training, calibration, and holdout remain chronological. By default,
-it trains six separate classifiers. To train one network with a shared hidden
-layer and a six-value output vector instead, use:
+activity label. It receives only the six per-action 7-day frequencies; 30-day
+frequency features, 90- and 365-day features, user IDs, counts, shares, and
+other features are excluded. Training, calibration, and holdout remain
+chronological. By default, it trains six separate classifiers. To train one
+network with a shared hidden layer and a six-value output vector instead, use:
 
 ```bash
 python experiments/lightgbm_baseline/run.py backtest \
@@ -63,13 +64,16 @@ python experiments/lightgbm_baseline/run.py backtest \
 ```
 
 The same option is available for `predict`. Each output value is the
-probability for one activity label; calibration thresholds turn those
-probabilities into the six binary predictions. The single model is saved as
-`models/frequency_nn_multilabel.joblib`.
+probability for one activity label; the selected fixed or calibrated
+thresholds turn those probabilities into the six binary predictions. The
+single model is saved as `models/frequency_nn_multilabel.joblib`.
 
 The script uses weekly forecast cutoffs beginning on 2026-03-01. It trains on the
-oldest 70% of weeks, selects per-label F1 thresholds on the next 15%, and reports
-the untouched final 15% holdout. Metrics are written to
+oldest 70% of weeks, reserves the next 15% for calibration, and reports the
+untouched final 15% holdout. By default, decisions use fixed thresholds:
+`0.30` for all labels except `push`, which uses `0.45`. Add
+`--calibrated-threshold` to choose per-label thresholds on the calibration
+weeks instead. Metrics are written to
 `experiments/lightgbm_baseline/outputs/backtest_<model>_<timestamp>/backtest_metrics.json`.
 Each run gets a new timestamped output folder by default. Supply `--output-dir`
 to choose a fixed folder explicitly.
@@ -90,14 +94,23 @@ python experiments/lightgbm_baseline/run.py backtest \
 python experiments/lightgbm_baseline/run.py backtest \
   --num-leaves 31 --min-child-samples 30 --n-estimators 500 \
   --output-dir experiments/lightgbm_baseline/outputs/larger_trees
+
+# Opt in to per-label threshold calibration
+python experiments/lightgbm_baseline/run.py backtest --calibrated-threshold
 ```
 
 Each run writes `backtest_metrics.json`, including the parameters, per-label F1,
-macro-F1, micro-F1, combined score, and selected thresholds. Compare the `score`
-field across runs; it is the assignment's average of macro-F1 and micro-F1.
+macro-F1, micro-F1, combined score, threshold mode, and thresholds. Compare the
+`score` field across runs; it is the assignment's average of macro-F1 and
+micro-F1.
 Change one or two settings at a time, keep the same cutoff/data/split, and use
 the chronological holdout only for comparing a small number of final candidates.
 Repeatedly tuning to that holdout can overfit it.
+
+LightGBM uses `scale_pos_weight = negative_count / positive_count` separately
+for each label by default, calculated from the training split only. Pass
+`--no-scale-pos-weight` to disable class weighting for either `backtest` or
+`predict`.
 
 ## Export LightGBM holdout failures
 
@@ -112,8 +125,24 @@ LightGBM backtest. It saves holdout metrics and `failure_cases.csv` under a new
 timestamped folder in `experiments/lightgbm_baseline/outputs/`. The CSV has one
 row per misclassified user-week-label, including actual/predicted values,
 probability, threshold, failure type, user IDs, cutoff, and feature values.
-Override the output folder or LightGBM parameters with the script's CLI flags.
+It uses the default fixed thresholds; pass `--calibrated-threshold` to opt in to
+calibration-based thresholds. Override the output folder or LightGBM parameters
+with the script's CLI flags. Per-label `scale_pos_weight` is enabled by
+default; pass `--no-scale-pos-weight` to disable it.
 Failure interpretation is intentionally left as a TODO in the script.
+
+To analyze a previously completed backtest from any supported experiment
+(including LightGBM, RelGT, and GRU), point the analyzer at that run directory:
+
+```bash
+python exam_fail_case.py --run-dir experiments/lightgbm_baseline/outputs/backtest_RUN --no-dashboard
+```
+
+This exports failure and false-positive CSVs under the run's
+`failure_analysis/` folder. LightGBM backtests save `holdout_probabilities.csv`
+with embedded actual labels for this purpose; rerun older LightGBM backtests
+that do not contain this file. For multi-branch runs, select a branch with
+`--model-branch`, for example `--model-branch relgt`.
 
 Supported LightGBM options are `--n-estimators`, `--learning-rate`,
 `--num-leaves`, `--min-child-samples`, `--subsample`, `--colsample-bytree`,
@@ -123,23 +152,16 @@ S2P2 options are `--s2p2-epochs`, `--s2p2-batch-size`,
 `--s2p2-max-sequence-length`, `--s2p2-hidden-size`, `--s2p2-state-size`,
 `--s2p2-num-layers`, and `--s2p2-integral-samples`.
 
-For each historical cutoff, LightGBM also receives total action counts across
-the six activity types for the preceding 7, 30, 90, and 365 days. For each
-period, it receives each action's share of that total and its per-day frequency
-(count divided by the period length). Shares are zero when the user has no
-actions in that window. These features use only actions available before the
-cutoff and are included automatically in LightGBM training, prediction, and
-RelGT+LightGBM ensembles.
-
-LightGBM also uses the Users table's `is_bot` value as a binary feature. It is
-joined by internal `user_id` only to attach this value; the identifier itself
-is excluded from model inputs. Before the user row's `first_seen_at`, the
-feature is missing rather than using information not yet available. The
-frequency-only neural network still uses only its 24 per-action frequency
-inputs.
+For each historical cutoff, LightGBM receives the total action count across
+the six activity types for the preceding 7 days, each action's share of the
+total for the preceding 7 and 30 days, and per-action daily frequencies for
+the 7-day window. Raw 30-day count features are excluded. Shares are zero when
+the user has no actions in that window. These features use only actions
+available before the cutoff and are included automatically in LightGBM
+training, prediction, and RelGT+LightGBM ensembles.
 
 LightGBM also receives each action's median daily count and the combined
-median daily count across all six actions for those same lookback windows.
+median daily count across all six actions for the same 7- and 30-day windows.
 These medians include zero-activity days, use complete 24-hour bins anchored to
 the prediction cutoff, and exclude events or rows unavailable at that cutoff.
 The frequency-only neural network continues to use only its per-action daily
@@ -165,7 +187,15 @@ cutoff of `2026-11-11 16:00:00 UTC`, and writes to a new timestamped folder unde
 
 - `predictions.csv`
 - Model files under `models/` (six LightGBM models or S2P2 weights)
-- `metadata.json`, including feature names and calibrated thresholds
+- `metadata.json`, including feature names, thresholds, and threshold mode
+
+Prediction uses the same fixed thresholds by default. Add
+`--calibrated-threshold` to calibrate thresholds from the earlier validation
+weeks, for example:
+
+```bash
+python experiments/lightgbm_baseline/run.py predict --calibrated-threshold
+```
 
 To generate predictions with S2P2, use `--temporal-model s2p2`, for example:
 

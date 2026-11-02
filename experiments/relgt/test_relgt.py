@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -22,10 +23,16 @@ from experiments.relgt.run import (
     _least_loaded_cuda_device,
     choose_fusion_weight,
     choose_three_fusion_weights,
+    calculate_metrics,
+    choose_thresholds,
     create_run_output_dir,
     fuse_probabilities,
     fuse_three_probabilities,
     lightgbm_examples_for_graph,
+    parse_ensemble_lookbacks,
+    parse_args,
+    parse_three_branch_weights,
+    parse_unit_interval,
     prediction_example_indices,
     require_s2p2_dependency,
     s2p2_examples_for_rows,
@@ -104,6 +111,41 @@ class TemporalSnapshotTests(unittest.TestCase):
         self.assertEqual(labels.shape, (1, len(LABELS)))
         self.assertEqual(labels[0].tolist(), [0, 0, 0, 0, 0, 1])
 
+    def test_snapshot_structure_features_do_not_depend_on_requested_users(self) -> None:
+        other_user_event = self.events.iloc[[2]].copy()
+        other_user_event.loc[:, "user_id"] = 12
+        events = pd.concat([self.events, other_user_event], ignore_index=True)
+
+        one_user = snapshot_tokens(events, self.cutoff, [10], self.vocabulary)
+        two_users = snapshot_tokens(events, self.cutoff, [10, 12], self.vocabulary)
+
+        np.testing.assert_array_equal(one_user.entity_ids[0], two_users.entity_ids[0])
+        np.testing.assert_array_equal(
+            one_user.node_features[0], two_users.node_features[0]
+        )
+        self.assertAlmostEqual(
+            float(one_user.node_features[0, 0, 2]), np.log1p(3)
+        )
+
+    def test_snapshot_respects_requested_lookback_window(self) -> None:
+        short_window = snapshot_tokens(
+            self.events,
+            self.cutoff,
+            [10],
+            self.vocabulary,
+            lookback_days=3,
+        )
+        long_window = snapshot_tokens(
+            self.events,
+            self.cutoff,
+            [10],
+            self.vocabulary,
+            lookback_days=90,
+        )
+
+        self.assertNotIn(9, short_window.entity_ids[0, :24])
+        self.assertIn(9, long_window.entity_ids[0, :24])
+
     def test_prediction_training_samples_have_labels_observed_before_cutoff(self) -> None:
         day_ns = pd.Timedelta(days=1).value
         cutoff_days = np.array(
@@ -147,6 +189,82 @@ class RelGTInspiredModelTests(unittest.TestCase):
 
 
 class HybridFusionTests(unittest.TestCase):
+    def test_parses_two_supported_lookback_windows(self) -> None:
+        self.assertEqual(parse_ensemble_lookbacks("30,14"), (30, 14))
+        self.assertEqual(parse_ensemble_lookbacks("90, 14"), (90, 14))
+
+    def test_rejects_invalid_lookback_pairs(self) -> None:
+        for value in ("30", "30,30", "30,7", "30,14,90"):
+            with self.subTest(value=value), self.assertRaises(
+                argparse.ArgumentTypeError
+            ):
+                parse_ensemble_lookbacks(value)
+
+    def test_parses_manual_fusion_weights(self) -> None:
+        self.assertEqual(parse_unit_interval("0.35"), 0.35)
+        self.assertEqual(
+            parse_three_branch_weights(
+                "relgt=0.2,lightgbm=0.5,s2p2=0.3"
+            ),
+            {"relgt": 0.2, "lightgbm": 0.5, "s2p2": 0.3},
+        )
+        for value in ("-0.1", "1.1", "nan", "inf"):
+            with self.subTest(value=value), self.assertRaises(
+                argparse.ArgumentTypeError
+            ):
+                parse_unit_interval(value)
+        for value in (
+            "relgt=0.2,lightgbm=0.5",
+            "relgt=0.2,lightgbm=0.5,s2p2=0.4",
+            "relgt=-0.1,lightgbm=0.8,s2p2=0.3",
+        ):
+            with self.subTest(value=value), self.assertRaises(
+                argparse.ArgumentTypeError
+            ):
+                parse_three_branch_weights(value)
+
+    def test_manual_fusion_options_are_limited_to_matching_modes(self) -> None:
+        with patch(
+            "sys.argv",
+            [
+                "run.py",
+                "backtest",
+                "--temporal-model",
+                "relgt_ensemble",
+                "--fusion-weight",
+                "0.7",
+            ],
+        ):
+            args = parse_args()
+        self.assertEqual(args.fusion_weight, 0.7)
+
+        with patch(
+            "sys.argv",
+            [
+                "run.py",
+                "backtest",
+                "--temporal-model",
+                "relgt",
+                "--fusion-weight",
+                "0.7",
+            ],
+        ), self.assertRaises(SystemExit):
+            parse_args()
+
+        with patch(
+            "sys.argv",
+            [
+                "run.py",
+                "predict",
+                "--temporal-model",
+                "relgt_lightgbm_s2p2",
+                "--fusion-weights",
+                "relgt=0.4,lightgbm=0.4,s2p2=0.2",
+            ],
+        ):
+            args = parse_args()
+        self.assertEqual(args.fusion_weights["s2p2"], 0.2)
+
     def test_fuses_probabilities_and_selects_calibration_weight(self) -> None:
         labels = np.array(
             [
@@ -166,6 +284,28 @@ class HybridFusionTests(unittest.TestCase):
         self.assertEqual(weight, 1.0)
         self.assertEqual(set(thresholds), set(LABELS))
         self.assertAlmostEqual(metrics["score"], 1.0)
+
+    def test_manual_two_branch_weight_controls_blend_and_calibration(self) -> None:
+        labels = np.tile(
+            np.array([[1, 0, 1, 0, 1, 0], [0, 1, 0, 1, 0, 1]], dtype=np.uint8),
+            (2, 1),
+        )
+        graph = np.where(labels == 1, 0.95, 0.05).astype(np.float32)
+        other = 1.0 - graph
+
+        weight, thresholds, metrics = choose_fusion_weight(
+            labels, graph, other, manual_weight=0.75
+        )
+        fused = fuse_probabilities(graph, other, weight)
+        expected_thresholds = choose_thresholds(labels, fused)
+        expected_metrics = calculate_metrics(labels, fused, expected_thresholds)
+
+        self.assertEqual(weight, 0.75)
+        self.assertEqual(thresholds, expected_thresholds)
+        self.assertEqual(metrics, expected_metrics)
+        self.assertAlmostEqual(metrics["score"], 1.0)
+        with self.assertRaisesRegex(ValueError, "between 0 and 1"):
+            choose_fusion_weight(labels, graph, other, manual_weight=1.5)
 
     def test_rejects_misaligned_probability_shapes(self) -> None:
         with self.assertRaisesRegex(ValueError, "matching shapes"):
@@ -191,6 +331,28 @@ class HybridFusionTests(unittest.TestCase):
         self.assertEqual(fused.shape, labels.shape)
         self.assertGreater(metrics["score"], 0.9)
         self.assertGreater(weights["lightgbm"], weights["relgt"])
+
+    def test_manual_three_branch_weights_control_blend_and_calibration(self) -> None:
+        labels = np.tile(
+            np.array([[1, 0, 1, 0, 1, 0], [0, 1, 0, 1, 0, 1]], dtype=np.uint8),
+            (2, 1),
+        )
+        relgt = np.where(labels == 1, 0.95, 0.05).astype(np.float32)
+        lightgbm = np.full(labels.shape, 0.5, dtype=np.float32)
+        s2p2 = 1.0 - relgt
+        manual_weights = {"relgt": 0.6, "lightgbm": 0.2, "s2p2": 0.2}
+
+        weights, thresholds, metrics = choose_three_fusion_weights(
+            labels, relgt, lightgbm, s2p2, manual_weights
+        )
+        fused = fuse_three_probabilities(relgt, lightgbm, s2p2, manual_weights)
+        expected_thresholds = choose_thresholds(labels, fused)
+        expected_metrics = calculate_metrics(labels, fused, expected_thresholds)
+
+        self.assertEqual(weights, manual_weights)
+        self.assertEqual(thresholds, expected_thresholds)
+        self.assertEqual(metrics, expected_metrics)
+        self.assertAlmostEqual(metrics["score"], 1.0)
 
     def test_three_branch_fusion_rejects_invalid_weights(self) -> None:
         probabilities = np.zeros((1, len(LABELS)), dtype=np.float32)

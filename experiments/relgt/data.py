@@ -20,7 +20,7 @@ LABELS = (
 )
 
 HORIZON_DAYS = 7
-LOOKBACK_DAYS = 90
+LOOKBACK_DAYS = 14
 MAX_OBJECTS_PER_RELATION = 4
 MAX_OBJECT_NEIGHBORS = len(LABELS) * MAX_OBJECTS_PER_RELATION
 MAX_REPOSITORY_NEIGHBORS = 24
@@ -220,17 +220,19 @@ def snapshot_tokens(
     user_ids: list[int] | np.ndarray,
     vocabulary: EntityVocabulary,
     eligible_only: bool = False,
+    lookback_days: int = LOOKBACK_DAYS,
 ) -> GraphTokens:
     """Build a temporal user→entity→repository neighborhood at a cutoff."""
+    if lookback_days < 1:
+        raise ValueError("lookback_days must be positive.")
     ordered_user_ids = np.asarray(user_ids, dtype=np.int32)
     tokens = _empty_tokens(ordered_user_ids)
     if not len(ordered_user_ids):
         return tokens
 
-    start = cutoff - pd.Timedelta(days=LOOKBACK_DAYS)
+    start = cutoff - pd.Timedelta(days=lookback_days)
     known = events.loc[
-        events["user_id"].isin(ordered_user_ids)
-        & (events["available_at"] < cutoff)
+        (events["available_at"] < cutoff)
         & (events["entity_available_at"] < cutoff)
         & (events["action_at"] < cutoff)
         & (events["action_at"] >= start)
@@ -238,7 +240,11 @@ def snapshot_tokens(
     if known.empty:
         return tokens
 
-    recent = known.assign(active_day=known["action_at"].dt.floor("D"))
+    recent = known.loc[known["user_id"].isin(ordered_user_ids)].assign(
+        active_day=lambda rows: rows["action_at"].dt.floor("D")
+    )
+    if recent.empty:
+        return tokens
     group_columns = [
         "user_id",
         "repo_id",
@@ -271,9 +277,9 @@ def snapshot_tokens(
 
     row_for_user = {int(uid): row for row, uid in enumerate(ordered_user_ids)}
     entity_structure = (
-        grouped.groupby(["node_type", "entity_id"], sort=False)
+        known.groupby(["node_type", "entity_id"], sort=False)
         .agg(
-            entity_event_count=("event_count", "sum"),
+            entity_event_count=("action_at", "size"),
             entity_user_count=("user_id", "nunique"),
             entity_relation_count=("relation_id", "nunique"),
         )
@@ -315,9 +321,9 @@ def snapshot_tokens(
     )
 
     repo_structure = (
-        grouped.groupby("repo_id", sort=False)
+        known.groupby("repo_id", sort=False)
         .agg(
-            repo_event_count=("event_count", "sum"),
+            repo_event_count=("action_at", "size"),
             repo_user_count=("user_id", "nunique"),
             repo_relation_count=("relation_id", "nunique"),
         )
@@ -423,8 +429,18 @@ def build_training_examples(
     db_dir: Path,
     start_cutoff: pd.Timestamp,
     vocabulary: EntityVocabulary,
+    lookback_days: int = LOOKBACK_DAYS,
+    eligibility_lookback_days: int | None = None,
 ) -> TrainingExamples:
     """Create weekly training samples with chronological labels."""
+    if lookback_days < 1:
+        raise ValueError("lookback_days must be positive.")
+    if eligibility_lookback_days is None:
+        eligibility_lookback_days = lookback_days
+    if eligibility_lookback_days < lookback_days:
+        raise ValueError(
+            "eligibility_lookback_days must be at least lookback_days."
+        )
     users = pd.read_parquet(
         db_dir / "Users.parquet", columns=["user_id", "is_cohort"]
     )
@@ -445,9 +461,24 @@ def build_training_examples(
     label_batches: list[np.ndarray] = []
     cutoff_batches: list[np.ndarray] = []
     for index, cutoff in enumerate(cutoffs, start=1):
-        tokens = snapshot_tokens(
-            events, cutoff, cohort_ids, vocabulary, eligible_only=True
+        eligible_tokens = snapshot_tokens(
+            events,
+            cutoff,
+            cohort_ids,
+            vocabulary,
+            eligible_only=True,
+            lookback_days=eligibility_lookback_days,
         )
+        if lookback_days == eligibility_lookback_days:
+            tokens = eligible_tokens
+        else:
+            tokens = snapshot_tokens(
+                events,
+                cutoff,
+                eligible_tokens.user_ids,
+                vocabulary,
+                lookback_days=lookback_days,
+            )
         labels = labels_for_cutoff(events, cutoff, tokens.user_ids)
         token_batches.append(tokens)
         label_batches.append(labels)

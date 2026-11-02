@@ -11,31 +11,77 @@ import pandas as pd
 from experiments.lightgbm_baseline.run import (
     _lifecycle_history,
     LABELS,
-    LOOKBACK_DAYS,
-    add_user_bot_feature,
+    DEFAULT_THRESHOLDS,
+    eligible_users_for_cutoff,
     fit_frequency_nn_models,
+    fit_models,
     frequency_feature_columns,
     load_histories,
     predict_frequency_nn_probabilities,
     row_for_cutoff,
     save_models,
     training_data_before,
+    thresholds_for_predictions,
 )
 
 
 class LifecycleFeatureTests(unittest.TestCase):
+    def test_scale_pos_weight_is_enabled_by_default_and_can_be_disabled(self) -> None:
+        train = pd.DataFrame(
+            {
+                "feature": [0.0, 1.0, 2.0, 3.0],
+                **{label: [1, 1, 1, 0] for label in LABELS},
+            }
+        )
+        with patch("experiments.lightgbm_baseline.run.lgb.LGBMClassifier") as classifier:
+            classifier.return_value.fit.return_value = None
+            fit_models(train, ["feature"], {})
+            self.assertEqual(classifier.call_count, len(LABELS))
+            self.assertTrue(
+                all(
+                    call.kwargs["scale_pos_weight"] == 1 / 3
+                    for call in classifier.call_args_list
+                )
+            )
+
+        with patch("experiments.lightgbm_baseline.run.lgb.LGBMClassifier") as classifier:
+            classifier.return_value.fit.return_value = None
+            fit_models(train, ["feature"], {}, use_scale_pos_weight=False)
+            self.assertTrue(
+                all(
+                    "scale_pos_weight" not in call.kwargs
+                    for call in classifier.call_args_list
+                )
+            )
+
+    def test_fixed_thresholds_are_defaults_and_calibration_is_opt_in(self) -> None:
+        calibration = pd.DataFrame(
+            {label: [0, 1, 0, 1] for label in LABELS}
+        )
+        probabilities = {
+            label: pd.Series([0.01, 0.99, 0.02, 0.98]).to_numpy()
+            for label in LABELS
+        }
+
+        fixed = thresholds_for_predictions(calibration, probabilities, False)
+        calibrated = thresholds_for_predictions(calibration, probabilities, True)
+
+        self.assertEqual(fixed, DEFAULT_THRESHOLDS)
+        self.assertEqual(fixed["push"], 0.45)
+        self.assertTrue(all(fixed[label] == 0.30 for label in LABELS if label != "push"))
+        self.assertEqual(set(calibrated), set(LABELS))
+        self.assertNotEqual(calibrated, fixed)
+
     def test_frequency_nn_uses_only_frequency_inputs_and_returns_probabilities(self) -> None:
         feature_columns = [
-            f"{label}_frequency_per_day_{days}d"
-            for days in LOOKBACK_DAYS
+            f"{label}_frequency_per_day_7d"
             for label in LABELS
         ]
-        columns = ["user_id", "cutoff", "is_bot", *LABELS, *feature_columns]
+        columns = ["user_id", "cutoff", *LABELS, *feature_columns]
         selected_features = frequency_feature_columns(columns)
         self.assertEqual(selected_features, feature_columns)
         self.assertNotIn("user_id", selected_features)
         self.assertFalse(any(label in selected_features for label in LABELS))
-        self.assertNotIn("is_bot", selected_features)
 
         train = pd.DataFrame(
             {
@@ -56,33 +102,9 @@ class LifecycleFeatureTests(unittest.TestCase):
             self.assertEqual(values.shape, (24,))
             self.assertTrue(((values >= 0) & (values <= 1)).all())
 
-    def test_is_bot_is_attached_as_binary_feature_without_user_id(self) -> None:
-        frame = pd.DataFrame(
-            {
-                "user_id": [7, 8],
-                "cutoff": pd.to_datetime(["2024-01-10", "2024-01-10"]),
-            }
-        )
-        users = pd.DataFrame(
-            {
-                "user_id": [7, 8],
-                "is_bot": [False, True],
-                "first_seen_at": pd.to_datetime(["2024-01-01", "2024-01-10"]),
-            }
-        )
-
-        result = add_user_bot_feature(frame, users)
-
-        self.assertEqual(result.loc[0, "is_bot"], 0)
-        self.assertTrue(pd.isna(result.loc[1, "is_bot"]))
-        self.assertEqual(frame.columns.tolist(), ["user_id", "cutoff"])
-        with self.assertRaisesRegex(ValueError, "Cannot determine is_bot"):
-            add_user_bot_feature(frame, users.iloc[:1])
-
     def test_frequency_nn_can_share_one_six_label_output_layer(self) -> None:
         feature_columns = [
-            f"{label}_frequency_per_day_{days}d"
-            for days in LOOKBACK_DAYS
+            f"{label}_frequency_per_day_7d"
             for label in LABELS
         ]
         train = pd.DataFrame(
@@ -139,8 +161,8 @@ class LifecycleFeatureTests(unittest.TestCase):
             for label, action_dates, available_dates in (
                 (
                     "open_pr",
-                    ["2024-03-01"],
-                    ["2024-03-01"],
+                    ["2024-03-10"],
+                    ["2024-03-10"],
                 ),
                 (
                     "open_issue",
@@ -149,8 +171,8 @@ class LifecycleFeatureTests(unittest.TestCase):
                 ),
                 (
                     "issue_comment",
-                    ["2024-02-01", "2024-02-15"],
-                    ["2024-02-01", "2024-02-15"],
+                    ["2024-03-05", "2024-03-15"],
+                    ["2024-03-05", "2024-03-15"],
                 ),
                 (
                     "pr_review",
@@ -182,19 +204,31 @@ class LifecycleFeatureTests(unittest.TestCase):
 
         features = row_for_cutoff(cutoff, histories, [7, 8]).set_index("user_id")
 
-        self.assertEqual(int(features.loc[7, "total_actions_count_90d"]), 6)
-        self.assertAlmostEqual(float(features.loc[7, "push_share_90d"]), 0.5)
-        self.assertAlmostEqual(float(features.loc[7, "open_pr_share_90d"]), 1 / 6)
+        self.assertAlmostEqual(float(features.loc[7, "push_share_30d"]), 0.5)
+        self.assertAlmostEqual(float(features.loc[7, "open_pr_share_30d"]), 1 / 6)
         self.assertAlmostEqual(
-            float(features.loc[7, "issue_comment_share_90d"]), 2 / 6
+            float(features.loc[7, "issue_comment_share_30d"]), 2 / 6
+        )
+        self.assertEqual(float(features.loc[8, "push_share_30d"]), 0.0)
+        self.assertIn("total_actions_count_7d", features.columns)
+        self.assertNotIn("total_actions_count_30d", features.columns)
+        self.assertFalse(
+            any(column.endswith("_count_30d") for column in features.columns)
         )
         self.assertAlmostEqual(
-            float(features.loc[7, "push_frequency_per_day_90d"]), 3 / 90
+            float(features.loc[7, "push_frequency_per_day_7d"]), 0.0
         )
-        self.assertEqual(int(features.loc[8, "total_actions_count_90d"]), 0)
-        self.assertEqual(float(features.loc[8, "push_share_90d"]), 0.0)
-        self.assertEqual(
-            float(features.loc[8, "push_frequency_per_day_90d"]), 0.0
+        self.assertTrue(
+            all(
+                f"{label}_frequency_per_day_7d" in features.columns
+                for label in LABELS
+            )
+        )
+        self.assertFalse(
+            any("_frequency_per_day_30d" in column for column in features.columns)
+        )
+        self.assertFalse(
+            any("90d" in column or "365d" in column for column in features.columns)
         )
 
     def test_median_daily_activity_includes_zero_days_and_respects_availability(self) -> None:
@@ -269,6 +303,50 @@ class LifecycleFeatureTests(unittest.TestCase):
         )
         self.assertEqual(float(features.loc[8, "total_median_actions_per_day_7d"]), 0)
 
+    def test_90_day_sample_filter_is_cutoff_safe_and_not_a_feature(self) -> None:
+        histories = {
+            label: pd.DataFrame(
+                {
+                    "user_id": user_ids,
+                    "repo_id": [1] * len(user_ids),
+                    "action_at": pd.to_datetime(action_dates),
+                    "available_at": pd.to_datetime(available_dates),
+                }
+            )
+            for label, user_ids, action_dates, available_dates in (
+                ("open_pr", [7, 8], ["2024-01-01"] * 2, ["2024-01-01"] * 2),
+                ("open_issue", [7, 8], ["2024-01-02"] * 2, ["2024-01-02"] * 2),
+                (
+                    "issue_comment",
+                    [7, 8],
+                    ["2024-01-03"] * 2,
+                    ["2024-01-03"] * 2,
+                ),
+                (
+                    "pr_review",
+                    [7, 8],
+                    ["2024-01-04"] * 2,
+                    ["2024-01-11", "2024-01-04"],
+                ),
+                (
+                    "pr_review_comment",
+                    [7, 8],
+                    ["2024-01-05"] * 2,
+                    ["2024-01-05"] * 2,
+                ),
+                ("push", [], [], []),
+            )
+        }
+        cutoff = pd.Timestamp("2024-01-10")
+
+        eligible = eligible_users_for_cutoff(cutoff, histories, [7, 8])
+        features = row_for_cutoff(cutoff, histories, [7, 8])
+
+        self.assertEqual(eligible.tolist(), [False, True])
+        self.assertFalse(
+            any("90d" in column or "365d" in column for column in features.columns)
+        )
+
     def test_lifecycle_events_require_event_and_row_availability_before_cutoff(self) -> None:
         raw = pd.DataFrame(
             {
@@ -292,7 +370,7 @@ class LifecycleFeatureTests(unittest.TestCase):
             [7],
         )
 
-        self.assertEqual(int(features.loc[0, "pr_merged_authored_count_90d"]), 1)
+        self.assertEqual(int(features.loc[0, "pr_merged_authored_count_7d"]), 1)
 
     def test_load_histories_builds_lifecycle_features_for_the_right_users(self) -> None:
         tables = {
@@ -362,12 +440,12 @@ class LifecycleFeatureTests(unittest.TestCase):
         cutoff = pd.Timestamp("2024-01-10")
         authored = row_for_cutoff(cutoff, histories, [7, 8]).set_index("user_id")
 
-        self.assertEqual(int(authored.loc[7, "pr_merged_authored_count_90d"]), 1)
-        self.assertEqual(int(authored.loc[8, "pr_merged_by_count_90d"]), 1)
+        self.assertEqual(int(authored.loc[7, "pr_merged_authored_count_7d"]), 1)
+        self.assertEqual(int(authored.loc[8, "pr_merged_by_count_7d"]), 1)
         self.assertEqual(
-            int(authored.loc[7, "issue_closed_reason_completed_count_90d"]), 1
+            int(authored.loc[7, "issue_closed_reason_completed_count_7d"]), 1
         )
-        self.assertEqual(int(authored.loc[7, "pr_review_dismissed_count_90d"]), 1)
+        self.assertEqual(int(authored.loc[7, "pr_review_dismissed_count_7d"]), 1)
 
     def test_training_examples_require_complete_labels_before_prediction(self) -> None:
         data = pd.DataFrame(

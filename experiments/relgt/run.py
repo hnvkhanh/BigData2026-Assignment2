@@ -23,6 +23,7 @@ from sklearn.metrics import f1_score
 from .data import (
     HORIZON_DAYS,
     LABELS,
+    LOOKBACK_DAYS,
     GraphTokens,
     TrainingExamples,
     build_training_examples,
@@ -31,6 +32,7 @@ from .data import (
     snapshot_tokens,
 )
 from .model import RelGTInspired
+from .gnn_model import RelationalGNN
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -39,7 +41,8 @@ DEFAULT_TEST_INPUT = ROOT / "assignment2" / "evaluation" / "test_input.csv"
 DEFAULT_OUTPUT_ROOT = Path(__file__).resolve().parent / "outputs"
 DEFAULT_START_CUTOFF = "2026-03-01 00:00:00"
 DEFAULT_PREDICTION_CUTOFF = "2026-11-11 16:00:00"
-CACHE_VERSION = 2
+CACHE_VERSION = 3
+ENSEMBLE_LOOKBACK_OPTIONS = (7, 14, 21, 30, 90)
 
 
 @dataclass(frozen=True)
@@ -177,13 +180,20 @@ def create_run_output_dir(command: str, requested_dir: Path | None) -> Path:
     return output_dir
 
 
-def _data_signature(db_dir: Path, start_cutoff: pd.Timestamp) -> dict[str, Any]:
+def _data_signature(
+    db_dir: Path,
+    start_cutoff: pd.Timestamp,
+    lookback_days: int,
+    eligibility_lookback_days: int,
+) -> dict[str, Any]:
     parquet_files = sorted(db_dir.glob("*.parquet"))
     if not parquet_files:
         raise FileNotFoundError(f"No Parquet tables found in {db_dir}.")
     return {
         "version": CACHE_VERSION,
         "start_cutoff": str(start_cutoff),
+        "lookback_days": lookback_days,
+        "eligibility_lookback_days": eligibility_lookback_days,
         "tables": [
             {
                 "name": path.name,
@@ -199,10 +209,32 @@ def load_or_build_examples(
     db_dir: Path,
     output_dir: Path,
     start_cutoff: pd.Timestamp,
+    lookback_days: int = LOOKBACK_DAYS,
+    eligibility_lookback_days: int | None = None,
 ) -> TrainingExamples:
-    cache_path = output_dir / "cache" / "weekly_graph_examples.npz"
+    if lookback_days < 1:
+        raise ValueError("lookback_days must be positive.")
+    if eligibility_lookback_days is None:
+        eligibility_lookback_days = lookback_days
+    if eligibility_lookback_days < lookback_days:
+        raise ValueError(
+            "eligibility_lookback_days must be at least lookback_days."
+        )
+    if (
+        lookback_days == LOOKBACK_DAYS
+        and eligibility_lookback_days == LOOKBACK_DAYS
+    ):
+        cache_name = "weekly_graph_examples.npz"
+    else:
+        cache_name = (
+            f"weekly_graph_examples_{lookback_days}d_"
+            f"eligible_{eligibility_lookback_days}d.npz"
+        )
+    cache_path = output_dir / "cache" / cache_name
     metadata_path = cache_path.with_suffix(".json")
-    signature = _data_signature(db_dir, start_cutoff)
+    signature = _data_signature(
+        db_dir, start_cutoff, lookback_days, eligibility_lookback_days
+    )
 
     if cache_path.exists() and metadata_path.exists():
         metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
@@ -227,7 +259,13 @@ def load_or_build_examples(
             return examples
 
     vocabulary = load_entity_vocabulary(db_dir)
-    examples = build_training_examples(db_dir, start_cutoff, vocabulary)
+    examples = build_training_examples(
+        db_dir,
+        start_cutoff,
+        vocabulary,
+        lookback_days=lookback_days,
+        eligibility_lookback_days=eligibility_lookback_days,
+    )
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     temporary_path = cache_path.with_suffix(".tmp.npz")
     np.savez(
@@ -279,9 +317,19 @@ def _model(
     num_heads: int,
     num_layers: int,
     dropout: float,
-) -> RelGTInspired:
+    architecture: str = "relgt",
+) -> RelGTInspired | RelationalGNN:
+    if architecture == "gnn":
+        return RelationalGNN(
+            num_entities=num_entities,
+            hidden_dim=hidden_dim,
+            num_layers=num_layers,
+            dropout=dropout,
+        )
     if hidden_dim % num_heads:
         raise ValueError("--hidden-dim must be divisible by --num-heads.")
+    if architecture != "relgt":
+        raise ValueError(f"Unsupported graph architecture: {architecture}")
     return RelGTInspired(
         num_entities=num_entities,
         hidden_dim=hidden_dim,
@@ -323,11 +371,14 @@ def fit_model(
     num_layers: int,
     dropout: float,
     seed: int,
-) -> RelGTInspired:
+    architecture: str = "relgt",
+) -> RelGTInspired | RelationalGNN:
     torch.manual_seed(seed)
     np.random.seed(seed)
     random.seed(seed)
-    model = _model(num_entities, hidden_dim, num_heads, num_layers, dropout)
+    model = _model(
+        num_entities, hidden_dim, num_heads, num_layers, dropout, architecture
+    )
     model.to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
     criterion = torch.nn.BCEWithLogitsLoss()
@@ -356,7 +407,7 @@ def fit_model(
 
 
 def predict_probabilities(
-    model: RelGTInspired,
+    model: RelGTInspired | RelationalGNN,
     tokens: GraphTokens,
     indices: np.ndarray,
     device: torch.device,
@@ -441,7 +492,18 @@ def choose_fusion_weight(
     labels: np.ndarray,
     graph_probabilities: np.ndarray,
     s2p2_probabilities: np.ndarray,
+    manual_weight: float | None = None,
 ) -> tuple[float, dict[str, float], dict[str, Any]]:
+    if manual_weight is not None:
+        if not np.isfinite(manual_weight) or not 0.0 <= manual_weight <= 1.0:
+            raise ValueError("A manual fusion weight must be between 0 and 1.")
+        fused = fuse_probabilities(
+            graph_probabilities, s2p2_probabilities, manual_weight
+        )
+        thresholds = choose_thresholds(labels, fused)
+        metrics = calculate_metrics(labels, fused, thresholds)
+        return manual_weight, thresholds, metrics
+
     best_weight = 0.0
     best_thresholds: dict[str, float] = {}
     best_metrics: dict[str, Any] | None = None
@@ -492,12 +554,24 @@ def choose_three_fusion_weights(
     relgt_probabilities: np.ndarray,
     lightgbm_probabilities: np.ndarray,
     s2p2_probabilities: np.ndarray,
+    manual_weights: dict[str, float] | None = None,
 ) -> tuple[dict[str, float], dict[str, float], dict[str, Any]]:
     expected_shape = (len(labels), len(LABELS))
     if labels.ndim != 2 or labels.shape != expected_shape or not len(labels):
         raise ValueError(
             f"Calibration labels must have non-empty shape (n, {len(LABELS)})."
         )
+    if manual_weights is not None:
+        fused = fuse_three_probabilities(
+            relgt_probabilities,
+            lightgbm_probabilities,
+            s2p2_probabilities,
+            manual_weights,
+        )
+        thresholds = choose_thresholds(labels, fused)
+        metrics = calculate_metrics(labels, fused, thresholds)
+        return manual_weights.copy(), thresholds, metrics
+
     best_weights: dict[str, float] | None = None
     best_thresholds: dict[str, float] = {}
     best_metrics: dict[str, Any] | None = None
@@ -552,6 +626,42 @@ def s2p2_examples_for_rows(
             ),
         }
     )
+
+
+def save_holdout_probabilities(
+    examples: TrainingExamples,
+    indices: np.ndarray,
+    branch_probabilities: dict[str, np.ndarray],
+    output_path: Path,
+) -> None:
+    """Write holdout labels and every model branch in the shared CSV schema."""
+    holdout_labels = examples.labels[indices]
+    output = pd.DataFrame(
+        {
+            "user_id": examples.tokens.user_ids[indices],
+            "cutoff": s2p2_examples_for_rows(examples, indices)["cutoff"],
+        }
+    )
+    for column, label in enumerate(LABELS):
+        output[f"actual_{label}"] = holdout_labels[:, column]
+
+    for branch, values in branch_probabilities.items():
+        probabilities = np.asarray(values)
+        expected_shape = (len(indices), len(LABELS))
+        if probabilities.shape != expected_shape:
+            raise ValueError(
+                f"{branch} holdout probabilities must have shape {expected_shape}, "
+                f"got {probabilities.shape}."
+            )
+        if not np.isfinite(probabilities).all() or (
+            (probabilities < 0) | (probabilities > 1)
+        ).any():
+            raise ValueError(
+                f"{branch} holdout probabilities must be finite values in [0, 1]."
+            )
+        for column, label in enumerate(LABELS):
+            output[f"{branch}_{label}"] = probabilities[:, column]
+    output.to_csv(output_path, index=False)
 
 
 def lightgbm_examples_for_graph(
@@ -618,7 +728,13 @@ def fit_lightgbm_branch(
         if column not in {"user_id", "cutoff", *LABELS}
     ]
     params = lightgbm_model_params(args)
-    models = fit_models(aligned_data.iloc[train_indices], feature_columns, params)
+    models = fit_models(
+        aligned_data.iloc[train_indices],
+        feature_columns,
+        params,
+        args.scale_pos_weight,
+    )
+    params["use_scale_pos_weight"] = int(args.scale_pos_weight)
     return models, histories, aligned_data, feature_columns, params
 
 
@@ -679,7 +795,307 @@ def fit_s2p2_branch(
     return model, histories, s2p2_device
 
 
+def parse_ensemble_lookbacks(value: str) -> tuple[int, int]:
+    try:
+        lookbacks = tuple(int(part.strip()) for part in value.split(","))
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(
+            "lookbacks must be two comma-separated day values."
+        ) from error
+    if len(lookbacks) != 2 or lookbacks[0] == lookbacks[1]:
+        raise argparse.ArgumentTypeError("provide exactly two distinct lookback values.")
+    if any(days not in ENSEMBLE_LOOKBACK_OPTIONS for days in lookbacks):
+        supported = ", ".join(map(str, ENSEMBLE_LOOKBACK_OPTIONS))
+        raise argparse.ArgumentTypeError(
+            f"lookback values must be selected from: {supported}."
+        )
+    return lookbacks
+
+
+def parse_unit_interval(value: str) -> float:
+    try:
+        weight = float(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("weight must be a number in [0, 1].") from error
+    if not np.isfinite(weight) or not 0.0 <= weight <= 1.0:
+        raise argparse.ArgumentTypeError("weight must be a finite number in [0, 1].")
+    return weight
+
+
+def parse_three_branch_weights(value: str) -> dict[str, float]:
+    weights: dict[str, float] = {}
+    try:
+        for item in value.split(","):
+            name, raw_weight = item.split("=", maxsplit=1)
+            name = name.strip()
+            if name in weights:
+                raise ValueError(f"duplicate branch {name!r}")
+            weights[name] = float(raw_weight)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(
+            "weights must use relgt=<value>,lightgbm=<value>,s2p2=<value>."
+        ) from error
+    expected_names = {"relgt", "lightgbm", "s2p2"}
+    if set(weights) != expected_names:
+        raise argparse.ArgumentTypeError(
+            "provide exactly relgt, lightgbm, and s2p2 weights."
+        )
+    if any(not np.isfinite(weight) or weight < 0 for weight in weights.values()):
+        raise argparse.ArgumentTypeError("weights must be finite and non-negative.")
+    if not np.isclose(sum(weights.values()), 1.0):
+        raise argparse.ArgumentTypeError("weights must sum to 1.")
+    return weights
+
+
+def _validate_aligned_examples(
+    reference: TrainingExamples, candidate: TrainingExamples
+) -> None:
+    if not (
+        np.array_equal(reference.tokens.user_ids, candidate.tokens.user_ids)
+        and np.array_equal(reference.cutoff_days, candidate.cutoff_days)
+        and np.array_equal(reference.labels, candidate.labels)
+    ):
+        raise ValueError(
+            "Lookback examples are not aligned by user, cutoff, and label."
+        )
+
+
+def _fit_lookback_models(
+    examples_by_lookback: dict[int, TrainingExamples],
+    lookbacks: tuple[int, int],
+    train_indices: np.ndarray,
+    args: argparse.Namespace,
+    device: torch.device,
+    architecture: str,
+) -> dict[int, RelGTInspired | RelationalGNN]:
+    models: dict[int, RelGTInspired | RelationalGNN] = {}
+    for lookback_days in lookbacks:
+        examples = examples_by_lookback[lookback_days]
+        print(f"Training {architecture.upper()} with {lookback_days}-day lookback")
+        model = fit_model(
+            examples,
+            train_indices,
+            examples.num_entities,
+            device,
+            args.epochs,
+            args.batch_size,
+            args.hidden_dim,
+            args.num_heads,
+            args.num_layers,
+            args.dropout,
+            args.seed + lookback_days,
+            architecture,
+        )
+        models[lookback_days] = model
+    return models
+
+
+def _predict_lookback_models(
+    models: dict[int, RelGTInspired | RelationalGNN],
+    examples_by_lookback: dict[int, TrainingExamples],
+    indices: np.ndarray,
+    device: torch.device,
+    batch_size: int,
+) -> dict[int, np.ndarray]:
+    return {
+        lookback_days: predict_probabilities(
+            model,
+            examples_by_lookback[lookback_days].tokens,
+            indices,
+            device,
+            batch_size,
+        )
+        for lookback_days, model in models.items()
+    }
+
+
+def _ensemble_branch_name(architecture: str, lookback_days: int) -> str:
+    return f"{architecture}_{lookback_days}d"
+
+
+def _fuse_lookback_probabilities(
+    labels: np.ndarray,
+    lookbacks: tuple[int, int],
+    probabilities: dict[int, np.ndarray],
+    manual_weight: float | None = None,
+) -> tuple[float, dict[str, float], dict[str, Any], np.ndarray]:
+    first, second = lookbacks
+    first_weight, thresholds, metrics = choose_fusion_weight(
+        labels, probabilities[first], probabilities[second], manual_weight
+    )
+    fused = fuse_probabilities(
+        probabilities[first], probabilities[second], first_weight
+    )
+    return first_weight, thresholds, metrics, fused
+
+
+def run_lookback_ensemble_backtest(
+    args: argparse.Namespace, architecture: str
+) -> None:
+    lookbacks = args.ensemble_lookbacks
+    eligibility_lookback_days = max(lookbacks)
+    examples_by_lookback = {
+        days: load_or_build_examples(
+            args.db_dir,
+            args.output_dir,
+            args.start_cutoff,
+            lookback_days=days,
+            eligibility_lookback_days=eligibility_lookback_days,
+        )
+        for days in lookbacks
+    }
+    reference = examples_by_lookback[lookbacks[0]]
+    for days in lookbacks[1:]:
+        _validate_aligned_examples(reference, examples_by_lookback[days])
+
+    train_end, calibration_end = chronological_splits(reference.cutoff_days)
+    train_indices = np.flatnonzero(reference.cutoff_days < train_end)
+    calibration_indices = np.flatnonzero(
+        (reference.cutoff_days >= train_end)
+        & (reference.cutoff_days < calibration_end)
+    )
+    holdout_indices = np.flatnonzero(reference.cutoff_days >= calibration_end)
+    if not len(calibration_indices) or not len(holdout_indices):
+        raise ValueError(
+            "The chronological split produced an empty calibration or holdout set."
+        )
+
+    device = select_device(args.device)
+    print(
+        f"Device: {device}; chronological boundaries: train < "
+        f"{pd.Timestamp(train_end, unit='D')}, holdout >= "
+        f"{pd.Timestamp(calibration_end, unit='D')}"
+    )
+    models = _fit_lookback_models(
+        examples_by_lookback,
+        lookbacks,
+        train_indices,
+        args,
+        device,
+        architecture,
+    )
+    calibration_by_lookback = _predict_lookback_models(
+        models,
+        examples_by_lookback,
+        calibration_indices,
+        device,
+        args.batch_size,
+    )
+    holdout_by_lookback = _predict_lookback_models(
+        models,
+        examples_by_lookback,
+        holdout_indices,
+        device,
+        args.batch_size,
+    )
+    first_weight, thresholds, calibration_metrics, _ = (
+        _fuse_lookback_probabilities(
+            reference.labels[calibration_indices],
+            lookbacks,
+            calibration_by_lookback,
+            args.fusion_weight,
+        )
+    )
+    second_weight = 1.0 - first_weight
+    fused_holdout = fuse_probabilities(
+        holdout_by_lookback[lookbacks[0]],
+        holdout_by_lookback[lookbacks[1]],
+        first_weight,
+    )
+    branch_probabilities = {
+        _ensemble_branch_name(architecture, days): holdout_by_lookback[days]
+        for days in lookbacks
+    }
+    branch_probabilities["fused"] = fused_holdout
+    branch_thresholds = {
+        _ensemble_branch_name(architecture, days): choose_thresholds(
+            reference.labels[calibration_indices], calibration_by_lookback[days]
+        )
+        for days in lookbacks
+    }
+    branch_thresholds["fused"] = thresholds
+    branch_metrics = {
+        branch: calculate_metrics(
+            reference.labels[holdout_indices], values, branch_thresholds[branch]
+        )
+        for branch, values in branch_probabilities.items()
+    }
+
+    for days, model in models.items():
+        torch.save(
+            model.state_dict(),
+            args.output_dir / f"{architecture}_{days}d_model.pt",
+        )
+    save_holdout_probabilities(
+        reference,
+        holdout_indices,
+        branch_probabilities,
+        args.output_dir / "holdout_probabilities.csv",
+    )
+    results = calculate_metrics(
+        reference.labels[holdout_indices], fused_holdout, thresholds
+    )
+    unique_cutoffs = np.unique(reference.cutoff_days)
+    results.update(
+        {
+            "split": {
+                "train_weeks": int(np.sum(unique_cutoffs < train_end)),
+                "calibration_weeks": int(
+                    np.sum(
+                        (unique_cutoffs >= train_end)
+                        & (unique_cutoffs < calibration_end)
+                    )
+                ),
+                "holdout_weeks": int(np.sum(unique_cutoffs >= calibration_end)),
+                "holdout_start": str(pd.Timestamp(calibration_end, unit="D")),
+            },
+            "device": str(device),
+            "temporal_model": f"{architecture}_lookback_ensemble",
+            "architecture": (
+                "RelGT-inspired sampled temporal neighborhood encoder"
+                if architecture == "relgt"
+                else "Relation-aware message passing over sampled user ego graphs"
+            ),
+            "lookback_days": list(lookbacks),
+            "eligibility_lookback_days": eligibility_lookback_days,
+            "epochs": args.epochs,
+            "experiment": args.output_dir.name,
+            "fusion": {
+                "method": (
+                    "manual probability averaging"
+                    if args.fusion_weight is not None
+                    else "calibration-selected probability averaging"
+                ),
+                "weights": {
+                    _ensemble_branch_name(architecture, lookbacks[0]): first_weight,
+                    _ensemble_branch_name(architecture, lookbacks[1]): second_weight,
+                },
+                "calibration_score": calibration_metrics["score"],
+            },
+            "branch_holdout": branch_metrics,
+        }
+    )
+    metrics_path = args.output_dir / "backtest_metrics.json"
+    metrics_path.write_text(json.dumps(results, indent=2) + "\n", encoding="utf-8")
+    print(
+        "HOLDOUT RESULTS (ensemble weights "
+        + (
+            "manually specified"
+            if args.fusion_weight is not None
+            else "selected on calibration weeks"
+        )
+        + ")"
+    )
+    print(json.dumps(results, indent=2))
+    print(f"Saved holdout metrics to {metrics_path}")
+    print(f"Saved holdout probabilities to {args.output_dir / 'holdout_probabilities.csv'}")
+
+
 def run_backtest(args: argparse.Namespace) -> None:
+    if args.temporal_model in {"relgt_ensemble", "gnn_ensemble"}:
+        architecture = "relgt" if args.temporal_model == "relgt_ensemble" else "gnn"
+        run_lookback_ensemble_backtest(args, architecture)
+        return
     if args.temporal_model in {"hybrid", "relgt_lightgbm_s2p2"}:
         require_s2p2_dependency()
     examples = load_or_build_examples(args.db_dir, args.output_dir, args.start_cutoff)
@@ -711,6 +1127,7 @@ def run_backtest(args: argparse.Namespace) -> None:
         args.num_layers,
         args.dropout,
         args.seed,
+        "gnn" if args.temporal_model == "gnn" else "relgt",
     )
     graph_calibration_probabilities = predict_probabilities(
         model, examples.tokens, calibration_indices, device, args.batch_size
@@ -739,6 +1156,7 @@ def run_backtest(args: argparse.Namespace) -> None:
             examples.labels[calibration_indices],
             graph_calibration_probabilities,
             s2p2_calibration_probabilities,
+            args.fusion_weight,
         )
         graph_only_thresholds = choose_thresholds(
             examples.labels[calibration_indices], graph_calibration_probabilities
@@ -763,24 +1181,16 @@ def run_backtest(args: argparse.Namespace) -> None:
         )
         torch.save(model.state_dict(), args.output_dir / "relgt_model.pt")
         s2p2_model.save(args.output_dir / "s2p2_model.pt")
-        pd.DataFrame(
+        save_holdout_probabilities(
+            examples,
+            holdout_indices,
             {
-                "user_id": examples.tokens.user_ids[holdout_indices],
-                "cutoff": s2p2_examples_for_rows(examples, holdout_indices)["cutoff"],
-                **{
-                    f"relgt_{label}": graph_holdout_probabilities[:, column]
-                    for column, label in enumerate(LABELS)
-                },
-                **{
-                    f"s2p2_{label}": s2p2_holdout_probabilities[:, column]
-                    for column, label in enumerate(LABELS)
-                },
-                **{
-                    f"fused_{label}": holdout_probabilities[:, column]
-                    for column, label in enumerate(LABELS)
-                },
-            }
-        ).to_csv(args.output_dir / "holdout_probabilities.csv", index=False)
+                "relgt": graph_holdout_probabilities,
+                "s2p2": s2p2_holdout_probabilities,
+                "fused": holdout_probabilities,
+            },
+            args.output_dir / "holdout_probabilities.csv",
+        )
     elif args.temporal_model == "relgt_lightgbm":
         (
             lightgbm_models,
@@ -805,6 +1215,7 @@ def run_backtest(args: argparse.Namespace) -> None:
             examples.labels[calibration_indices],
             graph_calibration_probabilities,
             lightgbm_calibration_probabilities,
+            args.fusion_weight,
         )
         graph_only_thresholds = choose_thresholds(
             examples.labels[calibration_indices], graph_calibration_probabilities
@@ -830,25 +1241,16 @@ def run_backtest(args: argparse.Namespace) -> None:
         )
         torch.save(model.state_dict(), args.output_dir / "relgt_model.pt")
         save_lightgbm_models(lightgbm_models, args.output_dir)
-        holdout_rows = s2p2_examples_for_rows(examples, holdout_indices)
-        pd.DataFrame(
+        save_holdout_probabilities(
+            examples,
+            holdout_indices,
             {
-                "user_id": examples.tokens.user_ids[holdout_indices],
-                "cutoff": holdout_rows["cutoff"],
-                **{
-                    f"relgt_{label}": graph_holdout_probabilities[:, column]
-                    for column, label in enumerate(LABELS)
-                },
-                **{
-                    f"lightgbm_{label}": lightgbm_holdout_probabilities[:, column]
-                    for column, label in enumerate(LABELS)
-                },
-                **{
-                    f"fused_{label}": holdout_probabilities[:, column]
-                    for column, label in enumerate(LABELS)
-                },
-            }
-        ).to_csv(args.output_dir / "holdout_probabilities.csv", index=False)
+                "relgt": graph_holdout_probabilities,
+                "lightgbm": lightgbm_holdout_probabilities,
+                "fused": holdout_probabilities,
+            },
+            args.output_dir / "holdout_probabilities.csv",
+        )
     elif args.temporal_model == "relgt_lightgbm_s2p2":
         cohort_user_ids = pd.read_parquet(
             args.db_dir / "Users.parquet", columns=["user_id", "is_cohort"]
@@ -890,6 +1292,7 @@ def run_backtest(args: argparse.Namespace) -> None:
             graph_calibration_probabilities,
             lightgbm_calibration_probabilities,
             s2p2_calibration_probabilities,
+            args.fusion_weights,
         )
         calibration_branch_probabilities = {
             "relgt": graph_calibration_probabilities,
@@ -925,29 +1328,17 @@ def run_backtest(args: argparse.Namespace) -> None:
         torch.save(model.state_dict(), args.output_dir / "relgt_model.pt")
         s2p2_model.save(args.output_dir / "s2p2_model.pt")
         save_lightgbm_models(lightgbm_models, args.output_dir)
-        holdout_rows = s2p2_examples_for_rows(examples, holdout_indices)
-        pd.DataFrame(
+        save_holdout_probabilities(
+            examples,
+            holdout_indices,
             {
-                "user_id": examples.tokens.user_ids[holdout_indices],
-                "cutoff": holdout_rows["cutoff"],
-                **{
-                    f"relgt_{label}": graph_holdout_probabilities[:, column]
-                    for column, label in enumerate(LABELS)
-                },
-                **{
-                    f"lightgbm_{label}": lightgbm_holdout_probabilities[:, column]
-                    for column, label in enumerate(LABELS)
-                },
-                **{
-                    f"s2p2_{label}": s2p2_holdout_probabilities[:, column]
-                    for column, label in enumerate(LABELS)
-                },
-                **{
-                    f"fused_{label}": holdout_probabilities[:, column]
-                    for column, label in enumerate(LABELS)
-                },
-            }
-        ).to_csv(args.output_dir / "holdout_probabilities.csv", index=False)
+                "relgt": graph_holdout_probabilities,
+                "lightgbm": lightgbm_holdout_probabilities,
+                "s2p2": s2p2_holdout_probabilities,
+                "fused": holdout_probabilities,
+            },
+            args.output_dir / "holdout_probabilities.csv",
+        )
     else:
         s2p2_model = None
         s2p2_device = None
@@ -957,6 +1348,15 @@ def run_backtest(args: argparse.Namespace) -> None:
             examples.labels[calibration_indices], graph_calibration_probabilities
         )
         holdout_probabilities = graph_holdout_probabilities
+        if args.temporal_model == "gnn":
+            torch.save(model.state_dict(), args.output_dir / "gnn_model.pt")
+        branch_name = "gnn" if args.temporal_model == "gnn" else "relgt"
+        save_holdout_probabilities(
+            examples,
+            holdout_indices,
+            {branch_name: holdout_probabilities},
+            args.output_dir / "holdout_probabilities.csv",
+        )
     results = calculate_metrics(
         examples.labels[holdout_indices], holdout_probabilities, thresholds
     )
@@ -973,10 +1373,18 @@ def run_backtest(args: argparse.Namespace) -> None:
     results["temporal_model"] = args.temporal_model
     results["epochs"] = args.epochs
     results["experiment"] = args.output_dir.name
-    results["architecture"] = "RelGT-inspired sampled temporal neighborhood encoder"
+    results["architecture"] = (
+        "Relation-aware message passing over sampled user ego graphs"
+        if args.temporal_model == "gnn"
+        else "RelGT-inspired sampled temporal neighborhood encoder"
+    )
     if args.temporal_model == "hybrid":
         results["fusion"] = {
-            "method": "calibration-selected probability averaging",
+            "method": (
+                "manual probability averaging"
+                if args.fusion_weight is not None
+                else "calibration-selected probability averaging"
+            ),
             "graph_weight": graph_weight,
             "s2p2_weight": 1.0 - graph_weight,
             "calibration_score": calibration_metrics["score"],
@@ -989,7 +1397,11 @@ def run_backtest(args: argparse.Namespace) -> None:
         }
     elif args.temporal_model == "relgt_lightgbm":
         results["fusion"] = {
-            "method": "calibration-selected probability averaging",
+            "method": (
+                "manual probability averaging"
+                if args.fusion_weight is not None
+                else "calibration-selected probability averaging"
+            ),
             "relgt_weight": graph_weight,
             "lightgbm_weight": 1.0 - graph_weight,
             "calibration_score": calibration_metrics["score"],
@@ -1001,7 +1413,11 @@ def run_backtest(args: argparse.Namespace) -> None:
         }
     elif args.temporal_model == "relgt_lightgbm_s2p2":
         results["fusion"] = {
-            "method": "calibration-selected three-branch probability averaging",
+            "method": (
+                "manual three-branch probability averaging"
+                if args.fusion_weights is not None
+                else "calibration-selected three-branch probability averaging"
+            ),
             "weights": fusion_weights,
             "calibration_score": calibration_metrics["score"],
             "lightgbm_params": lightgbm_params,
@@ -1014,9 +1430,184 @@ def run_backtest(args: argparse.Namespace) -> None:
     metrics_path.write_text(json.dumps(results, indent=2) + "\n", encoding="utf-8")
     print(json.dumps(results, indent=2))
     print(f"Saved holdout metrics to {metrics_path}")
+    print(f"Saved holdout probabilities to {args.output_dir / 'holdout_probabilities.csv'}")
+
+
+def run_lookback_ensemble_prediction(
+    args: argparse.Namespace, architecture: str
+) -> None:
+    lookbacks = args.ensemble_lookbacks
+    eligibility_lookback_days = max(lookbacks)
+    examples_by_lookback = {
+        days: load_or_build_examples(
+            args.db_dir,
+            args.output_dir,
+            args.start_cutoff,
+            lookback_days=days,
+            eligibility_lookback_days=eligibility_lookback_days,
+        )
+        for days in lookbacks
+    }
+    reference = examples_by_lookback[lookbacks[0]]
+    for days in lookbacks[1:]:
+        _validate_aligned_examples(reference, examples_by_lookback[days])
+
+    usable_indices = prediction_example_indices(reference.cutoff_days, args.cutoff)
+    usable_cutoffs = reference.cutoff_days[usable_indices]
+    train_end, _ = chronological_splits(usable_cutoffs)
+    train_indices = usable_indices[usable_cutoffs < train_end]
+    calibration_indices = usable_indices[usable_cutoffs >= train_end]
+    if not len(calibration_indices):
+        raise ValueError("No chronological calibration examples are available.")
+
+    device = select_device(args.device)
+    models = _fit_lookback_models(
+        examples_by_lookback,
+        lookbacks,
+        train_indices,
+        args,
+        device,
+        architecture,
+    )
+    calibration_by_lookback = _predict_lookback_models(
+        models,
+        examples_by_lookback,
+        calibration_indices,
+        device,
+        args.batch_size,
+    )
+    first_weight, thresholds, calibration_metrics, _ = (
+        _fuse_lookback_probabilities(
+            reference.labels[calibration_indices],
+            lookbacks,
+            calibration_by_lookback,
+            args.fusion_weight,
+        )
+    )
+
+    target_users = pd.read_csv(args.test_input, dtype={"UserID": "int64"})
+    if target_users["UserID"].duplicated().any():
+        raise ValueError(f"{args.test_input} contains duplicate UserIDs.")
+    users = pd.read_parquet(
+        args.db_dir / "Users.parquet",
+        columns=["user_id", "github_user_id", "is_cohort"],
+    )
+    cohort_users = users.loc[users["is_cohort"]]
+    user_lookup = cohort_users.set_index("github_user_id")["user_id"]
+    mapped_ids = target_users["UserID"].map(user_lookup)
+    if mapped_ids.isna().any():
+        raise ValueError(
+            f"{int(mapped_ids.isna().sum())} test UserID(s) are not in the cohort "
+            "for this data release."
+        )
+    internal_ids = mapped_ids.to_numpy(dtype=np.int32)
+    vocabulary = load_entity_vocabulary(args.db_dir)
+    events = load_events(
+        args.db_dir, cohort_users["user_id"].astype(int).tolist(), vocabulary
+    )
+    row_indices = np.arange(len(internal_ids), dtype=np.int64)
+    inference_by_lookback: dict[int, np.ndarray] = {}
+    for days in lookbacks:
+        inference_tokens = snapshot_tokens(
+            events,
+            args.cutoff,
+            internal_ids,
+            vocabulary,
+            lookback_days=days,
+        )
+        inference_by_lookback[days] = predict_probabilities(
+            models[days],
+            inference_tokens,
+            row_indices,
+            device,
+            args.batch_size,
+        )
+    second_weight = 1.0 - first_weight
+    probabilities = fuse_probabilities(
+        inference_by_lookback[lookbacks[0]],
+        inference_by_lookback[lookbacks[1]],
+        first_weight,
+    )
+
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    output = pd.DataFrame({"UserID": target_users["UserID"]})
+    for column, label in enumerate(LABELS):
+        output[label] = (probabilities[:, column] >= thresholds[label]).astype(
+            np.uint8
+        )
+    prediction_path = args.output_dir / "predictions.csv"
+    output.to_csv(prediction_path, index=False)
+    probability_values = {
+        f"{label}_probability": probabilities[:, column]
+        for column, label in enumerate(LABELS)
+    }
+    for days, branch_probabilities in inference_by_lookback.items():
+        branch = _ensemble_branch_name(architecture, days)
+        probability_values.update(
+            {
+                f"{branch}_{label}_probability": branch_probabilities[:, column]
+                for column, label in enumerate(LABELS)
+            }
+        )
+        torch.save(
+            models[days].state_dict(),
+            args.output_dir / f"{architecture}_{days}d_model.pt",
+        )
+    probability_output = pd.DataFrame(probability_values)
+    probability_output.insert(0, "UserID", target_users["UserID"].to_numpy())
+    probability_path = args.output_dir / "probabilities.csv"
+    probability_output.to_csv(probability_path, index=False)
+
+    metadata = {
+        "prediction_cutoff_utc": str(args.cutoff),
+        "training_start_cutoff_utc": str(args.start_cutoff),
+        "training_weeks": int(np.unique(reference.cutoff_days[train_indices]).size),
+        "calibration_weeks": int(
+            np.unique(reference.cutoff_days[calibration_indices]).size
+        ),
+        "labels": list(LABELS),
+        "thresholds": thresholds,
+        "device": str(device),
+        "temporal_model": f"{architecture}_lookback_ensemble",
+        "experiment": args.output_dir.name,
+        "epochs": args.epochs,
+        "batch_size": args.batch_size,
+        "hidden_dim": args.hidden_dim,
+        "num_heads": args.num_heads,
+        "num_layers": args.num_layers,
+        "lookback_days": list(lookbacks),
+        "eligibility_lookback_days": eligibility_lookback_days,
+        "architecture": (
+            "RelGT-inspired sampled temporal neighborhood encoder"
+            if architecture == "relgt"
+            else "Relation-aware message passing over sampled user ego graphs"
+        ),
+        "fusion": {
+            "method": (
+                "manual probability averaging"
+                if args.fusion_weight is not None
+                else "calibration-selected probability averaging"
+            ),
+            "weights": {
+                _ensemble_branch_name(architecture, lookbacks[0]): first_weight,
+                _ensemble_branch_name(architecture, lookbacks[1]): second_weight,
+            },
+            "calibration_score": calibration_metrics["score"],
+        },
+    }
+    (args.output_dir / "metadata.json").write_text(
+        json.dumps(metadata, indent=2) + "\n", encoding="utf-8"
+    )
+    print(f"Saved {len(output):,} predictions to {prediction_path}")
+    print(f"Saved unthresholded branch probabilities to {probability_path}")
+    print(f"Device: {device}; calibrated thresholds: {json.dumps(thresholds)}")
 
 
 def run_prediction(args: argparse.Namespace) -> None:
+    if args.temporal_model in {"relgt_ensemble", "gnn_ensemble"}:
+        architecture = "relgt" if args.temporal_model == "relgt_ensemble" else "gnn"
+        run_lookback_ensemble_prediction(args, architecture)
+        return
     if args.temporal_model in {"hybrid", "relgt_lightgbm_s2p2"}:
         require_s2p2_dependency()
     examples = load_or_build_examples(args.db_dir, args.output_dir, args.start_cutoff)
@@ -1041,6 +1632,7 @@ def run_prediction(args: argparse.Namespace) -> None:
         args.num_layers,
         args.dropout,
         args.seed,
+        "gnn" if args.temporal_model == "gnn" else "relgt",
     )
     graph_calibration_probabilities = predict_probabilities(
         model, examples.tokens, calibration_indices, device, args.batch_size
@@ -1065,6 +1657,7 @@ def run_prediction(args: argparse.Namespace) -> None:
             examples.labels[calibration_indices],
             graph_calibration_probabilities,
             s2p2_calibration_probabilities,
+            args.fusion_weight,
         )
     elif args.temporal_model == "relgt_lightgbm":
         (
@@ -1084,6 +1677,7 @@ def run_prediction(args: argparse.Namespace) -> None:
             examples.labels[calibration_indices],
             graph_calibration_probabilities,
             lightgbm_calibration_probabilities,
+            args.fusion_weight,
         )
     elif args.temporal_model == "relgt_lightgbm_s2p2":
         cohort_user_ids = pd.read_parquet(
@@ -1120,6 +1714,7 @@ def run_prediction(args: argparse.Namespace) -> None:
             graph_calibration_probabilities,
             lightgbm_calibration_probabilities,
             s2p2_calibration_probabilities,
+            args.fusion_weights,
         )
     else:
         thresholds = choose_thresholds(
@@ -1135,8 +1730,6 @@ def run_prediction(args: argparse.Namespace) -> None:
             "user_id",
             "github_user_id",
             "is_cohort",
-            "is_bot",
-            "first_seen_at",
         ],
     )
     cohort_users = users.loc[users["is_cohort"]]
@@ -1173,7 +1766,6 @@ def run_prediction(args: argparse.Namespace) -> None:
         )
     elif args.temporal_model == "relgt_lightgbm":
         from experiments.lightgbm_baseline.run import (
-            add_user_bot_feature,
             predict_probabilities as predict_lgbm,
             row_for_cutoff,
         )
@@ -1181,7 +1773,6 @@ def run_prediction(args: argparse.Namespace) -> None:
         inference_features = row_for_cutoff(
             args.cutoff, lightgbm_histories, internal_ids.astype("int64").tolist()
         )
-        inference_features = add_user_bot_feature(inference_features, cohort_users)
         lightgbm_by_label = predict_lgbm(
             lightgbm_models, inference_features, lightgbm_features
         )
@@ -1203,7 +1794,6 @@ def run_prediction(args: argparse.Namespace) -> None:
             [s2p2_by_label[label] for label in LABELS]
         )
         from experiments.lightgbm_baseline.run import (
-            add_user_bot_feature,
             predict_probabilities as predict_lgbm,
             row_for_cutoff,
         )
@@ -1213,7 +1803,6 @@ def run_prediction(args: argparse.Namespace) -> None:
             lightgbm_histories,
             internal_ids.astype("int64").tolist(),
         )
-        inference_features = add_user_bot_feature(inference_features, cohort_users)
         lightgbm_by_label = predict_lgbm(
             lightgbm_models, inference_features, lightgbm_features
         )
@@ -1294,10 +1883,13 @@ def run_prediction(args: argparse.Namespace) -> None:
     probability_path = args.output_dir / "probabilities.csv"
     probability_output.to_csv(probability_path, index=False)
 
-    relgt_model_path = (
-        "model.pt" if args.temporal_model == "relgt" else "relgt_model.pt"
-    )
-    torch.save(model.state_dict(), args.output_dir / relgt_model_path)
+    if args.temporal_model == "gnn":
+        graph_model_path = "gnn_model.pt"
+    elif args.temporal_model == "relgt":
+        graph_model_path = "model.pt"
+    else:
+        graph_model_path = "relgt_model.pt"
+    torch.save(model.state_dict(), args.output_dir / graph_model_path)
     if args.temporal_model == "hybrid":
         s2p2_model.save(args.output_dir / "s2p2_model.pt")
     elif args.temporal_model == "relgt_lightgbm":
@@ -1320,13 +1912,21 @@ def run_prediction(args: argparse.Namespace) -> None:
         "hidden_dim": args.hidden_dim,
         "num_heads": args.num_heads,
         "num_layers": args.num_layers,
-        "architecture": "RelGT-inspired sampled temporal neighborhood encoder",
+        "architecture": (
+            "Relation-aware message passing over sampled user ego graphs"
+            if args.temporal_model == "gnn"
+            else "RelGT-inspired sampled temporal neighborhood encoder"
+        ),
         "official_relgt": "https://github.com/snap-stanford/relgt",
     }
     if args.temporal_model == "hybrid":
         metadata["s2p2_device"] = str(s2p2_device)
         metadata["fusion"] = {
-            "method": "calibration-selected probability averaging",
+            "method": (
+                "manual probability averaging"
+                if args.fusion_weight is not None
+                else "calibration-selected probability averaging"
+            ),
             "graph_weight": graph_weight,
             "s2p2_weight": 1.0 - graph_weight,
             "calibration_score": calibration_metrics["score"],
@@ -1334,7 +1934,11 @@ def run_prediction(args: argparse.Namespace) -> None:
     elif args.temporal_model == "relgt_lightgbm":
         metadata["lightgbm_params"] = lightgbm_params
         metadata["fusion"] = {
-            "method": "calibration-selected probability averaging",
+            "method": (
+                "manual probability averaging"
+                if args.fusion_weight is not None
+                else "calibration-selected probability averaging"
+            ),
             "relgt_weight": graph_weight,
             "lightgbm_weight": 1.0 - graph_weight,
             "calibration_score": calibration_metrics["score"],
@@ -1352,7 +1956,11 @@ def run_prediction(args: argparse.Namespace) -> None:
             "device": str(s2p2_device),
         }
         metadata["fusion"] = {
-            "method": "calibration-selected three-branch probability averaging",
+            "method": (
+                "manual three-branch probability averaging"
+                if args.fusion_weights is not None
+                else "calibration-selected three-branch probability averaging"
+            ),
             "weights": fusion_weights,
             "calibration_score": calibration_metrics["score"],
         }
@@ -1388,9 +1996,43 @@ def add_common_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
         "--temporal-model",
-        choices=["relgt", "hybrid", "relgt_lightgbm", "relgt_lightgbm_s2p2"],
+        choices=[
+            "relgt",
+            "gnn",
+            "relgt_ensemble",
+            "gnn_ensemble",
+            "hybrid",
+            "relgt_lightgbm",
+            "relgt_lightgbm_s2p2",
+        ],
         default="relgt",
-        help="use RelGT alone or fuse with S2P2, LightGBM, or both",
+        help=(
+            "choose RelGT/GNN, a lookback ensemble, or a RelGT ensemble with "
+            "S2P2/LightGBM"
+        ),
+    )
+    parser.add_argument(
+        "--ensemble-lookbacks",
+        type=parse_ensemble_lookbacks,
+        default=(30, 14),
+        metavar="DAYS,DAYS",
+        help="two lookback windows for *_ensemble mode (choices: 14, 30, 90; default: 30,14)",
+    )
+    fusion_weights = parser.add_mutually_exclusive_group()
+    fusion_weights.add_argument(
+        "--fusion-weight",
+        type=parse_unit_interval,
+        metavar="FLOAT",
+        help=(
+            "manually set the first branch's weight for two-branch fusion "
+            "(the second branch gets 1 - weight)"
+        ),
+    )
+    fusion_weights.add_argument(
+        "--fusion-weights",
+        type=parse_three_branch_weights,
+        metavar="RELGT=FLOAT,LIGHTGBM=FLOAT,S2P2=FLOAT",
+        help="manually set three-branch weights; values must sum to 1",
     )
     parser.add_argument("--n-estimators", type=int, default=300)
     parser.add_argument("--learning-rate", type=float, default=0.03)
@@ -1399,6 +2041,13 @@ def add_common_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--subsample", type=float, default=0.85)
     parser.add_argument("--colsample-bytree", type=float, default=0.85)
     parser.add_argument("--reg-lambda", type=float, default=2.0)
+    parser.add_argument(
+        "--no-scale-pos-weight",
+        dest="scale_pos_weight",
+        action="store_false",
+        help="disable per-label negative/positive class weighting (enabled by default)",
+    )
+    parser.set_defaults(scale_pos_weight=True)
     parser.add_argument("--s2p2-epochs", type=int, default=3)
     parser.add_argument("--s2p2-batch-size", type=int, default=128)
     parser.add_argument("--s2p2-max-sequence-length", type=int, default=128)
@@ -1439,6 +2088,24 @@ def parse_args() -> argparse.Namespace:
         parser.error("--num-leaves must be at least 2.")
     if args.min_child_samples < 1:
         parser.error("--min-child-samples must be positive.")
+    two_branch_modes = {
+        "relgt_ensemble",
+        "gnn_ensemble",
+        "hybrid",
+        "relgt_lightgbm",
+    }
+    if args.fusion_weight is not None and args.temporal_model not in two_branch_modes:
+        parser.error(
+            "--fusion-weight is only valid for lookback ensembles, hybrid, "
+            "and relgt_lightgbm modes."
+        )
+    if (
+        args.fusion_weights is not None
+        and args.temporal_model != "relgt_lightgbm_s2p2"
+    ):
+        parser.error(
+            "--fusion-weights is only valid for relgt_lightgbm_s2p2 mode."
+        )
     if not 0.0 < args.subsample <= 1.0:
         parser.error("--subsample must be in (0, 1].")
     if not 0.0 < args.colsample_bytree <= 1.0:

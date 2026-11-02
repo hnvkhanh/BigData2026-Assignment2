@@ -22,7 +22,9 @@ DEFAULT_TEST_INPUT = ROOT / "assignment2" / "evaluation" / "test_input.csv"
 DEFAULT_OUTPUT_DIR = Path(__file__).resolve().parent / "outputs"
 
 HORIZON_DAYS = 7
-LOOKBACK_DAYS = (7, 30, 90, 365)
+LOOKBACK_DAYS = (7, 30)
+FREQUENCY_LOOKBACK_DAYS = (7,)
+ELIGIBILITY_WINDOW_DAYS = 90
 DEFAULT_START_CUTOFF = "2026-03-01 00:00:00"
 DEFAULT_PREDICTION_CUTOFF = "2026-11-11 16:00:00"
 USER_COLUMN = "UserID"
@@ -34,6 +36,10 @@ LABELS = (
     "pr_review_comment",
     "push",
 )
+DEFAULT_THRESHOLDS = {
+    label: 0.45 if label == "push" else 0.30
+    for label in LABELS
+}
 ISSUE_STATE_REASONS = ("completed", "not_planned", "duplicate", "other")
 
 # action_time identifies when the activity happened; available_time identifies
@@ -200,7 +206,8 @@ def row_for_cutoff(
             ]
             counts = window.groupby("user_id").size().reindex(user_index, fill_value=0)
             count_values = counts.to_numpy(dtype=np.int32)
-            feature_values[f"{label}_count_{days}d"] = count_values
+            if days != 30:
+                feature_values[f"{label}_count_{days}d"] = count_values
             if label in action_counts:
                 action_counts[label][days] = count_values
                 day_bins = np.floor(
@@ -215,26 +222,6 @@ def row_for_cutoff(
                     .groupby(["user_id", "_day_bin"])
                     .size()
                 )
-
-        recent = known.loc[
-            known["action_at"] >= cutoff - pd.Timedelta(days=90)
-        ]
-        repo_counts = (
-            recent.groupby("user_id")["repo_id"]
-            .nunique()
-            .reindex(user_index, fill_value=0)
-        )
-        feature_values[f"{label}_repos_90d"] = repo_counts.to_numpy(dtype=np.int32)
-
-        active_days = (
-            recent.assign(active_day=recent["action_at"].dt.floor("D"))
-            .groupby("user_id")["active_day"]
-            .nunique()
-            .reindex(user_index, fill_value=0)
-        )
-        feature_values[f"{label}_active_days_90d"] = active_days.to_numpy(
-            dtype=np.int16
-        )
 
         last_action = known.groupby("user_id")["action_at"].max().reindex(user_index)
         recency = (cutoff - last_action).dt.total_seconds() / 86_400
@@ -252,7 +239,8 @@ def row_for_cutoff(
         total_actions = np.sum(
             list(counts_by_action.values()), axis=0, dtype=np.int64
         )
-        feature_values[f"total_actions_count_{days}d"] = total_actions
+        if days != 30:
+            feature_values[f"total_actions_count_{days}d"] = total_actions
         total_daily_counts: pd.Series | None = None
         for label, counts in counts_by_action.items():
             feature_values[f"{label}_share_{days}d"] = np.divide(
@@ -261,9 +249,10 @@ def row_for_cutoff(
                 out=np.zeros(len(user_ids), dtype=np.float32),
                 where=total_actions > 0,
             )
-            feature_values[f"{label}_frequency_per_day_{days}d"] = (
-                counts.astype(np.float32) / float(days)
-            )
+            if days in FREQUENCY_LOOKBACK_DAYS:
+                feature_values[f"{label}_frequency_per_day_{days}d"] = (
+                    counts.astype(np.float32) / float(days)
+                )
             daily_counts = daily_action_counts[label].get(days)
             if daily_counts is not None:
                 total_daily_counts = (
@@ -320,29 +309,25 @@ def labels_for_horizon(
     return labels
 
 
-def add_user_bot_feature(
-    frame: pd.DataFrame,
-    users: pd.DataFrame,
-) -> pd.DataFrame:
-    """Attach bot status only after the user row is known at the example cutoff."""
-    if users["user_id"].duplicated().any():
-        raise ValueError("Users table contains duplicate user_id values.")
-    if "cutoff" not in frame or "first_seen_at" not in users:
-        raise ValueError("Bot features require example cutoffs and user first_seen_at.")
-
-    indexed_users = users.set_index("user_id")
-    bot_by_user = indexed_users["is_bot"]
-    is_bot = frame["user_id"].map(bot_by_user)
-    if is_bot.isna().any():
-        raise ValueError(
-            f"Cannot determine is_bot for {int(is_bot.isna().sum())} user(s)."
-        )
-    first_seen_by_user = indexed_users["first_seen_at"]
-    first_seen_at = pd.to_datetime(frame["user_id"].map(first_seen_by_user))
-    available = first_seen_at < pd.to_datetime(frame["cutoff"])
-    result = frame.copy()
-    result["is_bot"] = is_bot.astype("float32").where(available)
-    return result
+def eligible_users_for_cutoff(
+    cutoff: pd.Timestamp,
+    histories: dict[str, pd.DataFrame],
+    user_ids: list[int],
+) -> np.ndarray:
+    """Keep the assignment's five-actions-in-90-days sample filter."""
+    user_index = pd.Index(user_ids)
+    eligible_counts = np.zeros(len(user_ids), dtype=np.int32)
+    start = cutoff - pd.Timedelta(days=ELIGIBILITY_WINDOW_DAYS)
+    for label in LABELS:
+        history = histories[label]
+        recent = history.loc[
+            (history["available_at"] < cutoff)
+            & (history["action_at"] < cutoff)
+            & (history["action_at"] >= start)
+        ]
+        counts = recent.groupby("user_id").size().reindex(user_index, fill_value=0)
+        eligible_counts += counts.to_numpy(dtype=np.int32)
+    return eligible_counts >= 5
 
 
 def build_training_data(
@@ -355,8 +340,6 @@ def build_training_data(
             "user_id",
             "github_user_id",
             "is_cohort",
-            "is_bot",
-            "first_seen_at",
         ],
     )
     cohort = users.loc[users["is_cohort"]].copy()
@@ -379,13 +362,8 @@ def build_training_data(
         x = row_for_cutoff(cutoff, histories, user_ids)
         y = labels_for_horizon(cutoff, histories, user_ids)
         panel = x.merge(y, on="user_id", validate="one_to_one")
-        panel = add_user_bot_feature(panel, cohort)
-        # The official test list is restricted to users with at least five
-        # activity records in the preceding 90 days.
-        eligible_count = panel[
-            [f"{label}_count_90d" for label in LABELS]
-        ].sum(axis=1)
-        panels.append(panel.loc[eligible_count >= 5])
+        eligible = eligible_users_for_cutoff(cutoff, histories, user_ids)
+        panels.append(panel.loc[eligible])
         print(f"Built weekly sample {index}/{len(cutoffs)}: {cutoff}")
 
     return pd.concat(panels, ignore_index=True), histories, user_ids
@@ -412,11 +390,26 @@ def choose_threshold(y_true: np.ndarray, probabilities: np.ndarray) -> float:
     return float(candidates[int(np.argmax(scores))])
 
 
+def thresholds_for_predictions(
+    calibration: pd.DataFrame,
+    probabilities: dict[str, np.ndarray],
+    calibrated_threshold: bool,
+) -> dict[str, float]:
+    if not calibrated_threshold:
+        return DEFAULT_THRESHOLDS.copy()
+    return {
+        label: choose_threshold(
+            calibration[label].to_numpy(dtype=np.int8), probabilities[label]
+        )
+        for label in LABELS
+    }
+
+
 def frequency_feature_columns(columns: list[str]) -> list[str]:
     """Return only the per-action frequencies, excluding identifiers and labels."""
     expected = [
         f"{label}_frequency_per_day_{days}d"
-        for days in LOOKBACK_DAYS
+        for days in FREQUENCY_LOOKBACK_DAYS
         for label in LABELS
     ]
     missing = [column for column in expected if column not in columns]
@@ -425,13 +418,28 @@ def frequency_feature_columns(columns: list[str]) -> list[str]:
     return expected
 
 
+def scale_pos_weights(train: pd.DataFrame) -> dict[str, float | None]:
+    weights: dict[str, float | None] = {}
+    for label in LABELS:
+        positive_count = int(train[label].sum())
+        negative_count = len(train) - positive_count
+        weights[label] = (
+            negative_count / positive_count
+            if positive_count > 0 and negative_count > 0
+            else None
+        )
+    return weights
+
+
 def fit_models(
     train: pd.DataFrame,
     feature_columns: list[str],
     model_params: dict[str, int | float],
+    use_scale_pos_weight: bool = True,
 ) -> dict[str, lgb.LGBMClassifier | None]:
     models: dict[str, lgb.LGBMClassifier | None] = {}
     x_train = train[feature_columns]
+    weights = scale_pos_weights(train) if use_scale_pos_weight else {}
 
     for label in LABELS:
         y_train = train[label]
@@ -440,12 +448,16 @@ def fit_models(
             print(f"{label}: only one class in training data; using constant predictions.")
             continue
 
+        params = dict(model_params)
+        weight = weights.get(label)
+        if weight is not None:
+            params["scale_pos_weight"] = weight
         model = lgb.LGBMClassifier(
             objective="binary",
             random_state=42,
             n_jobs=-1,
             verbosity=-1,
-            **model_params,
+            **params,
         )
         model.fit(x_train, y_train)
         models[label] = model
@@ -573,9 +585,12 @@ def fit_temporal_model(
     s2p2_params: dict[str, int],
     device_name: str,
     nn_output_mode: str = "per_label",
+    use_scale_pos_weight: bool = False,
 ) -> tuple[Any, Any]:
     if temporal_model == "lightgbm":
-        return fit_models(train, feature_columns, model_params), None
+        return fit_models(
+            train, feature_columns, model_params, use_scale_pos_weight
+        ), None
     if temporal_model == "frequency_nn":
         return fit_frequency_nn_models(
             train, feature_columns, nn_output_mode
@@ -702,6 +717,8 @@ def run_backtest(
     s2p2_params: dict[str, int] | None = None,
     device_name: str = "auto",
     nn_output_mode: str = "per_label",
+    calibrated_threshold: bool = False,
+    use_scale_pos_weight: bool = True,
 ) -> None:
     data, histories, _ = build_training_data(db_dir, start_cutoff)
     unique_cutoffs = sorted(data["cutoff"].unique())
@@ -731,6 +748,7 @@ def run_backtest(
         s2p2_options,
         device_name,
         nn_output_mode,
+        use_scale_pos_weight,
     )
     calibration_probabilities = predict_temporal_probabilities(
         temporal_model,
@@ -741,13 +759,9 @@ def run_backtest(
         histories,
         nn_output_mode,
     )
-    thresholds = {
-        label: choose_threshold(
-            calibration[label].to_numpy(dtype=np.int8),
-            calibration_probabilities[label],
-        )
-        for label in LABELS
-    }
+    thresholds = thresholds_for_predictions(
+        calibration, calibration_probabilities, calibrated_threshold
+    )
     holdout_probabilities = predict_temporal_probabilities(
         temporal_model,
         models,
@@ -765,8 +779,17 @@ def run_backtest(
         "holdout_start": str(calibration_end),
     }
     results["temporal_model"] = temporal_model
+    results["threshold_mode"] = (
+        "calibrated" if calibrated_threshold else "fixed_default"
+    )
     if temporal_model == "lightgbm":
         results["model_params"] = model_params
+        results["scale_pos_weight"] = {
+            "enabled": use_scale_pos_weight,
+            "per_label": (
+                scale_pos_weights(train) if use_scale_pos_weight else {}
+            ),
+        }
     elif temporal_model == "frequency_nn":
         results["model_params"] = {
             "architecture": [
@@ -775,7 +798,7 @@ def run_backtest(
                 len(LABELS) if nn_output_mode == "multi_label" else 1,
             ],
             "output_mode": nn_output_mode,
-            "input_features": "per-action daily frequencies over 7, 30, 90, and 365 days only",
+            "input_features": "per-action daily frequencies over 7 days only",
             "user_id_used_as_feature": False,
             "max_iter": 100,
         }
@@ -786,13 +809,24 @@ def run_backtest(
         }
 
     output_dir.mkdir(parents=True, exist_ok=True)
+    holdout_output = holdout[["user_id", "cutoff", *feature_columns]].copy()
+    for label in LABELS:
+        holdout_output[f"actual_{label}"] = holdout[label].to_numpy(dtype=np.int8)
+        holdout_output[f"{temporal_model}_{label}"] = holdout_probabilities[
+            label
+        ].astype(np.float32)
+    holdout_output.to_csv(output_dir / "holdout_probabilities.csv", index=False)
     (output_dir / "backtest_metrics.json").write_text(
         json.dumps(results, indent=2) + "\n",
         encoding="utf-8",
     )
-    print("\nHOLDOUT RESULTS (thresholds selected on earlier calibration weeks)")
+    threshold_description = (
+        "calibrated on earlier weeks" if calibrated_threshold else "fixed defaults"
+    )
+    print(f"\nHOLDOUT RESULTS (thresholds: {threshold_description})")
     print(json.dumps(results, indent=2))
     print(f"Saved metrics to {output_dir / 'backtest_metrics.json'}")
+    print(f"Saved holdout probabilities to {output_dir / 'holdout_probabilities.csv'}")
 
 
 def run_prediction(
@@ -806,6 +840,8 @@ def run_prediction(
     s2p2_params: dict[str, int] | None = None,
     device_name: str = "auto",
     nn_output_mode: str = "per_label",
+    calibrated_threshold: bool = False,
+    use_scale_pos_weight: bool = True,
 ) -> None:
     data, histories, cohort_user_ids = build_training_data(db_dir, start_cutoff)
     data = training_data_before(data, cutoff)
@@ -827,6 +863,7 @@ def run_prediction(
         s2p2_options,
         device_name,
         nn_output_mode,
+        use_scale_pos_weight,
     )
     calibration_probabilities = predict_temporal_probabilities(
         temporal_model,
@@ -837,13 +874,9 @@ def run_prediction(
         histories,
         nn_output_mode,
     )
-    thresholds = {
-        label: choose_threshold(
-            calibration[label].to_numpy(dtype=np.int8),
-            calibration_probabilities[label],
-        )
-        for label in LABELS
-    }
+    thresholds = thresholds_for_predictions(
+        calibration, calibration_probabilities, calibrated_threshold
+    )
 
     target_users = pd.read_csv(test_input, dtype={"UserID": "int64"})
     if target_users["UserID"].duplicated().any():
@@ -854,8 +887,6 @@ def run_prediction(
             "user_id",
             "github_user_id",
             "is_cohort",
-            "is_bot",
-            "first_seen_at",
         ],
     )
     cohort_users = cohort_users.loc[cohort_users["is_cohort"]]
@@ -869,7 +900,6 @@ def run_prediction(
     internal_ids = mapped_ids.astype("int64").tolist()
 
     inference = row_for_cutoff(cutoff, histories, cohort_user_ids)
-    inference = add_user_bot_feature(inference, cohort_users)
     inference = inference.set_index("user_id").loc[internal_ids].reset_index()
     probabilities = predict_temporal_probabilities(
         temporal_model,
@@ -894,6 +924,9 @@ def run_prediction(
         probability_output.to_csv(output_dir / "probabilities.csv", index=False)
     metadata = {
         "temporal_model": temporal_model,
+        "threshold_mode": (
+            "calibrated" if calibrated_threshold else "fixed_default"
+        ),
         "prediction_cutoff_utc": str(cutoff),
         "training_start_cutoff_utc": str(start_cutoff),
         "training_weeks": int(train["cutoff"].nunique()),
@@ -901,6 +934,13 @@ def run_prediction(
         "feature_columns": feature_columns,
         "labels": list(LABELS),
     }
+    if temporal_model == "lightgbm":
+        metadata["scale_pos_weight"] = {
+            "enabled": use_scale_pos_weight,
+            "per_label": (
+                scale_pos_weights(train) if use_scale_pos_weight else {}
+            ),
+        }
     if temporal_model == "lightgbm":
         metadata["model_params"] = model_params
     elif temporal_model == "frequency_nn":
@@ -911,7 +951,7 @@ def run_prediction(
                 len(LABELS) if nn_output_mode == "multi_label" else 1,
             ],
             "output_mode": nn_output_mode,
-            "input_features": "per-action daily frequencies over 7, 30, 90, and 365 days only",
+            "input_features": "per-action daily frequencies over 7 days only",
             "user_id_used_as_feature": False,
             "max_iter": 100,
         }
@@ -959,6 +999,13 @@ def parse_args() -> argparse.Namespace:
             help="frequency_nn: use six models or one six-output model",
         )
         subparser.add_argument(
+            "--calibrated-threshold",
+            "--calibrate-thresholds",
+            dest="calibrated_threshold",
+            action="store_true",
+            help="select per-label thresholds from chronological calibration data",
+        )
+        subparser.add_argument(
             "--device",
             choices=("auto", "cpu", "cuda"),
             default="auto",
@@ -984,6 +1031,13 @@ def parse_args() -> argparse.Namespace:
         subparser.add_argument("--subsample", type=float, default=0.85)
         subparser.add_argument("--colsample-bytree", type=float, default=0.85)
         subparser.add_argument("--reg-lambda", type=float, default=2.0)
+        subparser.add_argument(
+            "--no-scale-pos-weight",
+            dest="scale_pos_weight",
+            action="store_false",
+            help="disable per-label negative/positive class weighting (enabled by default)",
+        )
+        subparser.set_defaults(scale_pos_weight=True)
     predict_parser = subparsers.choices["predict"]
     predict_parser.add_argument("--test-input", type=Path, default=DEFAULT_TEST_INPUT)
     predict_parser.add_argument(
@@ -1031,6 +1085,8 @@ def main() -> None:
             s2p2_params,
             args.device,
             args.nn_output_mode,
+            args.calibrated_threshold,
+            args.scale_pos_weight,
         )
     else:
         run_prediction(
@@ -1044,6 +1100,8 @@ def main() -> None:
             s2p2_params,
             args.device,
             args.nn_output_mode,
+            args.calibrated_threshold,
+            args.scale_pos_weight,
         )
 
 

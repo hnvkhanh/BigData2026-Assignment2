@@ -15,7 +15,7 @@ centroid-attention readout are adapted to the assignment-specific snapshots.
 ## What this implementation models
 
 At each historical weekly cutoff, it creates a temporal heterogeneous graph
-from cohort actions in the preceding 90 days:
+from cohort actions in the configured lookback window (30 days by default):
 
 - Target users connect to typed Pull Request, Issue, and Repository nodes through
   six activity relations (open, comment, review, inline review comment, push).
@@ -23,6 +23,8 @@ from cohort actions in the preceding 90 days:
   also reached directly by Push relations.
 - The target node and sampled neighbors are tokenized with entity features,
   node type, relation type, hop distance, relative time, and local structure.
+  Degree and diversity features use all cohort events available at the cutoff,
+  independent of which users are included in a prediction batch.
   At most four recent entity neighbors per activity relation and 24 repositories
   are retained for each user.
 - A local Transformer encodes each sampled neighborhood. Learnable centroids
@@ -36,6 +38,18 @@ can run on Apple Silicon MPS. It does not reproduce RelGT's vector-quantized
 centroid codebook, full RelBench feature encoders, or all cross-table edges.
 The branch is therefore a transparent RelGT-inspired experiment, not a claim of
 an exact RelGT reproduction.
+
+## GNN comparison
+
+The standalone `gnn` mode provides a message-passing baseline over the same
+cutoff-safe snapshots. It embeds each typed neighbor, applies relation-specific
+messages, mean-aggregates them into a user root, and updates the neighbors from
+that root over `--num-layers` steps. Hop IDs distinguish direct activity nodes
+from sampled repository context. The current snapshot format does not retain
+explicit entity-to-repository edge indices, so this experiment uses the
+user-centered sampled edges rather than reconstructing those links. It requires
+only the PyTorch dependency already used by this experiment and does not change
+the default RelGT model or ensemble modes.
 
 Historical snapshots require both the event row and its referenced node to be
 available before the cutoff. PRs, Issues, and PRReviews use `first_seen_at`;
@@ -80,16 +94,25 @@ The `relgt_lightgbm` mode combines RelGT with the LightGBM baseline and uses
 the root `requirements.txt` dependencies; it does not require EasyTPP. It builds
 the baseline's cutoff-safe tabular features, aligns them to RelGT user-week
 examples, and selects a shared probability-fusion weight and label thresholds
-using calibration weeks only. The LightGBM features include recent total
-actions, per-action shares, and per-day action frequencies over 7-, 30-, 90-,
-and 365-day windows, plus the cutoff-available `is_bot` feature. The frequency-
-only neural network in the baseline remains restricted to its frequency inputs.
+using calibration weeks only. The LightGBM features include 7-day total
+actions, per-action shares over 7- and 30-day windows, 7-day per-action
+frequencies, and median daily activity over both windows. Raw 30-day count
+features are excluded.
+The LightGBM branch applies per-label `scale_pos_weight` based on the training
+split by default; pass `--no-scale-pos-weight` to disable it.
+The baseline's 90-day eligibility filter remains, but 90- and 365-day windows
+are not used as tabular model features. The frequency-only neural network in
+the baseline remains restricted to per-action frequency inputs.
 
 The `relgt_lightgbm_s2p2` mode combines all three branches. It requires both
 the base/RelGT dependencies and the optional pinned S2P2/EasyTPP dependency.
 The three non-negative probability weights are selected on a simplex grid with
 0.25 increments using calibration weeks only, together with per-label
-thresholds. The S2P2 dependency is checked before training starts.
+thresholds. Alternatively, set all weights explicitly with
+`--fusion-weights relgt=0.4,lightgbm=0.4,s2p2=0.2`. Manual weights must be
+non-negative and sum to 1. In either mode, thresholds are calibrated using only
+the calibration split. These options work for both backtest and predict. The
+S2P2 dependency is checked before training starts.
 
 ## Run a chronological backtest
 
@@ -104,13 +127,78 @@ on later weeks, and score a final chronological holdout. Every invocation
 creates a unique timestamped run folder, such as
 `experiments/relgt/outputs/backtest_20261102_001234_12345/`. Its report and
 temporal graph cache are kept inside that folder, so concurrent runs do not
-overwrite one another.
+overwrite one another. The backtest saves calibration-thresholded holdout
+metrics in `backtest_metrics.json` and per-user-week actual labels and model
+probabilities in `holdout_probabilities.csv`.
+
+Analyze a saved holdout with `exam_fail_case.py` (use the run folder printed
+when the backtest starts):
+
+```bash
+python exam_fail_case.py \
+  --run-dir experiments/relgt/outputs/backtest_20261102_001234_12345 \
+  --model-branch relgt
+```
+
+For the standalone GNN, use `--model-branch gnn`. Add `--no-dashboard` to
+export failure-case CSVs without launching the interactive dashboard.
 
 For a quick first run with fewer training epochs:
 
 ```bash
 python -m experiments.relgt.run backtest --epochs 1 --batch-size 128
 ```
+
+Run the standalone GNN comparison with:
+
+```bash
+python -m experiments.relgt.run backtest \
+  --temporal-model gnn \
+  --epochs 5 \
+  --hidden-dim 64 \
+  --num-layers 2
+```
+
+It uses the same chronological split, calibration thresholds, and sampled
+graph cache as RelGT. The report identifies the message-passing architecture,
+and the run saves its weights as `gnn_model.pt`.
+
+## Lookback ensembles
+
+The `relgt_ensemble` and `gnn_ensemble` modes independently train two models
+from the selected lookback windows, then choose their probability-fusion weight
+and per-label thresholds using calibration weeks only. The default pair is
+30 and 14 days; `--ensemble-lookbacks` accepts any two distinct values from
+14, 30, and 90. Both branches use the same users, labels, and chronological
+split; eligibility is determined using the longer selected window.
+
+```bash
+python -m experiments.relgt.run backtest --temporal-model relgt_ensemble
+python -m experiments.relgt.run backtest --temporal-model gnn_ensemble
+python -m experiments.relgt.run backtest \
+  --temporal-model relgt_ensemble \
+  --ensemble-lookbacks 90,14
+```
+
+Backtests save one checkpoint per lookback and branch probabilities named
+`relgt_30d_<label>` / `relgt_14d_<label>` (or `gnn_*`), plus `fused_<label>`,
+in the shared holdout CSV format. `backtest_metrics.json` includes holdout
+metrics and the selected weights for each branch. To set the first
+branch's weight manually (the second branch receives the remainder), pass
+`--fusion-weight` to either backtest or predict:
+
+```bash
+python -m experiments.relgt.run backtest \
+  --temporal-model relgt_ensemble \
+  --fusion-weight 0.7
+```
+
+When omitted, the weight is still selected on calibration weeks. Thresholds
+are always calibrated on calibration probabilities using the selected or
+manually specified blend. The same ensemble
+modes are available with `predict`. Analyze the fused holdout or either branch
+with `exam_fail_case.py --run-dir <run-folder> --model-branch fused` or, for
+example, `--model-branch relgt_14d`.
 
 Run the combined RelGT + S2P2 model with:
 
@@ -122,7 +210,9 @@ python -m experiments.relgt.run backtest \
   --s2p2-epochs 1
 ```
 
-The run report includes the calibration-selected RelGT/S2P2 fusion weights.
+The run report includes the calibration-selected RelGT/S2P2 fusion weights;
+`--fusion-weight` can manually set the RelGT weight (S2P2 receives the
+remainder). The same option is available for RelGT + LightGBM.
 `holdout_probabilities.csv` records the aligned RelGT, S2P2, and fused
 probabilities for each holdout user-week, and the run folder contains both
 trained model weights. S2P2 training settings can be adjusted with
@@ -182,6 +272,14 @@ Use the latest assignment data release and its `test_input.csv`:
 
 ```bash
 python -m experiments.relgt.run predict
+```
+
+To train the same GNN architecture and generate predictions, pass
+`--temporal-model gnn`; the output folder contains `gnn_model.pt` and metadata
+identifying the architecture:
+
+```bash
+python -m experiments.relgt.run predict --temporal-model gnn
 ```
 
 By default this uses the assignment cutoff `2026-11-11 16:00:00 UTC` and

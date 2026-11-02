@@ -85,6 +85,27 @@ class RelGTInspired(nn.Module):
         relative_days: torch.Tensor,
     ) -> torch.Tensor:
         """Return six logits for each user in a batch."""
+        return self.output(
+            self.encode(
+                entity_ids,
+                node_type_ids,
+                relation_ids,
+                hop_ids,
+                node_features,
+                relative_days,
+            )
+        )
+
+    def encode(
+        self,
+        entity_ids: torch.Tensor,
+        node_type_ids: torch.Tensor,
+        relation_ids: torch.Tensor,
+        hop_ids: torch.Tensor,
+        node_features: torch.Tensor,
+        relative_days: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return each user's local-plus-global relational graph representation."""
         batch_size = entity_ids.shape[0]
         device = entity_ids.device
         is_neighbor = entity_ids.ne(0)
@@ -169,4 +190,4 @@ class RelGTInspired(nn.Module):
         user_representation = torch.cat(
             [local_tokens[:, 0], global_user[:, 0]], dim=-1
         )
-        return self.output(user_representation)
+        return user_representation
