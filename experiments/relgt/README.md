@@ -76,6 +76,18 @@ holdout is used only for final evaluation. S2P2 uses CPU when CUDA is
 unavailable because its upstream implementation warns against MPS. On CUDA,
 automatic device selection chooses the least-utilized GPU.
 
+The `relgt_lightgbm` mode combines RelGT with the LightGBM baseline and uses
+the root `requirements.txt` dependencies; it does not require EasyTPP. It builds
+the baseline's cutoff-safe tabular features, aligns them to RelGT user-week
+examples, and selects a shared probability-fusion weight and label thresholds
+using calibration weeks only.
+
+The `relgt_lightgbm_s2p2` mode combines all three branches. It requires both
+the base/RelGT dependencies and the optional pinned S2P2/EasyTPP dependency.
+The three non-negative probability weights are selected on a simplex grid with
+0.25 increments using calibration weeks only, together with per-label
+thresholds. The S2P2 dependency is checked before training starts.
+
 ## Run a chronological backtest
 
 From the project root:
@@ -114,6 +126,39 @@ trained model weights. S2P2 training settings can be adjusted with
 `--s2p2-batch-size`, `--s2p2-max-sequence-length`, `--s2p2-hidden-size`,
 `--s2p2-state-size`, `--s2p2-num-layers`, and `--s2p2-integral-samples`.
 
+Run RelGT combined with LightGBM with:
+
+```bash
+python -m experiments.relgt.run backtest \
+  --temporal-model relgt_lightgbm \
+  --epochs 1 \
+  --n-estimators 300
+```
+
+Fusion is calibrated on the same chronological calibration weeks used for
+threshold selection; the holdout is reserved for final evaluation. The report
+includes the fused score and separate RelGT and LightGBM holdout metrics.
+`holdout_probabilities.csv` contains the aligned branch and fused
+probabilities. The run saves `relgt_model.pt` and one
+`lightgbm_<label>.txt` file per trained label. LightGBM settings can be
+adjusted with `--n-estimators`, `--learning-rate`, `--num-leaves`,
+`--min-child-samples`, `--subsample`, `--colsample-bytree`, and `--reg-lambda`.
+
+Run all three models together with:
+
+```bash
+python -m experiments.relgt.run backtest \
+  --temporal-model relgt_lightgbm_s2p2 \
+  --epochs 1 \
+  --s2p2-epochs 1 \
+  --n-estimators 300
+```
+
+The backtest report records all three fusion weights and the individual branch
+holdout metrics. `holdout_probabilities.csv` includes RelGT, LightGBM, S2P2,
+and fused probabilities. Both secondary branch weights and the RelGT weights
+are saved in the run folder.
+
 Each run gets its own cache to keep concurrent runs isolated. Use
 `--output-dir` to choose a specific folder when you want to organize or rerun
 an experiment:
@@ -143,7 +188,39 @@ writes:
 - `predictions.csv`: evaluator-format binary labels.
 - `probabilities.csv`: unthresholded per-label
   probabilities, for later comparison or probability-level fusion.
-- `model.pt` and `metadata.json`.
+- `model.pt` for RelGT-only runs, or `relgt_model.pt` plus the selected
+  secondary branch's weights for combined runs, and `metadata.json`.
+
+Select the RelGT + LightGBM ensemble for prediction with:
+
+```bash
+python -m experiments.relgt.run predict \
+  --temporal-model relgt_lightgbm \
+  --output-dir experiments/relgt/outputs/relgt_lightgbm_prediction
+```
+
+The output includes fused predictions and probabilities, separate
+`relgt_<label>_probability` and `lightgbm_<label>_probability` columns,
+`relgt_model.pt`, LightGBM model files, and metadata containing the calibrated
+fusion weights and LightGBM settings.
+
+To generate predictions with all three models, use:
+
+```bash
+python -m experiments.relgt.run predict \
+  --temporal-model relgt_lightgbm_s2p2 \
+  --output-dir experiments/relgt/outputs/relgt_lightgbm_s2p2_prediction
+```
+
+The probabilities file includes branch-specific RelGT, LightGBM, and S2P2
+columns as well as fused probabilities. The output folder contains
+`relgt_model.pt`, `s2p2_model.pt`, LightGBM model files, and metadata with the
+calibration-selected three-branch weights.
+
+Training and calibration examples for prediction are restricted to weekly
+samples whose complete seven-day label window ends on or before the requested
+prediction cutoff. RelGT's graph snapshots use only actions and entity rows
+available before each sample cutoff.
 
 Override the cutoff, test-user input, or output location with flags:
 
@@ -172,8 +249,9 @@ predictions from overwriting one another.
 
 ## Compare with LightGBM
 
-Compare LightGBM, RelGT, and hybrid runs using the same cutoff dates and
-chronological split. Compare the assignment score `(macro-F1 + micro-F1) / 2`
-on the untouched holdout. The hybrid is an experiment, not an assumed
-improvement; retain it only if it improves the measured holdout score over the
-individual branches.
+Compare LightGBM, RelGT, RelGT+S2P2, RelGT+LightGBM, and
+RelGT+LightGBM+S2P2 runs using the same cutoff dates and chronological split.
+Compare the assignment score
+`(macro-F1 + micro-F1) / 2` on the untouched holdout. Combined models are
+experiments, not assumed improvements; retain one only if it improves the
+measured holdout score over the individual branches.

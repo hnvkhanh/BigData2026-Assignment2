@@ -31,6 +31,7 @@ LABELS = (
     "pr_review_comment",
     "push",
 )
+ISSUE_STATE_REASONS = ("completed", "not_planned", "duplicate", "other")
 
 # action_time identifies when the activity happened; available_time identifies
 # when that row could first be used in a prediction snapshot.
@@ -58,7 +59,11 @@ def load_histories(
     for label, (table, user_col, action_col, available_col) in ACTION_SPECS.items():
         columns = list(dict.fromkeys([user_col, "repo_id", action_col, available_col]))
         if table == "Issues":
-            columns.append("is_pull_request")
+            columns.extend(["is_pull_request", "closed_at", "state_reason"])
+        elif table == "PullRequests":
+            columns.extend(["merged_at", "merged_by_id", "closed_at"])
+        elif table == "PRReviews":
+            columns.append("dismissed_at")
         raw = pd.read_parquet(db_dir / f"{table}.parquet", columns=columns)
         mask = raw[user_col].isin(cohort_ids) & raw[action_col].notna()
         if table == "Issues":
@@ -75,7 +80,67 @@ def load_histories(
         history = history.dropna(subset=["action_at", "available_at"])
         histories[label] = history.reset_index(drop=True)
 
+        if table == "PullRequests":
+            histories["pr_merged_authored"] = _lifecycle_history(
+                raw, "author_id", "merged_at", "first_seen_at", cohort_ids
+            )
+            histories["pr_merged_by"] = _lifecycle_history(
+                raw, "merged_by_id", "merged_at", "first_seen_at", cohort_ids
+            )
+            histories["pr_closed_authored"] = _lifecycle_history(
+                raw, "author_id", "closed_at", "first_seen_at", cohort_ids
+            )
+        elif table == "Issues":
+            histories["issue_closed_authored"] = _lifecycle_history(
+                raw, "author_id", "closed_at", "first_seen_at", cohort_ids
+            )
+            closed = raw.loc[raw["closed_at"].notna()]
+            reasons = closed["state_reason"]
+            known_reasons = set(ISSUE_STATE_REASONS) - {"other"}
+            for reason in ISSUE_STATE_REASONS:
+                if reason == "other":
+                    reason_mask = reasons.notna() & ~reasons.isin(known_reasons)
+                else:
+                    reason_mask = reasons.eq(reason)
+                reason_rows = closed.loc[reason_mask]
+                histories[f"issue_closed_reason_{reason}"] = _lifecycle_history(
+                    reason_rows,
+                    "author_id",
+                    "closed_at",
+                    "first_seen_at",
+                    cohort_ids,
+                )
+        elif table == "PRReviews":
+            histories["pr_review_dismissed"] = _lifecycle_history(
+                raw, "reviewer_id", "dismissed_at", "first_seen_at", cohort_ids
+            )
+
     return histories
+
+
+def _lifecycle_history(
+    raw: pd.DataFrame,
+    actor_column: str,
+    event_column: str,
+    row_available_column: str,
+    cohort_user_ids: set[int],
+) -> pd.DataFrame:
+    """Represent a lifecycle transition only after both it and its row are known."""
+    mask = (
+        raw[actor_column].isin(cohort_user_ids)
+        & raw[event_column].notna()
+        & raw[row_available_column].notna()
+        & raw["repo_id"].notna()
+    )
+    rows = raw.loc[mask]
+    return pd.DataFrame(
+        {
+            "user_id": rows[actor_column].astype("int64"),
+            "repo_id": rows["repo_id"].astype("int64"),
+            "action_at": pd.to_datetime(rows[event_column]),
+            "available_at": pd.to_datetime(rows[row_available_column]),
+        }
+    ).reset_index(drop=True)
 
 
 def row_for_cutoff(
@@ -84,7 +149,7 @@ def row_for_cutoff(
     user_ids: list[int],
 ) -> pd.DataFrame:
     """Create one feature row per user using only rows available before cutoff."""
-    features = pd.DataFrame({"user_id": user_ids})
+    feature_values: dict[str, object] = {"user_id": user_ids}
     user_index = pd.Index(user_ids)
     for label, history in histories.items():
         known = history.loc[
@@ -97,7 +162,7 @@ def row_for_cutoff(
                 known["action_at"] >= cutoff - pd.Timedelta(days=days)
             ]
             counts = window.groupby("user_id").size().reindex(user_index, fill_value=0)
-            features[f"{label}_count_{days}d"] = counts.to_numpy(dtype=np.int32)
+            feature_values[f"{label}_count_{days}d"] = counts.to_numpy(dtype=np.int32)
 
         recent = known.loc[
             known["action_at"] >= cutoff - pd.Timedelta(days=90)
@@ -107,7 +172,7 @@ def row_for_cutoff(
             .nunique()
             .reindex(user_index, fill_value=0)
         )
-        features[f"{label}_repos_90d"] = repo_counts.to_numpy(dtype=np.int32)
+        feature_values[f"{label}_repos_90d"] = repo_counts.to_numpy(dtype=np.int32)
 
         active_days = (
             recent.assign(active_day=recent["action_at"].dt.floor("D"))
@@ -115,16 +180,18 @@ def row_for_cutoff(
             .nunique()
             .reindex(user_index, fill_value=0)
         )
-        features[f"{label}_active_days_90d"] = active_days.to_numpy(dtype=np.int16)
+        feature_values[f"{label}_active_days_90d"] = active_days.to_numpy(
+            dtype=np.int16
+        )
 
         last_action = known.groupby("user_id")["action_at"].max().reindex(user_index)
         recency = (cutoff - last_action).dt.total_seconds() / 86_400
-        features[f"{label}_days_since_last"] = recency.fillna(3660).clip(upper=3660).to_numpy(
-            dtype=np.float32
+        feature_values[f"{label}_days_since_last"] = (
+            recency.fillna(3660).clip(upper=3660).to_numpy(dtype=np.float32)
         )
 
-    features["cutoff"] = cutoff
-    return features
+    feature_values["cutoff"] = cutoff
+    return pd.DataFrame(feature_values)
 
 
 def labels_for_horizon(
@@ -137,7 +204,8 @@ def labels_for_horizon(
     user_index = pd.Index(user_ids)
     horizon_end = cutoff + pd.Timedelta(days=HORIZON_DAYS)
 
-    for label, history in histories.items():
+    for label in LABELS:
+        history = histories[label]
         future = history.loc[
             (history["action_at"] >= cutoff)
             & (history["action_at"] < horizon_end)
@@ -161,7 +229,7 @@ def build_training_data(
     histories = load_histories(db_dir, user_ids)
 
     # All six labels need a fully observed seven-day target window.
-    coverage_end = min(history["action_at"].max() for history in histories.values())
+    coverage_end = min(histories[label]["action_at"].max() for label in LABELS)
     last_cutoff = coverage_end - pd.Timedelta(days=HORIZON_DAYS)
     cutoffs = pd.date_range(start=start_cutoff, end=last_cutoff, freq="7D")
     if len(cutoffs) < 10:
@@ -185,6 +253,14 @@ def build_training_data(
         print(f"Built weekly sample {index}/{len(cutoffs)}: {cutoff}")
 
     return pd.concat(panels, ignore_index=True), histories, user_ids
+
+
+def training_data_before(
+    data: pd.DataFrame, prediction_cutoff: pd.Timestamp
+) -> pd.DataFrame:
+    """Keep only examples whose full seven-day label window precedes prediction."""
+    label_window_ends = data["cutoff"] + pd.Timedelta(days=HORIZON_DAYS)
+    return data.loc[label_window_ends <= prediction_cutoff].copy()
 
 
 def choose_threshold(y_true: np.ndarray, probabilities: np.ndarray) -> float:
@@ -451,6 +527,7 @@ def run_prediction(
     device_name: str = "auto",
 ) -> None:
     data, histories, cohort_user_ids = build_training_data(db_dir, start_cutoff)
+    data = training_data_before(data, cutoff)
     cutoffs = [pd.Timestamp(value) for value in sorted(data["cutoff"].unique())]
     train_end, _ = chronological_splits(cutoffs)
     feature_columns = [column for column in data.columns if column not in {"user_id", "cutoff", *LABELS}]

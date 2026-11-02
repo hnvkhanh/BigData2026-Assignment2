@@ -138,9 +138,18 @@ python assignment2/evaluation/evaluate.py \
 - Each feature snapshot filters by both the action timestamp and the table's
   documented row-availability timestamp. PRs, ordinary issues, and reviews use
   `first_seen_at` for availability; comments and pushes use `created_at`.
+- Lifecycle summaries are treated as events at their transition time:
+  PullRequest merges and closures, issue closures and their `state_reason`, and
+  review dismissals contribute only when the transition and source row were
+  both available before the feature cutoff. PR merge counts are attributed to
+  both the PR author and `merged_by_id`; user IDs are not model features.
 - Labels use actual action timestamps: PR/issue `created_at`, review
   `submitted_at`, and comment/push `created_at`. Each label covers
   `[cutoff, cutoff + 7 days)`.
+- Training, calibration, and holdout are split chronologically by weekly
+  cutoff. Prediction-time training and calibration examples are further
+  limited to label windows that end on or before the requested prediction
+  cutoff.
 - PR conversations in `Issues` are excluded from `open_issue`.
 - Model features deliberately exclude user IDs. Only cohort users are included
   because other users' activity is incomplete.

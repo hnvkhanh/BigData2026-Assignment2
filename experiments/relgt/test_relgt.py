@@ -21,8 +21,13 @@ from experiments.relgt.run import (
     CudaDeviceInfo,
     _least_loaded_cuda_device,
     choose_fusion_weight,
+    choose_three_fusion_weights,
     create_run_output_dir,
     fuse_probabilities,
+    fuse_three_probabilities,
+    lightgbm_examples_for_graph,
+    prediction_example_indices,
+    require_s2p2_dependency,
     s2p2_examples_for_rows,
 )
 from experiments.relgt.data import GraphTokens, TrainingExamples
@@ -99,6 +104,23 @@ class TemporalSnapshotTests(unittest.TestCase):
         self.assertEqual(labels.shape, (1, len(LABELS)))
         self.assertEqual(labels[0].tolist(), [0, 0, 0, 0, 0, 1])
 
+    def test_prediction_training_samples_have_labels_observed_before_cutoff(self) -> None:
+        day_ns = pd.Timedelta(days=1).value
+        cutoff_days = np.array(
+            [
+                pd.Timestamp("2026-01-01").value // day_ns,
+                pd.Timestamp("2026-01-08").value // day_ns,
+                pd.Timestamp("2026-01-15").value // day_ns,
+            ],
+            dtype=np.int32,
+        )
+
+        indices = prediction_example_indices(
+            cutoff_days, pd.Timestamp("2026-01-15")
+        )
+
+        self.assertEqual(indices.tolist(), [0, 1])
+
 
 class RelGTInspiredModelTests(unittest.TestCase):
     def test_forward_and_backward_for_empty_and_populated_neighborhoods(self) -> None:
@@ -149,6 +171,42 @@ class HybridFusionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "matching shapes"):
             fuse_probabilities(np.zeros((2, 6)), np.zeros((3, 6)), 0.5)
 
+    def test_selects_three_branch_weights_using_calibration_predictions(self) -> None:
+        labels = np.tile(
+            np.array([[1, 0, 1, 0, 1, 0], [0, 1, 0, 1, 0, 1]], dtype=np.uint8),
+            (4, 1),
+        )
+        relgt = np.where(labels == 1, 0.2, 0.8).astype(np.float32)
+        lightgbm = np.where(labels == 1, 0.95, 0.05).astype(np.float32)
+        s2p2 = np.full(labels.shape, 0.5, dtype=np.float32)
+
+        weights, thresholds, metrics = choose_three_fusion_weights(
+            labels, relgt, lightgbm, s2p2
+        )
+        fused = fuse_three_probabilities(relgt, lightgbm, s2p2, weights)
+
+        self.assertAlmostEqual(sum(weights.values()), 1.0)
+        self.assertEqual(set(weights), {"relgt", "lightgbm", "s2p2"})
+        self.assertEqual(set(thresholds), set(LABELS))
+        self.assertEqual(fused.shape, labels.shape)
+        self.assertGreater(metrics["score"], 0.9)
+        self.assertGreater(weights["lightgbm"], weights["relgt"])
+
+    def test_three_branch_fusion_rejects_invalid_weights(self) -> None:
+        probabilities = np.zeros((1, len(LABELS)), dtype=np.float32)
+
+        with self.assertRaisesRegex(ValueError, "sum to 1"):
+            fuse_three_probabilities(
+                probabilities,
+                probabilities,
+                probabilities,
+                {"relgt": 0.5, "lightgbm": 0.4, "s2p2": 0.2},
+            )
+
+    def test_s2p2_dependency_preflight_reports_install_instructions(self) -> None:
+        with self.assertRaisesRegex(ImportError, "s2p2-requirements.txt"):
+            require_s2p2_dependency()
+
     def test_aligns_s2p2_rows_to_graph_user_and_cutoff(self) -> None:
         tokens = GraphTokens(
             user_ids=np.array([4, 8], dtype=np.int32),
@@ -176,6 +234,43 @@ class HybridFusionTests(unittest.TestCase):
 
         self.assertEqual(rows["user_id"].tolist(), [8])
         self.assertEqual(rows["cutoff"].tolist(), [pd.Timestamp("2026-03-08")])
+
+    def test_aligns_lightgbm_features_to_graph_user_and_cutoff(self) -> None:
+        tokens = GraphTokens(
+            user_ids=np.array([4, 8], dtype=np.int32),
+            entity_ids=np.zeros((2, 1), dtype=np.int32),
+            node_type_ids=np.zeros((2, 1), dtype=np.uint8),
+            relation_ids=np.zeros((2, 1), dtype=np.uint8),
+            hop_ids=np.zeros((2, 1), dtype=np.uint8),
+            node_features=np.zeros((2, 1, 4), dtype=np.float32),
+            relative_days=np.zeros((2, 1), dtype=np.float32),
+        )
+        labels = np.zeros((2, len(LABELS)), dtype=np.uint8)
+        examples = TrainingExamples(
+            tokens=tokens,
+            labels=labels,
+            cutoff_days=np.array(
+                [
+                    pd.Timestamp("2026-03-01").value // pd.Timedelta(days=1).value,
+                    pd.Timestamp("2026-03-08").value // pd.Timedelta(days=1).value,
+                ],
+                dtype=np.int32,
+            ),
+            num_entities=10,
+        )
+        data = pd.DataFrame(
+            {
+                "user_id": [8, 4],
+                "cutoff": pd.to_datetime(["2026-03-08", "2026-03-01"]),
+                "feature": [80, 40],
+                **{label: [0, 0] for label in LABELS},
+            }
+        )
+
+        aligned = lightgbm_examples_for_graph(examples, data)
+
+        self.assertEqual(aligned["user_id"].tolist(), [4, 8])
+        self.assertEqual(aligned["feature"].tolist(), [40, 80])
 
 
 class DeviceAndOutputTests(unittest.TestCase):
