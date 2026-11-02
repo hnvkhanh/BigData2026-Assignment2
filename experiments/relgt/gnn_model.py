@@ -69,8 +69,18 @@ class RelationalGNN(nn.Module):
         hidden_dim: int = 64,
         num_layers: int = 2,
         dropout: float = 0.1,
+        output_indices: tuple[int, ...] = tuple(range(len(LABELS))),
     ) -> None:
         super().__init__()
+        if (
+            not output_indices
+            or len(set(output_indices)) != len(output_indices)
+            or any(index < 0 or index >= len(LABELS) for index in output_indices)
+        ):
+            raise ValueError(
+                f"output_indices must be unique label indices between 0 and {len(LABELS) - 1}."
+            )
+        self.output_indices = output_indices
         self.entity_embedding = nn.Embedding(num_entities, hidden_dim, padding_idx=0)
         self.node_type_embedding = nn.Embedding(4, hidden_dim)
         self.relation_embedding = nn.Embedding(len(LABELS) + 2, hidden_dim)
@@ -89,7 +99,7 @@ class RelationalGNN(nn.Module):
             nn.Linear(hidden_dim * 2, hidden_dim),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(hidden_dim, len(LABELS)),
+            nn.Linear(hidden_dim, len(output_indices)),
         )
 
     @staticmethod

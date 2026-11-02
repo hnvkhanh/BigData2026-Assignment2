@@ -28,6 +28,27 @@ python -m experiments.gru_relational_ple.run --epochs 1 --batch-size 64
 # Example with explicit model/device settings and output directory
 python -m experiments.gru_relational_ple.run --device auto --epochs 5 --hidden-dim 64 --num-heads 4 --num-graph-layers 2 --num-gru-layers 1 --output-dir experiments/gru_relational_ple/outputs/gru_relational_ple_run
 
+# Relational GNN specialists: compare all-non-push with PR/issue grouping
+python -m experiments.relgt_action_specialists.run
+
+# Run only the grouped PR and issue action specialists
+python -m experiments.relgt_action_specialists.run --variant grouped
+
+# Quick specialist smoke backtest
+python -m experiments.relgt_action_specialists.run --epochs 1 --batch-size 64
+
+# Activity-chunk GNNs: see activity percentiles and chunk sizes before training
+python -m experiments.relgt_activity_chunks.run --inspect-only --chunk-thresholds 20,200
+
+# Three GNNs by prior-action count (low < 20 <= mid < 200 <= high) plus a global baseline
+python -m experiments.relgt_activity_chunks.run --chunk-thresholds 20,200
+
+# Same, with tertile thresholds from the training partition and no global baseline
+python -m experiments.relgt_activity_chunks.run --no-global-baseline
+
+# Count only the last 90 days of activity; quick smoke run
+python -m experiments.relgt_activity_chunks.run --activity-window-days 90 --epochs 1 --batch-size 64
+
 # RelGT
 python -m experiments.relgt.run backtest
 

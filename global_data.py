@@ -1,10 +1,10 @@
-"""Global GitHub activity explorer with bot-vs-human analysis.
+"""Global GitHub activity explorer with user-defined activity groups.
 
 Install:
     pip install pandas pyarrow plotly dash scipy
 
 Run from the repository root:
-    python global_trends_bot_human_dash.py
+    python global_trends_dash.py
 
 Then open:
     http://127.0.0.1:8051
@@ -14,8 +14,7 @@ The input can be:
 - A Parquet/CSV/JSON/JSONL file
 - A glob matching one or more supported files
 
-For generic event files, configure USER_COL, TIME_COL, ACTION_COL, and make
-sure an is_bot column is present to enable the bot-vs-human section.
+For generic event files, configure USER_COL, TIME_COL, and ACTION_COL.
 """
 
 # ---------------------------------------------------------------- CONFIG
@@ -30,7 +29,6 @@ PORT = 8051
 # Transition rows with fewer previous-action events are hidden to avoid
 # displaying very unstable conditional probabilities.
 MIN_SUPPORT = 30
-BOT_MIN_SUPPORT = 30
 
 # ---------------------------------------------------------------- IMPORTS
 import glob
@@ -43,13 +41,12 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-from dash import Dash, Input, Output, dcc, html, dash_table
+from dash import Dash, Input, Output, State, dcc, html, dash_table
 
 try:
-    from scipy.stats import kruskal, mannwhitneyu
+    from scipy.stats import kruskal
 except Exception:  # scipy is optional; significance tests will be skipped
     kruskal = None
-    mannwhitneyu = None
 
 # ---------------------------------------------------------------- INPUT DATA
 GITHUB_ACTIVITY_TABLES = (
@@ -77,7 +74,7 @@ def read_github_activity_db(db_dir):
 
     users = pd.read_parquet(
         db_dir / "Users.parquet",
-        columns=["user_id", "github_user_id", "is_cohort", "is_bot"],
+        columns=["user_id", "github_user_id", "is_cohort"],
     )
     cohort_users = users.loc[users["is_cohort"].fillna(False)].set_index("user_id")
 
@@ -102,7 +99,6 @@ def read_github_activity_db(db_dir):
                     "timestamp": rows[time_col],
                     "action": action,
                     "item_id": rows["repo_id"],
-                    "is_bot": rows[actor_col].map(cohort_users["is_bot"]),
                 }
             )
         )
@@ -148,21 +144,6 @@ def guess(cols, keys):
     return None
 
 
-def parse_bot_flag(series):
-    """Convert common bool/numeric/string bot labels to nullable booleans."""
-    if pd.api.types.is_bool_dtype(series):
-        return series.astype("boolean")
-
-    normalized = series.astype("string").str.strip().str.lower()
-    mapping = {
-        "true": True, "1": True, "1.0": True,
-        "yes": True, "y": True, "t": True, "bot": True,
-        "false": False, "0": False, "0.0": False,
-        "no": False, "n": False, "f": False, "human": False,
-    }
-    return normalized.map(mapping).astype("boolean")
-
-
 # Load data and determine columns.
 df = read_any(DATA_PATH)
 if df.empty:
@@ -206,37 +187,8 @@ df[ACTION_COL] = df[ACTION_COL].astype(str)
 df["_u"] = df[USER_COL].astype(str)
 
 # Sort so adjacent rows form each user's chronological event sequence.
-srt_cols = ["_u", "_t", ACTION_COL]
-if "is_bot" in df.columns:
-    srt_cols.append("is_bot")
-srt = df[srt_cols].sort_values(["_u", "_t"]).reset_index(drop=True)
+srt = df[["_u", "_t", ACTION_COL]].sort_values(["_u", "_t"]).reset_index(drop=True)
 srt["_uc"] = pd.factorize(srt["_u"])[0]
-
-# Normalize bot/human labels at the event level, then enforce a single
-# user-level label. Conflicts are counted and resolved by majority vote.
-BOT_COLUMN_PRESENT = "is_bot" in srt.columns
-BOT_FLAG_CONFLICTS = 0
-BOT_UNKNOWN_USERS = 0
-
-if BOT_COLUMN_PRESENT:
-    srt["_bot_event"] = parse_bot_flag(srt["is_bot"])
-    flag_counts = srt.groupby("_u")["_bot_event"].nunique(dropna=True)
-    BOT_FLAG_CONFLICTS = int((flag_counts > 1).sum())
-
-    def majority_bot_flag(values):
-        values = values.dropna()
-        if values.empty:
-            return pd.NA
-        modes = values.mode()
-        return modes.iloc[0]
-
-    user_bot_flags = srt.groupby("_u")["_bot_event"].agg(majority_bot_flag)
-    BOT_UNKNOWN_USERS = int(user_bot_flags.isna().sum())
-    srt["_bot"] = srt["_u"].map(user_bot_flags).astype("boolean")
-else:
-    srt["_bot"] = pd.Series(pd.NA, index=srt.index, dtype="boolean")
-
-BOT_AVAILABLE = BOT_COLUMN_PRESENT and srt["_bot"].notna().any()
 
 # Build action codes and the user x action matrix.
 actions_all = sorted(srt[ACTION_COL].dropna().unique())
@@ -254,16 +206,6 @@ print(
     f"{len(srt):,} events | {srt['_uc'].nunique():,} users | "
     f"{K} actions: {actions_all}"
 )
-if BOT_AVAILABLE:
-    valid_user_flags = srt.drop_duplicates("_u")["_bot"]
-    print(
-        f"Bot/human labels: {(valid_user_flags == True).sum():,} bots | "
-        f"{(valid_user_flags == False).sum():,} humans | "
-        f"{BOT_UNKNOWN_USERS:,} unknown users | "
-        f"{BOT_FLAG_CONFLICTS:,} users with conflicting labels"
-    )
-else:
-    print("Bot/human analysis disabled: no usable is_bot labels were found.")
 
 # ---------------------------------------------------------------- CONSTANTS
 PALETTE = [
@@ -299,10 +241,7 @@ NORMS = {
     "prob": "P(next | previous), row %",
     "lift": "Lift = P(next | previous) / P(next)",
 }
-BOT_NAMES = {True: "Bot", False: "Human"}
-BOT_COLORS = {True: "#F58518", False: "#4C78A8"}
-BOT_GAP_LABELS = ["<1m", "1–10m", "10m–1h", "1–6h", "6–24h", "1–7d", ">7d"]
-BOT_GAP_EDGES = [0, 60, 600, 3600, 21600, 86400, 604800, np.inf]
+MAX_GROUPS = 5  # -> up to MAX_GROUPS - 1 threshold inputs
 
 # ---------------------------------------------------------------- HELPERS
 
@@ -349,68 +288,32 @@ def ordered(acts):
     return [action for action in actions_all if action in selected]
 
 
-def bh_adjust(p_values):
-    """Benjamini-Hochberg adjusted p-values. NaNs remain NaN."""
-    p_values = np.asarray(p_values, dtype=float)
-    result = np.full(len(p_values), np.nan)
-    valid = np.isfinite(p_values)
-    if not valid.any():
-        return result
-
-    p = p_values[valid]
-    n = len(p)
-    order = np.argsort(p)
-    ranked = p[order]
-    adjusted = ranked * n / np.arange(1, n + 1)
-    adjusted = np.minimum.accumulate(adjusted[::-1])[::-1]
-    adjusted = np.clip(adjusted, 0, 1)
-
-    restored = np.empty(n)
-    restored[order] = adjusted
-    result[valid] = restored
-    return result
-
-
-def compare_bot_human(bot_values, human_values):
-    """Mann-Whitney U and Cliff's delta (positive means bots tend higher)."""
-    bot_values = np.asarray(bot_values, dtype=float)
-    human_values = np.asarray(human_values, dtype=float)
-    bot_values = bot_values[np.isfinite(bot_values)]
-    human_values = human_values[np.isfinite(human_values)]
-
-    if len(bot_values) == 0 or len(human_values) == 0 or mannwhitneyu is None:
-        return None, None, None
-
-    try:
-        result = mannwhitneyu(
-            bot_values,
-            human_values,
-            alternative="two-sided",
-            method="auto",
-        )
-        u_stat = float(result.statistic)
-        p_value = float(result.pvalue)
-        cliff_delta = 2 * u_stat / (len(bot_values) * len(human_values)) - 1
-        return u_stat, p_value, float(cliff_delta)
-    except Exception:
-        return None, None, None
-
-
-def safe_median(values):
-    values = np.asarray(values, dtype=float)
-    values = values[np.isfinite(values)]
-    return float(np.median(values)) if len(values) else np.nan
+def parse_thresholds(q, raw_values):
+    """Sorted, unique, valid upper-bound thresholds for the first q-1 inputs."""
+    cleaned = []
+    for value in list(raw_values)[: max(int(q) - 1, 0)]:
+        if value is None:
+            continue
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            continue
+        if np.isfinite(number):
+            cleaned.append(number)
+    return tuple(sorted(set(cleaned)))
 
 
 # ---------------------------------------------------------------- DASH APP
 app = Dash(__name__)
-app.title = "Global action trends: Bot vs Human"
+app.title = "Global action trends"
 
 TBL_STYLE = dict(
     style_table={"overflowX": "auto"},
     style_cell={"textAlign": "left", "fontSize": 13, "padding": "6px"},
     style_header={"fontWeight": "bold", "backgroundColor": "#f2f2f2"},
 )
+
+TH_BOX_STYLE = {"width": "150px"}
 
 app.layout = html.Div(
     style={
@@ -565,7 +468,7 @@ app.layout = html.Div(
                         html.Label("Number of groups"),
                         dcc.Dropdown(
                             id="g-q",
-                            options=[2, 3, 4, 5],
+                            options=list(range(2, MAX_GROUPS + 1)),
                             value=3,
                             clearable=False,
                         ),
@@ -592,6 +495,33 @@ app.layout = html.Div(
                         ),
                     ],
                 ),
+            ],
+        ),
+        html.Div(
+            "Group thresholds (inclusive upper bound of each group; the last "
+            "group is everything above the final threshold). Defaults are "
+            "quantile-based suggestions; edit them and press Enter or click away.",
+            style={"color": "#555", "margin": "12px 0 4px"},
+        ),
+        html.Div(
+            style={"display": "flex", "gap": "16px", "flexWrap": "wrap"},
+            children=[
+                html.Div(
+                    id=f"g-th-box-{i}",
+                    style=TH_BOX_STYLE,
+                    children=[
+                        html.Label(f"G{i + 1} upper bound (≤)"),
+                        dcc.Input(
+                            id=f"g-th-{i}",
+                            type="number",
+                            min=0,
+                            step=1,
+                            debounce=True,
+                            style={"width": "100%"},
+                        ),
+                    ],
+                )
+                for i in range(MAX_GROUPS - 1)
             ],
         ),
         html.Div(
@@ -633,94 +563,6 @@ app.layout = html.Div(
                     "from", "to", "highest group", "lowest group",
                     "spread (pp)", "P highest %", "P lowest %",
                 ]
-            ],
-            **TBL_STYLE,
-        ),
-
-        # ---------------------------------------------------------- BOT VS HUMAN
-        html.Hr(),
-        html.H2("Bot vs Human Behavior Analysis"),
-        html.Div(
-            "This section compares bot and human accounts using user-level "
-            "activity statistics, event timing, inter-event gaps, and action "
-            "transitions. The action filter and transition time filter above "
-            "also apply to this section.",
-            style={"color": "#555", "marginBottom": "12px"},
-        ),
-        html.Pre(
-            id="bot-summary",
-            style={
-                "whiteSpace": "pre-wrap",
-                "backgroundColor": "#f5f5f5",
-                "padding": "12px",
-                "borderRadius": "6px",
-            },
-        ),
-        html.H3("1. Do bots and humans perform different actions?"),
-        html.Div(
-            "Action mix is calculated per user, so each account has equal "
-            "weight in the mean action-share comparison. Activity counts are "
-            "shown on a log scale because user activity is often skewed.",
-            style={"color": "#555", "marginBottom": "6px"},
-        ),
-        dcc.Graph(id="bot-action"),
-        html.H4("Statistical comparison by action and activity measure"),
-        dash_table.DataTable(
-            id="bot-stats",
-            page_size=20,
-            sort_action="native",
-            columns=[
-                {"name": "Measure", "id": "measure"},
-                {"name": "Bot users", "id": "Bot n"},
-                {"name": "Human users", "id": "Human n"},
-                {"name": "Bot median", "id": "Bot median"},
-                {"name": "Human median", "id": "Human median"},
-                {"name": "Median difference", "id": "median difference"},
-                {"name": "Cliff's delta", "id": "Cliff's delta"},
-                {"name": "p-value", "id": "p-value"},
-                {"name": "BH-adjusted p", "id": "BH-adjusted p"},
-            ],
-            **TBL_STYLE,
-        ),
-        html.H3("2. Do bots and humans act at different times?"),
-        html.Div(
-            "The heatmaps show the percentage of each group's events in each "
-            "hour/day cell. The difference heatmap is Bot minus Human in "
-            "percentage points. These are event-weighted profiles.",
-            style={"color": "#555", "marginBottom": "6px"},
-        ),
-        dcc.Graph(id="bot-time"),
-        html.H3("3. How much time passes between consecutive actions?"),
-        html.Div(
-            "Gaps are measured between consecutive selected actions from the "
-            "same user. If an action is deselected above, it is skipped when "
-            "forming these selected-action sequences.",
-            style={"color": "#555", "marginBottom": "6px"},
-        ),
-        dcc.Graph(id="bot-gaps"),
-        html.H3("4. Do bots and humans follow different action sequences?"),
-        html.Div(
-            id="bot-transition-note",
-            style={
-                "color": "#555",
-                "marginBottom": "6px",
-                "whiteSpace": "pre-wrap",
-            },
-        ),
-        dcc.Graph(id="bot-transitions"),
-        html.H4("Transitions with the largest bot-human differences"),
-        dash_table.DataTable(
-            id="bot-transition-table",
-            page_size=20,
-            sort_action="native",
-            columns=[
-                {"name": "Previous action", "id": "from"},
-                {"name": "Next action", "id": "to"},
-                {"name": "Bot previous events", "id": "Bot prev n"},
-                {"name": "Human previous events", "id": "Human prev n"},
-                {"name": "Bot probability (%)", "id": "P Bot %"},
-                {"name": "Human probability (%)", "id": "P Human %"},
-                {"name": "Bot - Human (pp)", "id": "Difference (pp)"},
             ],
             **TBL_STYLE,
         ),
@@ -1081,11 +923,11 @@ def metric_label(metric, window):
 
 
 @lru_cache(maxsize=16)
-def user_groups(acts_t, metric, window, q):
-    """Per-user activity metric and quantile group (0 = lightest)."""
+def user_values(acts_t, metric, window):
+    """Per-user activity metric (indexed by user code)."""
     d = srt[srt[ACTION_COL].isin(acts_t)]
     if d.empty:
-        return pd.Series(dtype=float), pd.Series(dtype=int), []
+        return pd.Series(dtype=float)
 
     if metric == "total":
         values = d.groupby("_uc").size()
@@ -1103,24 +945,74 @@ def user_groups(acts_t, metric, window, q):
                 .groupby(level=0)
                 .max()
             )
+    return values.astype(float)
 
-    values = values.astype(float)
-    try:
-        groups = pd.qcut(values, q, labels=False, duplicates="drop")
-    except ValueError:
-        groups = pd.Series(0, index=values.index)
-    groups = groups.astype(int)
 
-    labels = []
-    for group_id in sorted(groups.unique()):
-        group_values = values[groups == group_id]
-        low, high = group_values.min(), group_values.max()
-        labels.append(
-            f"G{group_id + 1} ({low:g})"
-            if low == high
-            else f"G{group_id + 1} ({low:g}-{high:g})"
+@lru_cache(maxsize=32)
+def user_groups(acts_t, metric, window, thresholds):
+    """Assign users to groups using user-defined inclusive upper bounds.
+
+    Group 0 holds values <= thresholds[0], group 1 holds values in
+    (thresholds[0], thresholds[1]], ..., and the last group holds values above
+    the final threshold. Empty groups are dropped.
+    """
+    values = user_values(acts_t, metric, window)
+    if values.empty:
+        return pd.Series(dtype=float), pd.Series(dtype=int), []
+
+    n_raw = len(thresholds) + 1
+    raw = pd.Series(
+        np.searchsorted(np.asarray(thresholds, dtype=float), values.to_numpy(), side="left"),
+        index=values.index,
+    )
+    present = sorted(raw.unique())
+    remap = {group_id: index for index, group_id in enumerate(present)}
+    groups = raw.map(remap).astype(int)
+
+    def raw_label(group_id):
+        if n_raw == 1:
+            return "G1 (all users)"
+        if group_id == 0:
+            return f"G1 (≤{thresholds[0]:g})"
+        if group_id == n_raw - 1:
+            return f"G{group_id + 1} (>{thresholds[-1]:g})"
+        return (
+            f"G{group_id + 1} (>{thresholds[group_id - 1]:g} "
+            f"to ≤{thresholds[group_id]:g})"
         )
+
+    labels = [raw_label(group_id) for group_id in present]
     return values, groups, labels
+
+
+@app.callback(
+    *[Output(f"g-th-{i}", "value") for i in range(MAX_GROUPS - 1)],
+    *[Output(f"g-th-box-{i}", "style") for i in range(MAX_GROUPS - 1)],
+    Input("g-metric", "value"),
+    Input("g-window", "value"),
+    Input("g-q", "value"),
+    State("actions", "value"),
+)
+def suggest_thresholds(metric, window, q, acts):
+    """Show q-1 threshold inputs and pre-fill them with quantile cut points."""
+    n_inputs = MAX_GROUPS - 1
+    n_active = int(q) - 1
+    styles = [
+        TH_BOX_STYLE if i < n_active else {"display": "none"}
+        for i in range(n_inputs)
+    ]
+    suggestions = [None] * n_inputs
+
+    acts = ordered(acts)
+    if acts:
+        values = user_values(tuple(acts), metric, window)
+        if len(values):
+            quantiles = np.linspace(0, 1, int(q) + 1)[1:-1]
+            cuts = np.unique(np.floor(values.quantile(quantiles).to_numpy()))
+            for i, cut in enumerate(cuts[:n_active]):
+                suggestions[i] = int(cut)
+
+    return (*suggestions, *styles)
 
 
 @app.callback(
@@ -1133,19 +1025,22 @@ def user_groups(acts_t, metric, window, q):
     Input("g-metric", "value"),
     Input("g-window", "value"),
     Input("g-q", "value"),
+    *[Input(f"g-th-{i}", "value") for i in range(MAX_GROUPS - 1)],
 )
-def group_mix(acts, metric, window, q):
+def group_mix(acts, metric, window, q, *raw_thresholds):
     acts = ordered(acts)
     if not acts:
         empty = empty_fig("Select at least one action")
         return "Select at least one action.", empty, empty, [], []
 
-    values, groups, labels = user_groups(tuple(acts), metric, window, q)
+    thresholds = parse_thresholds(q, raw_thresholds)
+    values, groups, labels = user_groups(tuple(acts), metric, window, thresholds)
     if len(groups) == 0:
         empty = empty_fig("No users")
         return "No users for the selected actions.", empty, empty, [], []
 
     group_count = len(labels)
+    short = [label.split(" ")[0] for label in labels]
     d = srt[srt[ACTION_COL].isin(acts)]
     counts = pd.crosstab(d["_uc"], d[ACTION_COL]).reindex(
         columns=acts, fill_value=0
@@ -1156,14 +1051,18 @@ def group_mix(acts, metric, window, q):
 
     note = (
         f"Users split into {group_count} group(s) by {metric_label(metric, window)} "
-        f"(quantiles; G1 = lightest). Group sizes: "
+        f"using your thresholds (G1 = lightest). Metric range: "
+        f"min {values.min():g}, median {values.median():g}, max {values.max():g}. "
+        "Group sizes: "
         + "; ".join(
             f"{labels[group_id]} n={sizes[group_id]:,}"
             for group_id in range(group_count)
         )
     )
-    if group_count < q:
-        note += f"\n(only {group_count} groups possible: many users share the same value)"
+    if group_count < len(thresholds) + 1:
+        note += "\n(empty groups omitted: no users fall in some threshold ranges)"
+    if len(thresholds) < int(q) - 1:
+        note += "\n(some threshold inputs are empty or duplicated, so fewer groups are used)"
     if kruskal is None:
         note += "\nInstall scipy (pip install scipy) to get significance tests."
     else:
@@ -1229,7 +1128,7 @@ def group_mix(acts, metric, window, q):
         for group_id in range(group_count):
             mean_share = float(share.loc[groups == group_id, action].mean())
             means.append(mean_share)
-            row[f"G{group_id + 1} mean %"] = round(100 * mean_share, 2)
+            row[f"{short[group_id]} mean %"] = round(100 * mean_share, 2)
         row["spread (pp)"] = round(100 * (max(means) - min(means)), 2)
 
         p_value = effect = None
@@ -1273,16 +1172,18 @@ def group_mix(acts, metric, window, q):
     Input("g-window", "value"),
     Input("g-q", "value"),
     Input("g-view", "value"),
+    *[Input(f"g-th-{i}", "value") for i in range(MAX_GROUPS - 1)],
 )
-def group_trans(acts, gap_key, metric, window, q, view):
+def group_trans(acts, gap_key, metric, window, q, view, *raw_thresholds):
     acts = ordered(acts)
     if not acts:
         return empty_fig("Select at least one action"), "", []
 
-    values, groups, labels = user_groups(tuple(acts), metric, window, q)
+    thresholds = parse_thresholds(q, raw_thresholds)
+    values, groups, labels = user_groups(tuple(acts), metric, window, thresholds)
     group_count = len(labels)
     if group_count < 2:
-        return empty_fig("Only one group: pick a different metric / fewer groups"), "", []
+        return empty_fig("Only one group: adjust the thresholds or metric"), "", []
 
     d = srt[srt[ACTION_COL].isin(acts)]
     if len(d) < 2:
@@ -1417,539 +1318,6 @@ def group_trans(acts, gap_key, metric, window, q, view):
             )
     difference_rows.sort(key=lambda row: -row["spread (pp)"])
     return fig, note, difference_rows[:30]
-
-# ---------------------------------------------------------------- BOT VS HUMAN: ACTIONS + USER-LEVEL STATISTICS
-
-
-@app.callback(
-    Output("bot-summary", "children"),
-    Output("bot-action", "figure"),
-    Output("bot-stats", "data"),
-    Input("actions", "value"),
-)
-def bot_action_analysis(acts):
-    if not BOT_AVAILABLE:
-        message = (
-            "Bot/human analysis is unavailable because the input has no usable "
-            "is_bot column. For the assignment database, check Users.parquet."
-        )
-        return message, empty_fig("is_bot labels unavailable"), []
-
-    acts = ordered(acts)
-    if not acts:
-        return "Select at least one action.", empty_fig("No actions selected"), []
-
-    d = srt[
-        srt[ACTION_COL].isin(acts) & srt["_bot"].notna()
-    ].copy()
-    if d.empty:
-        return "No labeled activity events.", empty_fig("No labeled events"), []
-
-    # One row per user, with one column per selected action.
-    counts = pd.crosstab(d["_u"], d[ACTION_COL]).reindex(
-        columns=acts, fill_value=0
-    )
-    total_per_user = counts.sum(axis=1)
-    shares = counts.div(total_per_user, axis=0)
-
-    meta = d.groupby("_u").agg(
-        _bot=("_bot", "first"),
-        first_time=("_t", "min"),
-        last_time=("_t", "max"),
-        events=(ACTION_COL, "size"),
-        active_days=("_t", lambda values: values.dt.normalize().nunique()),
-    )
-    meta["events_per_active_day"] = meta["events"] / meta["active_days"].clip(lower=1)
-    meta["observation_span_days"] = (
-        (meta["last_time"] - meta["first_time"]).dt.total_seconds() / 86400
-    )
-
-    # Consecutive selected-action time gaps per user.
-    d["_gap_s"] = d.groupby("_u")["_t"].diff().dt.total_seconds()
-    user_gap_median = d.groupby("_u")["_gap_s"].median()
-    meta["median_gap_seconds"] = user_gap_median.reindex(meta.index)
-
-    bot_meta = meta[meta["_bot"] == True]
-    human_meta = meta[meta["_bot"] == False]
-    n_bot = len(bot_meta)
-    n_human = len(human_meta)
-    bot_events = int(bot_meta["events"].sum())
-    human_events = int(human_meta["events"].sum())
-    total_events = bot_events + human_events
-
-    summary = (
-        f"Users: {n_bot:,} bots | {n_human:,} humans\n"
-        f"Events: {bot_events:,} bot events | {human_events:,} human events\n"
-        f"Bot share of selected events: {bot_events / max(total_events, 1):.1%}\n\n"
-        f"Median actions per user:\n"
-        f"  Bot: {bot_meta['events'].median():.1f}\n"
-        f"  Human: {human_meta['events'].median():.1f}\n\n"
-        f"Median active days per user:\n"
-        f"  Bot: {bot_meta['active_days'].median():.1f}\n"
-        f"  Human: {human_meta['active_days'].median():.1f}\n\n"
-        f"Median actions per active day:\n"
-        f"  Bot: {bot_meta['events_per_active_day'].median():.2f}\n"
-        f"  Human: {human_meta['events_per_active_day'].median():.2f}\n\n"
-        f"Median time between consecutive selected actions:\n"
-        f"  Bot: {fmt_secs(bot_meta['median_gap_seconds'].median())}\n"
-        f"  Human: {fmt_secs(human_meta['median_gap_seconds'].median())}\n\n"
-        f"Data quality:\n"
-        f"  Users with conflicting is_bot labels: {BOT_FLAG_CONFLICTS:,}\n"
-        f"  Users with unknown is_bot labels: {BOT_UNKNOWN_USERS:,}"
-    )
-
-    fig = make_subplots(
-        rows=1,
-        cols=2,
-        subplot_titles=(
-            "Mean per-user action share (approx. 95% CI)",
-            "Actions per user (log10 scale)",
-        ),
-        horizontal_spacing=0.15,
-    )
-
-    for flag in (True, False):
-        name = BOT_NAMES[flag]
-        user_ids = meta.index[meta["_bot"] == flag]
-        if len(user_ids) == 0:
-            continue
-
-        per_user_shares = shares.reindex(user_ids)
-        mean_shares = per_user_shares.mean()
-        errors = 1.96 * per_user_shares.sem().fillna(0)
-        fig.add_trace(
-            go.Bar(
-                x=acts,
-                y=mean_shares.values,
-                name=name,
-                marker_color=BOT_COLORS[flag],
-                error_y=dict(type="data", array=errors.values),
-            ),
-            row=1,
-            col=1,
-        )
-        activity = meta.loc[user_ids, "events"]
-        fig.add_trace(
-            go.Box(
-                y=np.log10(activity + 1),
-                name=name,
-                marker_color=BOT_COLORS[flag],
-                boxmean=True,
-                boxpoints="outliers",
-                showlegend=False,
-            ),
-            row=1,
-            col=2,
-        )
-
-    fig.update_yaxes(title_text="Mean share", tickformat=".0%", row=1, col=1)
-    fig.update_yaxes(title_text="log10(1 + actions per user)", row=1, col=2)
-    fig.update_layout(
-        barmode="group",
-        template="plotly_white",
-        height=500,
-        legend=dict(orientation="h", y=-0.2),
-    )
-
-    # User-level statistical comparisons. This avoids treating every event
-    # from a highly active user as an independent sample.
-    test_data = [
-        ("Total actions per user", meta["events"]),
-        ("Active days per user", meta["active_days"]),
-        ("Actions per active day", meta["events_per_active_day"]),
-        ("Observation span (days)", meta["observation_span_days"]),
-        ("Median inter-event gap (seconds)", meta["median_gap_seconds"]),
-    ]
-    for action in acts:
-        test_data.append((f"Share of {action} (%)", shares[action] * 100))
-
-    rows = []
-    raw_p_values = []
-    for measure, values in test_data:
-        bot_values = values.reindex(bot_meta.index).dropna().to_numpy()
-        human_values = values.reindex(human_meta.index).dropna().to_numpy()
-        _, p_value, delta = compare_bot_human(bot_values, human_values)
-        raw_p_values.append(np.nan if p_value is None else p_value)
-
-        bot_median = safe_median(bot_values)
-        human_median = safe_median(human_values)
-        rows.append(
-            {
-                "measure": measure,
-                "Bot n": len(bot_values),
-                "Human n": len(human_values),
-                "Bot median": None if np.isnan(bot_median) else round(bot_median, 3),
-                "Human median": None if np.isnan(human_median) else round(human_median, 3),
-                "median difference": (
-                    None
-                    if np.isnan(bot_median) or np.isnan(human_median)
-                    else round(bot_median - human_median, 3)
-                ),
-                "Cliff's delta": None if delta is None else round(delta, 3),
-                "p-value": None if p_value is None else float(f"{p_value:.4g}"),
-                "BH-adjusted p": None,
-            }
-        )
-
-    adjusted_p_values = bh_adjust(raw_p_values)
-    for row, adjusted_p in zip(rows, adjusted_p_values):
-        row["BH-adjusted p"] = (
-            None if not np.isfinite(adjusted_p) else float(f"{adjusted_p:.4g}")
-        )
-
-    if mannwhitneyu is None:
-        summary += "\n\nInstall scipy (`pip install scipy`) to calculate Mann-Whitney tests."
-
-    return summary, fig, rows
-
-# ---------------------------------------------------------------- BOT VS HUMAN: TEMPORAL PATTERNS
-
-
-@app.callback(
-    Output("bot-time", "figure"),
-    Output("bot-gaps", "figure"),
-    Input("actions", "value"),
-)
-def bot_temporal_analysis(acts):
-    if not BOT_AVAILABLE:
-        unavailable = empty_fig("is_bot labels unavailable")
-        return unavailable, unavailable
-
-    acts = ordered(acts)
-    if not acts:
-        empty = empty_fig("Select actions")
-        return empty, empty
-
-    d = srt[
-        srt[ACTION_COL].isin(acts) & srt["_bot"].notna()
-    ].copy()
-    if d.empty:
-        empty = empty_fig("No labeled events")
-        return empty, empty
-
-    # Hour x weekday percentages within each group (event-weighted).
-    day_names = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
-    profiles = {}
-    for flag in (True, False):
-        sub = d[d["_bot"] == flag]
-        profile = np.zeros((7, 24), dtype=float)
-        if len(sub):
-            grouped = sub.groupby([
-                sub["_t"].dt.dayofweek,
-                sub["_t"].dt.hour,
-            ]).size()
-            for (weekday, hour), count in grouped.items():
-                profile[int(weekday), int(hour)] = 100 * count / len(sub)
-        profiles[flag] = profile
-
-    difference = profiles[True] - profiles[False]
-    diff_limit = max(0.1, float(np.nanmax(np.abs(difference))))
-
-    fig_time = make_subplots(
-        rows=1,
-        cols=3,
-        subplot_titles=(
-            "Bot event distribution (%)",
-            "Human event distribution (%)",
-            "Bot - Human (percentage points)",
-        ),
-        horizontal_spacing=0.12,
-    )
-    fig_time.add_trace(
-        go.Heatmap(
-            z=profiles[True],
-            x=list(range(24)),
-            y=day_names,
-            colorscale="Blues",
-            zmin=0,
-            showscale=False,
-            hovertemplate="%{y}, %{x}:00<br>%{z:.3f}% of bot events<extra></extra>",
-        ),
-        row=1,
-        col=1,
-    )
-    fig_time.add_trace(
-        go.Heatmap(
-            z=profiles[False],
-            x=list(range(24)),
-            y=day_names,
-            colorscale="Blues",
-            zmin=0,
-            showscale=False,
-            hovertemplate="%{y}, %{x}:00<br>%{z:.3f}% of human events<extra></extra>",
-        ),
-        row=1,
-        col=2,
-    )
-    fig_time.add_trace(
-        go.Heatmap(
-            z=difference,
-            x=list(range(24)),
-            y=day_names,
-            colorscale="RdBu",
-            zmin=-diff_limit,
-            zmax=diff_limit,
-            colorbar=dict(title="pp"),
-            hovertemplate="%{y}, %{x}:00<br>Bot - Human: %{z:+.3f} pp<extra></extra>",
-        ),
-        row=1,
-        col=3,
-    )
-    fig_time.update_layout(template="plotly_white", height=430)
-    fig_time.update_xaxes(title_text="Hour of day (0–23)")
-    fig_time.update_yaxes(autorange="reversed")
-
-    # Inter-event gaps between consecutive selected actions by the same user.
-    d["_gap_s"] = d.groupby("_u")["_t"].diff().dt.total_seconds()
-    gaps = d[
-        d["_gap_s"].notna()
-        & (d["_gap_s"] >= 0)
-        & d["_bot"].notna()
-    ].copy()
-    if gaps.empty:
-        return fig_time, empty_fig("No consecutive same-user event pairs")
-
-    gaps["_gap_bucket"] = pd.cut(
-        gaps["_gap_s"],
-        bins=BOT_GAP_EDGES,
-        labels=BOT_GAP_LABELS,
-        right=False,
-        include_lowest=True,
-    )
-
-    fig_gap = go.Figure()
-    for flag in (True, False):
-        sub = gaps[gaps["_bot"] == flag]
-        bucket_counts = sub["_gap_bucket"].value_counts().reindex(
-            BOT_GAP_LABELS, fill_value=0
-        )
-        percentages = 100 * bucket_counts / max(len(sub), 1)
-        fig_gap.add_trace(
-            go.Bar(
-                x=BOT_GAP_LABELS,
-                y=percentages.values,
-                name=BOT_NAMES[flag],
-                marker_color=BOT_COLORS[flag],
-                customdata=bucket_counts.values,
-                hovertemplate=(
-                    "%{x}<br>%{y:.2f}% of gaps<br>%{customdata:,} gaps<extra></extra>"
-                ),
-            )
-        )
-    fig_gap.update_layout(
-        barmode="group",
-        template="plotly_white",
-        height=460,
-        title="Distribution of time between consecutive actions",
-        xaxis_title="Time between actions",
-        yaxis_title="Percentage of same-user event gaps (%)",
-        legend=dict(orientation="h", y=-0.2),
-    )
-    return fig_time, fig_gap
-
-# ---------------------------------------------------------------- BOT VS HUMAN: ACTION TRANSITIONS
-
-
-@app.callback(
-    Output("bot-transitions", "figure"),
-    Output("bot-transition-note", "children"),
-    Output("bot-transition-table", "data"),
-    Input("actions", "value"),
-    Input("gap", "value"),
-)
-def bot_transition_analysis(acts, gap_key):
-    if not BOT_AVAILABLE:
-        return empty_fig("is_bot labels unavailable"), "No usable is_bot labels.", []
-
-    acts = ordered(acts)
-    if not acts:
-        return empty_fig("Select actions"), "", []
-
-    d = srt[
-        srt[ACTION_COL].isin(acts) & srt["_bot"].notna()
-    ].copy()
-    if len(d) < 2:
-        return empty_fig("Not enough events"), "", []
-
-    action_codes = d["_a"].to_numpy()
-    users = d["_u"].to_numpy()
-    timestamps = d["_t"].to_numpy()
-    bot_flags = d["_bot"].astype(bool).to_numpy()
-
-    same_user = users[1:] == users[:-1]
-    gap_seconds = (timestamps[1:] - timestamps[:-1]) / np.timedelta64(1, "s")
-    valid = (
-        same_user
-        & (gap_seconds >= 0)
-        & (gap_seconds <= GAPS[gap_key])
-    )
-    if not valid.any():
-        return empty_fig("No transitions with this filter"), "", []
-
-    previous_codes = action_codes[:-1]
-    next_codes = action_codes[1:]
-    # Bot label belongs to the user; using the previous event's label is safe
-    # because both events in a valid pair belong to the same account.
-    previous_is_bot = bot_flags[:-1]
-
-    indices = [CODE[action] for action in acts]
-    matrices = {}
-    probabilities = {}
-    row_support = {}
-
-    for flag in (True, False):
-        group_valid = valid & (previous_is_bot == flag)
-        pair_codes = (
-            previous_codes[group_valid].astype(np.int64) * K
-            + next_codes[group_valid].astype(np.int64)
-        )
-        full_matrix = np.bincount(
-            pair_codes,
-            minlength=K * K,
-        ).reshape(K, K).astype(float)
-        selected_matrix = full_matrix[np.ix_(indices, indices)]
-        support = selected_matrix.sum(axis=1)
-        probability = np.divide(
-            selected_matrix,
-            support[:, None],
-            out=np.full_like(selected_matrix, np.nan),
-            where=support[:, None] >= BOT_MIN_SUPPORT,
-        )
-        matrices[flag] = selected_matrix
-        probabilities[flag] = probability
-        row_support[flag] = support
-
-    bot_probability = probabilities[True]
-    human_probability = probabilities[False]
-    difference = (bot_probability - human_probability) * 100
-
-    finite_difference = np.abs(difference[np.isfinite(difference)])
-    if finite_difference.size == 0:
-        bot_n = int((valid & previous_is_bot).sum())
-        human_n = int((valid & ~previous_is_bot).sum())
-        message = (
-            f"Used {bot_n:,} bot transitions and {human_n:,} human transitions "
-            f"({GAP_LABELS[gap_key]}), but there are not enough previous-action "
-            f"events in both groups. Each group needs at least {BOT_MIN_SUPPORT} "
-            "events for a previous-action row."
-        )
-        return empty_fig("Insufficient transition support"), message, []
-
-    diff_limit = min(100.0, max(5.0, float(np.percentile(finite_difference, 95))))
-    fig = make_subplots(
-        rows=1,
-        cols=3,
-        subplot_titles=(
-            "Bot: P(next | previous)",
-            "Human: P(next | previous)",
-            "Bot - Human (percentage points)",
-        ),
-        horizontal_spacing=0.13,
-    )
-
-    def probability_text(probability_matrix):
-        return [
-            ["" if not np.isfinite(value) else f"{value * 100:.1f}%" for value in row]
-            for row in probability_matrix
-        ]
-
-    difference_text = [
-        ["" if not np.isfinite(value) else f"{value:+.1f}" for value in row]
-        for row in difference
-    ]
-
-    fig.add_trace(
-        go.Heatmap(
-            z=bot_probability * 100,
-            x=acts,
-            y=acts,
-            text=probability_text(bot_probability),
-            texttemplate="%{text}",
-            colorscale="Blues",
-            zmin=0,
-            zmax=100,
-            showscale=False,
-            hovertemplate="%{y} -> %{x}<br>Bot: %{text}<extra></extra>",
-        ),
-        row=1,
-        col=1,
-    )
-    fig.add_trace(
-        go.Heatmap(
-            z=human_probability * 100,
-            x=acts,
-            y=acts,
-            text=probability_text(human_probability),
-            texttemplate="%{text}",
-            colorscale="Blues",
-            zmin=0,
-            zmax=100,
-            showscale=False,
-            hovertemplate="%{y} -> %{x}<br>Human: %{text}<extra></extra>",
-        ),
-        row=1,
-        col=2,
-    )
-    fig.add_trace(
-        go.Heatmap(
-            z=difference,
-            x=acts,
-            y=acts,
-            text=difference_text,
-            texttemplate="%{text}",
-            colorscale="RdBu",
-            zmin=-diff_limit,
-            zmax=diff_limit,
-            colorbar=dict(title="pp"),
-            hovertemplate="%{y} -> %{x}<br>Bot - Human: %{text} pp<extra></extra>",
-        ),
-        row=1,
-        col=3,
-    )
-    fig.update_yaxes(autorange="reversed")
-    fig.update_layout(
-        template="plotly_white",
-        height=max(480, 300 + 25 * len(acts)),
-    )
-
-    bot_pairs = int((valid & previous_is_bot).sum())
-    human_pairs = int((valid & ~previous_is_bot).sum())
-    note = (
-        f"Used {bot_pairs:,} bot transitions and {human_pairs:,} human transitions "
-        f"({GAP_LABELS[gap_key]}). Rows = previous action; columns = next action.\n"
-        "Difference = Bot probability minus Human probability. Positive values "
-        "mean the transition is more common for bots; negative values mean it is "
-        "more common for humans.\n"
-        f"Rows with fewer than {BOT_MIN_SUPPORT} previous-action events in either "
-        "group are hidden. These transition differences are descriptive, not "
-        "individual significance tests."
-    )
-
-    rows = []
-    for i, from_action in enumerate(acts):
-        for j, to_action in enumerate(acts):
-            if not (
-                np.isfinite(bot_probability[i, j])
-                and np.isfinite(human_probability[i, j])
-            ):
-                continue
-            bot_probability_pct = float(bot_probability[i, j] * 100)
-            human_probability_pct = float(human_probability[i, j] * 100)
-            rows.append(
-                {
-                    "from": from_action,
-                    "to": to_action,
-                    "Bot prev n": int(row_support[True][i]),
-                    "Human prev n": int(row_support[False][i]),
-                    "P Bot %": round(bot_probability_pct, 2),
-                    "P Human %": round(human_probability_pct, 2),
-                    "Difference (pp)": round(
-                        bot_probability_pct - human_probability_pct, 2
-                    ),
-                }
-            )
-    rows.sort(key=lambda row: abs(row["Difference (pp)"]), reverse=True)
-    return fig, note, rows[:50]
 
 
 if __name__ == "__main__":
