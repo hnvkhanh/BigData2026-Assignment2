@@ -1131,7 +1131,13 @@ def run_prediction(args: argparse.Namespace) -> None:
         raise ValueError(f"{args.test_input} contains duplicate UserIDs.")
     users = pd.read_parquet(
         args.db_dir / "Users.parquet",
-        columns=["user_id", "github_user_id", "is_cohort"],
+        columns=[
+            "user_id",
+            "github_user_id",
+            "is_cohort",
+            "is_bot",
+            "first_seen_at",
+        ],
     )
     cohort_users = users.loc[users["is_cohort"]]
     user_lookup = cohort_users.set_index("github_user_id")["user_id"]
@@ -1167,6 +1173,7 @@ def run_prediction(args: argparse.Namespace) -> None:
         )
     elif args.temporal_model == "relgt_lightgbm":
         from experiments.lightgbm_baseline.run import (
+            add_user_bot_feature,
             predict_probabilities as predict_lgbm,
             row_for_cutoff,
         )
@@ -1174,6 +1181,7 @@ def run_prediction(args: argparse.Namespace) -> None:
         inference_features = row_for_cutoff(
             args.cutoff, lightgbm_histories, internal_ids.astype("int64").tolist()
         )
+        inference_features = add_user_bot_feature(inference_features, cohort_users)
         lightgbm_by_label = predict_lgbm(
             lightgbm_models, inference_features, lightgbm_features
         )
@@ -1195,6 +1203,7 @@ def run_prediction(args: argparse.Namespace) -> None:
             [s2p2_by_label[label] for label in LABELS]
         )
         from experiments.lightgbm_baseline.run import (
+            add_user_bot_feature,
             predict_probabilities as predict_lgbm,
             row_for_cutoff,
         )
@@ -1204,6 +1213,7 @@ def run_prediction(args: argparse.Namespace) -> None:
             lightgbm_histories,
             internal_ids.astype("int64").tolist(),
         )
+        inference_features = add_user_bot_feature(inference_features, cohort_users)
         lightgbm_by_label = predict_lgbm(
             lightgbm_models, inference_features, lightgbm_features
         )

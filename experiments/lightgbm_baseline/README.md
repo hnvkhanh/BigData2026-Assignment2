@@ -131,6 +131,13 @@ actions in that window. These features use only actions available before the
 cutoff and are included automatically in LightGBM training, prediction, and
 RelGT+LightGBM ensembles.
 
+LightGBM also uses the Users table's `is_bot` value as a binary feature. It is
+joined by internal `user_id` only to attach this value; the identifier itself
+is excluded from model inputs. Before the user row's `first_seen_at`, the
+feature is missing rather than using information not yet available. The
+frequency-only neural network still uses only its 24 per-action frequency
+inputs.
+
 LightGBM also receives each action's median daily count and the combined
 median daily count across all six actions for those same lookback windows.
 These medians include zero-activity days, use complete 24-hour bins anchored to

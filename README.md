@@ -30,7 +30,9 @@ on examples whose complete seven-day label window ends by the requested
 prediction cutoff. Feature snapshots also exclude actions, rows, and lifecycle
 transitions that were not yet available at each historical cutoff. LightGBM
 also uses per-action and combined median daily activity counts over its
-lookback windows; inactive days count as zero.
+lookback windows; inactive days count as zero. Its tabular branch also uses
+the user's `is_bot` flag when the Users row is known by the cutoff; the
+frequency-only neural network remains frequency-only.
 
 ## Setup
 

@@ -82,7 +82,8 @@ the baseline's cutoff-safe tabular features, aligns them to RelGT user-week
 examples, and selects a shared probability-fusion weight and label thresholds
 using calibration weeks only. The LightGBM features include recent total
 actions, per-action shares, and per-day action frequencies over 7-, 30-, 90-,
-and 365-day windows.
+and 365-day windows, plus the cutoff-available `is_bot` feature. The frequency-
+only neural network in the baseline remains restricted to its frequency inputs.
 
 The `relgt_lightgbm_s2p2` mode combines all three branches. It requires both
 the base/RelGT dependencies and the optional pinned S2P2/EasyTPP dependency.

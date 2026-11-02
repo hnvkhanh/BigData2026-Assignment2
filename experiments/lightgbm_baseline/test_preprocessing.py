@@ -12,6 +12,7 @@ from experiments.lightgbm_baseline.run import (
     _lifecycle_history,
     LABELS,
     LOOKBACK_DAYS,
+    add_user_bot_feature,
     fit_frequency_nn_models,
     frequency_feature_columns,
     load_histories,
@@ -29,11 +30,12 @@ class LifecycleFeatureTests(unittest.TestCase):
             for days in LOOKBACK_DAYS
             for label in LABELS
         ]
-        columns = ["user_id", "cutoff", *LABELS, *feature_columns]
+        columns = ["user_id", "cutoff", "is_bot", *LABELS, *feature_columns]
         selected_features = frequency_feature_columns(columns)
         self.assertEqual(selected_features, feature_columns)
         self.assertNotIn("user_id", selected_features)
         self.assertFalse(any(label in selected_features for label in LABELS))
+        self.assertNotIn("is_bot", selected_features)
 
         train = pd.DataFrame(
             {
@@ -53,6 +55,29 @@ class LifecycleFeatureTests(unittest.TestCase):
         for values in probabilities.values():
             self.assertEqual(values.shape, (24,))
             self.assertTrue(((values >= 0) & (values <= 1)).all())
+
+    def test_is_bot_is_attached_as_binary_feature_without_user_id(self) -> None:
+        frame = pd.DataFrame(
+            {
+                "user_id": [7, 8],
+                "cutoff": pd.to_datetime(["2024-01-10", "2024-01-10"]),
+            }
+        )
+        users = pd.DataFrame(
+            {
+                "user_id": [7, 8],
+                "is_bot": [False, True],
+                "first_seen_at": pd.to_datetime(["2024-01-01", "2024-01-10"]),
+            }
+        )
+
+        result = add_user_bot_feature(frame, users)
+
+        self.assertEqual(result.loc[0, "is_bot"], 0)
+        self.assertTrue(pd.isna(result.loc[1, "is_bot"]))
+        self.assertEqual(frame.columns.tolist(), ["user_id", "cutoff"])
+        with self.assertRaisesRegex(ValueError, "Cannot determine is_bot"):
+            add_user_bot_feature(frame, users.iloc[:1])
 
     def test_frequency_nn_can_share_one_six_label_output_layer(self) -> None:
         feature_columns = [

@@ -320,13 +320,44 @@ def labels_for_horizon(
     return labels
 
 
+def add_user_bot_feature(
+    frame: pd.DataFrame,
+    users: pd.DataFrame,
+) -> pd.DataFrame:
+    """Attach bot status only after the user row is known at the example cutoff."""
+    if users["user_id"].duplicated().any():
+        raise ValueError("Users table contains duplicate user_id values.")
+    if "cutoff" not in frame or "first_seen_at" not in users:
+        raise ValueError("Bot features require example cutoffs and user first_seen_at.")
+
+    indexed_users = users.set_index("user_id")
+    bot_by_user = indexed_users["is_bot"]
+    is_bot = frame["user_id"].map(bot_by_user)
+    if is_bot.isna().any():
+        raise ValueError(
+            f"Cannot determine is_bot for {int(is_bot.isna().sum())} user(s)."
+        )
+    first_seen_by_user = indexed_users["first_seen_at"]
+    first_seen_at = pd.to_datetime(frame["user_id"].map(first_seen_by_user))
+    available = first_seen_at < pd.to_datetime(frame["cutoff"])
+    result = frame.copy()
+    result["is_bot"] = is_bot.astype("float32").where(available)
+    return result
+
+
 def build_training_data(
     db_dir: Path,
     start_cutoff: pd.Timestamp,
 ) -> tuple[pd.DataFrame, dict[str, pd.DataFrame], list[int]]:
     users = pd.read_parquet(
         db_dir / "Users.parquet",
-        columns=["user_id", "github_user_id", "is_cohort"],
+        columns=[
+            "user_id",
+            "github_user_id",
+            "is_cohort",
+            "is_bot",
+            "first_seen_at",
+        ],
     )
     cohort = users.loc[users["is_cohort"]].copy()
     user_ids = cohort["user_id"].astype(int).tolist()
@@ -348,6 +379,7 @@ def build_training_data(
         x = row_for_cutoff(cutoff, histories, user_ids)
         y = labels_for_horizon(cutoff, histories, user_ids)
         panel = x.merge(y, on="user_id", validate="one_to_one")
+        panel = add_user_bot_feature(panel, cohort)
         # The official test list is restricted to users with at least five
         # activity records in the preceding 90 days.
         eligible_count = panel[
@@ -818,7 +850,13 @@ def run_prediction(
         raise ValueError(f"{test_input} contains duplicate UserIDs.")
     cohort_users = pd.read_parquet(
         db_dir / "Users.parquet",
-        columns=["user_id", "github_user_id", "is_cohort"],
+        columns=[
+            "user_id",
+            "github_user_id",
+            "is_cohort",
+            "is_bot",
+            "first_seen_at",
+        ],
     )
     cohort_users = cohort_users.loc[cohort_users["is_cohort"]]
     user_lookup = cohort_users.set_index("github_user_id")["user_id"]
@@ -831,6 +869,7 @@ def run_prediction(
     internal_ids = mapped_ids.astype("int64").tolist()
 
     inference = row_for_cutoff(cutoff, histories, cohort_user_ids)
+    inference = add_user_bot_feature(inference, cohort_users)
     inference = inference.set_index("user_id").loc[internal_ids].reset_index()
     probabilities = predict_temporal_probabilities(
         temporal_model,
