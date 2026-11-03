@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import math
 
+import numpy as np
 import torch
 from torch import nn
 
 from .data import LABELS
+from .gnn_model import user_embedding_index
 
 
 class RelGTInspired(nn.Module):
@@ -26,6 +28,7 @@ class RelGTInspired(nn.Module):
         num_local_layers: int = 2,
         num_centroids: int = 8,
         dropout: float = 0.1,
+        known_user_ids: np.ndarray | None = None,
     ) -> None:
         super().__init__()
         self.entity_embedding = nn.Embedding(num_entities, hidden_dim, padding_idx=0)
@@ -35,6 +38,19 @@ class RelGTInspired(nn.Module):
         self.feature_projection = nn.Linear(4, hidden_dim)
         self.time_projection = nn.Linear(7, hidden_dim)
         self.token_norm = nn.LayerNorm(hidden_dim)
+        # Users seen in training get a learned vector added to the user token;
+        # index 0 (zero vector) is shared by every other user.
+        known = (
+            np.unique(np.asarray(known_user_ids, dtype=np.int64))
+            if known_user_ids is not None
+            else np.empty(0, dtype=np.int64)
+        )
+        self.register_buffer("known_user_ids", torch.as_tensor(known))
+        self.user_embedding = (
+            nn.Embedding(len(known) + 1, hidden_dim, padding_idx=0)
+            if len(known)
+            else None
+        )
 
         layer = nn.TransformerEncoderLayer(
             d_model=hidden_dim,
@@ -83,6 +99,7 @@ class RelGTInspired(nn.Module):
         hop_ids: torch.Tensor,
         node_features: torch.Tensor,
         relative_days: torch.Tensor,
+        user_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Return six logits for each user in a batch."""
         return self.output(
@@ -93,6 +110,7 @@ class RelGTInspired(nn.Module):
                 hop_ids,
                 node_features,
                 relative_days,
+                user_ids,
             )
         )
 
@@ -104,8 +122,13 @@ class RelGTInspired(nn.Module):
         hop_ids: torch.Tensor,
         node_features: torch.Tensor,
         relative_days: torch.Tensor,
+        user_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Return each user's local-plus-global relational graph representation."""
+        if (self.user_embedding is None) != (user_ids is None):
+            raise ValueError(
+                "user_ids must be given exactly when the model has known_user_ids."
+            )
         batch_size = entity_ids.shape[0]
         device = entity_ids.device
         is_neighbor = entity_ids.ne(0)
@@ -161,6 +184,14 @@ class RelGTInspired(nn.Module):
             + self.feature_projection(structural_tokens)
             + self.time_projection(self._time_features(age_tokens))
         )
+        if self.user_embedding is not None:
+            user_vectors = self.user_embedding(
+                user_embedding_index(self.known_user_ids, user_ids)
+            )
+            local_tokens = torch.cat(
+                [local_tokens[:, :1] + user_vectors.unsqueeze(1), local_tokens[:, 1:]],
+                dim=1,
+            )
 
         padding_mask = torch.cat(
             [

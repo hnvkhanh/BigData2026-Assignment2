@@ -37,7 +37,108 @@ design, with a much smaller sampled graph and PyTorch-only implementation so it
 can run on Apple Silicon MPS. It does not reproduce RelGT's vector-quantized
 centroid codebook, full RelBench feature encoders, or all cross-table edges.
 The branch is therefore a transparent RelGT-inspired experiment, not a claim of
-an exact RelGT reproduction.
+an exact RelGT reproduction. For a version that does all three and reads the
+database tables directly, use `--temporal-model relgt_db` (next section).
+
+## RelGT on the relational database (`relgt_db`)
+
+`--temporal-model relgt_db` applies the upstream RelGT method to the database
+itself instead of to hand-built activity snapshots. It is a PyTorch-only port
+of [`model.py`](https://github.com/snap-stanford/relgt/blob/main/model.py),
+[`local_module.py`](https://github.com/snap-stanford/relgt/blob/main/local_module.py),
+[`codebook.py`](https://github.com/snap-stanford/relgt/blob/main/codebook.py),
+[`encoders.py`](https://github.com/snap-stanford/relgt/blob/main/encoders.py),
+and the sampler in [`utils.py`](https://github.com/snap-stanford/relgt/blob/main/utils.py).
+It needs no PyTorch Geometric, torch_frame, or RelBench.
+
+**From database to graph** ([`database.py`](database.py)). All 8 tables are
+read, using a schema declared from `assignment2/data/db/SCHEMA.md`
+(`GITHUB_SCHEMA`: primary keys, foreign keys, row-time columns, and "known
+only later" columns). As in RelBench's `make_pkey_fkey_graph`:
+
+- every row is a node (2.58M), its table is the node type, and every
+  foreign key is an undirected edge (5.1M), e.g.
+  `PRReviews.pr_id -> PullRequests`, `Issues.pull_request_id -> PullRequests`,
+  `PRReviewComments.in_reply_to_id -> PRReviewComments`;
+- every other column is typed and encoded: numbers (signed log, standardized),
+  booleans and columns with at most 512 values (categorical), free text such as
+  titles, bodies, branches, paths, and diff hunks (hashed word pieces),
+  `Issues.labels` (multicategorical), and timestamps (whether known, age at the
+  cutoff, hour of day, day of week). GitHub ids, event ids, commit hashes,
+  `head_repo_id`/`org_id` (not row indices), constant columns, and
+  `Pushes.ref` (a copy of `ref_type` + `branch`) are dropped.
+
+**Leakage rules.** A row is known from its row time (`first_seen_at` or
+`created_at`), and an edge once both of its rows are known. The late key
+`merged_by_id` is linked only from `merged_at`. Late values (`merged_at`,
+`closed_at`, `Issues.state_reason` (known from `closed_at`), `dismissed_at`)
+are masked for each token unless they were known before that sample's cutoff.
+Every comparison is strictly earlier than the cutoff. Unlike upstream, the
+fallback tokens below are also drawn only from rows known before the cutoff.
+
+**Tokens** ([`db_sampler.py`](db_sampler.py)). The seed is the cohort user's
+`Users` row at the weekly cutoff. As upstream, the sampler collects the 1-hop
+neighbors known before the cutoff (at most 5,000) and their neighbors as 2-hop
+(at most 1,000 per 1-hop node). It then draws `K - 1` tokens uniformly from
+both, with replacement when there are fewer than `K - 1`. A seed with no
+neighbors gets random known rows marked hop 3. The full history before the
+cutoff is used, with no lookback window. Each token has the RelGT elements:
+the row's encoded columns, its table, its hop, its age (cutoff minus row time),
+and a GIN positional encoding over the edges among the sampled rows.
+
+**Model** ([`db_model.py`](db_model.py)). As upstream: per-table column
+encoders feed a ResNet (torch_frame-style). The five elements are each
+layer-normalized, concatenated, and mixed. A local Transformer over the `K`
+tokens reads out to the seed through attention. Global attention goes to an
+EMA vector-quantized codebook of seed representations (`full` = both). A
+batch-norm feed-forward network and an MLP head give six logits. The model is
+trained with BCE, gradient clipping at 1.0, and Adam; the epoch with the best
+calibration-week macro AUPRC is kept, as upstream keeps its best validation
+epoch.
+
+**Same task as `relgt`.** The user-weeks, labels, five-action 14-day
+eligibility filter, weekly cutoffs, 70/15/15 chronological split, per-label
+threshold calibration, and output files are the same as in the `relgt` mode.
+On the current release, the 102,524 user-weeks and labels match the `relgt`
+cache exactly, so holdout scores compare directly.
+
+**Differences from upstream**, adapted to this task and machine:
+
+- Text uses a trainable hashed word-piece vocabulary shared by all text
+  columns, instead of frozen GloVe sentence embeddings.
+- The defaults are smaller: `K=128` instead of 300, 64 channels instead of 512,
+  and 512 centroids instead of 4,096. The learning rate is 1e-3 (upstream used
+  1e-4) to match this repository's other graph runs.
+- The codebook assignment buffer covers `Users` rows (the seeds) rather than
+  every node.
+- Attention dropout is applied only in training; upstream also applies it at
+  evaluation.
+- One head predicts all six labels.
+
+Run it:
+
+```bash
+python -m experiments.relgt.run backtest --temporal-model relgt_db
+python -m experiments.relgt.run predict --temporal-model relgt_db
+```
+
+Useful options: `--num-neighbors` (K, default 128), `--hidden-dim`,
+`--num-heads`, `--num-layers` (local Transformer layers), `--num-centroids`,
+`--conv-type full|local|global`, `--ablate none|type|hop|time|tfs|gnn` (drop
+one token element, as in the upstream ablations), `--text-buckets`, `--db-lr`,
+`--weight-decay`, `--max-steps-per-epoch`, `--epochs`, `--batch-size`,
+`--dropout`, `--train-fraction`, and `--seed`. `--user-embedding` is rejected
+because RelGT has no per-entity id embedding. The fusion modes
+(`relgt_lightgbm`, `hybrid`, ...) still use the `relgt` snapshot branch.
+
+Backtests write `backtest_metrics.json` (holdout metrics, settings, and
+per-epoch history), `holdout_probabilities.csv` (branch `relgt_db`, usable
+with `exam_fail_case.py --model-branch relgt_db`), and `relgt_db_model.pt`.
+Predictions write `predictions.csv`, `probabilities.csv`, `metadata.json`,
+and the model. Token sets are cached in the run folder's `cache/`, keyed by
+the data files, start cutoff, `K`, and seed; reuse `--output-dir` to skip
+sampling. Loading and graph construction take about 15 s, and sampling about
+0.3 ms per user-week on one CPU core.
 
 ## GNN comparison
 
@@ -73,8 +174,9 @@ auto` selects the CUDA GPU with the lowest reported utilization (breaking ties
 by memory use); if CUDA is unavailable, it selects MPS, then CPU. You can
 explicitly use `--device cuda` to select the least-loaded CUDA GPU, or choose
 `--device mps` / `--device cpu`. If `nvidia-smi` cannot report utilization, it
-warns and uses free GPU memory as the selection fallback. The code does not
-require PyTorch Geometric or a Stanford RelGT clone.
+warns and uses free GPU memory as the selection fallback. The code, including
+`relgt_db`, does not require PyTorch Geometric, torch_frame, RelBench, or a
+Stanford RelGT clone.
 
 The optional `hybrid` mode also requires the pinned S2P2/EasyTPP dependency:
 

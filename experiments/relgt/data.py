@@ -425,6 +425,20 @@ def labels_for_cutoff(
     return labels
 
 
+def weekly_cutoffs(events: pd.DataFrame, start_cutoff: pd.Timestamp) -> pd.DatetimeIndex:
+    """Weekly cutoffs whose seven-day label window every relation fully covers."""
+    coverage_end = events.groupby("relation_id")["action_at"].max().min()
+    last_cutoff = coverage_end - pd.Timedelta(days=HORIZON_DAYS)
+    cutoffs = pd.date_range(start=start_cutoff, end=last_cutoff, freq="7D")
+    if len(cutoffs) < 10:
+        raise ValueError(
+            f"Only {len(cutoffs)} complete weekly samples are available from "
+            f"{start_cutoff} through {last_cutoff}. Choose an earlier "
+            "--start-cutoff or use a newer data release."
+        )
+    return cutoffs
+
+
 def build_training_examples(
     db_dir: Path,
     start_cutoff: pd.Timestamp,
@@ -446,16 +460,7 @@ def build_training_examples(
     )
     cohort_ids = users.loc[users["is_cohort"], "user_id"].astype(np.int32).to_numpy()
     events = load_events(db_dir, cohort_ids.tolist(), vocabulary)
-
-    coverage_end = events.groupby("relation_id")["action_at"].max().min()
-    last_cutoff = coverage_end - pd.Timedelta(days=HORIZON_DAYS)
-    cutoffs = pd.date_range(start=start_cutoff, end=last_cutoff, freq="7D")
-    if len(cutoffs) < 10:
-        raise ValueError(
-            f"Only {len(cutoffs)} complete weekly samples are available from "
-            f"{start_cutoff} through {last_cutoff}. Choose an earlier "
-            "--start-cutoff or use a newer data release."
-        )
+    cutoffs = weekly_cutoffs(events, start_cutoff)
 
     token_batches: list[GraphTokens] = []
     label_batches: list[np.ndarray] = []

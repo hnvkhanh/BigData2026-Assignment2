@@ -269,6 +269,8 @@ class S2P2TemporalModel:
         num_layers: int = 2,
         integral_samples: int = 8,
         seed: int = 42,
+        user_embedding: bool = False,
+        user_offset_l2: float = 1.0,
     ) -> None:
         self.device = device
         self.epochs = epochs
@@ -279,7 +281,12 @@ class S2P2TemporalModel:
         self.num_layers = num_layers
         self.integral_samples = integral_samples
         self.seed = seed
+        self.user_embedding = user_embedding
+        self.user_offset_l2 = user_offset_l2
         self.model: torch.nn.Module | None = None
+        # Learned per-(user, label) logit offsets added to the S2P2 probabilities.
+        self.user_ids: np.ndarray | None = None
+        self.user_offsets: np.ndarray | None = None
 
     def _new_model(self) -> torch.nn.Module:
         try:
@@ -369,13 +376,69 @@ class S2P2TemporalModel:
                 f"S2P2 epoch {epoch + 1}/{self.epochs}: "
                 f"mean normalized NLL={epoch_loss / batch_count:.5f}"
             )
+        if self.user_embedding:
+            self._fit_user_offsets(examples, histories)
         return self
+
+    def _fit_user_offsets(
+        self, examples: pd.DataFrame, histories: dict[str, pd.DataFrame]
+    ) -> None:
+        """Learn an L2-regularized logit offset per (user, label) on top of S2P2.
+
+        The upstream S2P2 model is a black box with no user input, so the user
+        signal is a residual head: sigmoid(logit(S2P2 probability) + offset).
+        """
+        base = self._predict_matrix(examples, histories).clip(1e-6, 1 - 1e-6)
+        base_logits = torch.as_tensor(np.log(base / (1 - base)), dtype=torch.float32)
+        targets = torch.as_tensor(
+            examples[list(LABELS)].to_numpy(dtype=np.float32), dtype=torch.float32
+        )
+        self.user_ids, rows = np.unique(
+            examples["user_id"].to_numpy(dtype=np.int64), return_inverse=True
+        )
+        rows = torch.as_tensor(rows, dtype=torch.long)
+        offsets = torch.zeros(
+            (len(self.user_ids), len(LABELS)), dtype=torch.float32, requires_grad=True
+        )
+        optimizer = torch.optim.Adam([offsets], lr=0.05)
+        for _ in range(200):
+            optimizer.zero_grad(set_to_none=True)
+            loss = torch.nn.functional.binary_cross_entropy_with_logits(
+                base_logits + offsets[rows], targets
+            ) + self.user_offset_l2 * offsets.pow(2).sum() / len(rows)
+            loss.backward()
+            optimizer.step()
+        self.user_offsets = offsets.detach().numpy()
+        print(f"S2P2 user offsets fitted for {len(self.user_ids)} users.")
+
+    def _apply_user_offsets(
+        self, examples: pd.DataFrame, probabilities: np.ndarray
+    ) -> np.ndarray:
+        users = examples["user_id"].to_numpy(dtype=np.int64)
+        position = np.searchsorted(self.user_ids, users).clip(max=len(self.user_ids) - 1)
+        known = self.user_ids[position] == users
+        offsets = np.where(known[:, None], self.user_offsets[position], 0.0)
+        clipped = probabilities.clip(1e-6, 1 - 1e-6)
+        logits = np.log(clipped / (1 - clipped)) + offsets
+        return (1 / (1 + np.exp(-logits))).astype(np.float32)
 
     def predict(
         self,
         examples: pd.DataFrame,
         histories: dict[str, pd.DataFrame],
     ) -> dict[str, np.ndarray]:
+        result = self._predict_matrix(examples, histories)
+        if self.user_offsets is not None:
+            result = self._apply_user_offsets(examples, result)
+        return {
+            label: result[:, index] for index, label in enumerate(LABELS)
+        }
+
+    def _predict_matrix(
+        self,
+        examples: pd.DataFrame,
+        histories: dict[str, pd.DataFrame],
+    ) -> np.ndarray:
         if self.model is None:
             raise RuntimeError("Fit the S2P2 model before requesting predictions.")
         sequences = build_event_sequences(
@@ -414,9 +477,7 @@ class S2P2TemporalModel:
                             "S2P2 produced non-finite weekly activity probabilities."
                         )
                     result[batch_indices] = probabilities.cpu().numpy()
-        return {
-            label: result[:, index] for index, label in enumerate(LABELS)
-        }
+        return result
 
     def save(self, path: Any) -> None:
         if self.model is None:

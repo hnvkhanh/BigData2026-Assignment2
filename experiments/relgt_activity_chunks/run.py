@@ -188,6 +188,29 @@ def _partition_indices(examples: TrainingExamples) -> dict[str, np.ndarray]:
     return partitions | {"_bounds": np.array([train_end, calibration_end])}
 
 
+def apply_train_fraction(
+    partitions: dict[str, np.ndarray], fraction: float, seed: int
+) -> None:
+    """Keep a random ``fraction`` of the train partition; the rest joins calibration."""
+    if fraction >= 1.0:
+        return
+    available = len(partitions["train"])
+    keep = max(1, round(available * fraction))
+    chosen = np.sort(
+        np.random.default_rng(seed).choice(
+            partitions["train"], size=keep, replace=False
+        )
+    )
+    partitions["calibration"] = np.union1d(
+        partitions["calibration"], np.setdiff1d(partitions["train"], chosen)
+    )
+    partitions["train"] = chosen
+    print(
+        f"Using {keep} of {available} training examples "
+        f"(--train-fraction {fraction}); the rest go to calibration"
+    )
+
+
 def _create_output_dir(requested_dir: Path | None) -> Path:
     if requested_dir is not None:
         requested_dir.mkdir(parents=True, exist_ok=True)
@@ -209,6 +232,8 @@ def run_backtest(args: argparse.Namespace) -> None:
     )
     partitions = _partition_indices(examples)
     train_end, calibration_end = (int(day) for day in partitions.pop("_bounds"))
+    available_train_examples = len(partitions["train"])
+    apply_train_fraction(partitions, args.train_fraction, args.seed)
     train_indices = partitions["train"]
     calibration_indices = partitions["calibration"]
     holdout_indices = partitions["holdout"]
@@ -249,12 +274,32 @@ def run_backtest(args: argparse.Namespace) -> None:
     ]
     if not args.no_global_baseline:
         models.append(("global", np.arange(len(chunks)), args.seed + len(CHUNK_NAMES)))
+    balanced_size = None
+    if args.balance_chunks:
+        balanced_size = min(
+            int(np.sum(chunks[train_indices] == chunk))
+            for chunk in range(len(CHUNK_NAMES))
+        )
+        print(f"Balancing chunk models to {balanced_size} training examples each")
     for name, member_indices, seed in models:
         train_members = np.intersect1d(train_indices, member_indices)
+        if balanced_size is not None and name in CHUNK_NAMES:
+            train_members = np.sort(
+                np.random.default_rng(seed).choice(
+                    train_members, size=balanced_size, replace=False
+                )
+            )
         calibration_members = np.intersect1d(calibration_indices, member_indices)
         print(f"Training {name} model on {len(train_members)} examples")
         model = fit_specialist(
-            examples, tokens, train_members, ALL_OUTPUTS, device, args, seed
+            examples,
+            tokens,
+            train_members,
+            ALL_OUTPUTS,
+            device,
+            args,
+            seed,
+            user_embedding=args.user_embedding,
         )
         calibration = predict_specialist(
             model, tokens, calibration_members, device, args.batch_size
@@ -353,6 +398,11 @@ def run_backtest(args: argparse.Namespace) -> None:
             "examples_per_chunk": chunk_sizes,
         },
         "train_examples": int(len(train_indices)),
+        "available_train_examples": available_train_examples,
+        "user_embedding": args.user_embedding,
+        "balance_chunks": args.balance_chunks,
+        "balanced_chunk_train_examples": balanced_size,
+        "train_fraction": args.train_fraction,
         "calibration_examples": int(len(calibration_indices)),
         "holdout_examples": int(len(holdout_indices)),
         "train_end_exclusive": str(pd.Timestamp(train_end, unit="D")),
@@ -380,7 +430,7 @@ def run_backtest(args: argparse.Namespace) -> None:
     print(f"Saved holdout probabilities to {probability_path}")
 
 
-def parse_args() -> argparse.Namespace:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--db-dir", type=Path, default=DEFAULT_DB_DIR)
     parser.add_argument("--output-dir", type=Path, default=None)
@@ -416,6 +466,32 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="skip the single model trained on all users for comparison",
     )
+    parser.add_argument(
+        "--train-fraction",
+        type=float,
+        default=1.0,
+        help=(
+            "fraction of the training partition to use, sampled at random "
+            "(seeded by --seed); the unused remainder is added to calibration"
+        ),
+    )
+    parser.add_argument(
+        "--balance-chunks",
+        action="store_true",
+        help=(
+            "randomly downsample larger chunks' training examples so every "
+            "chunk model trains on as many as the smallest chunk has; the "
+            "global baseline is unaffected"
+        ),
+    )
+    parser.add_argument(
+        "--user-embedding",
+        action="store_true",
+        help=(
+            "give each model a learned per-user embedding added to the root node; "
+            "users absent from a model's training examples get a zero embedding"
+        ),
+    )
     parser.add_argument("--epochs", type=int, default=5)
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--hidden-dim", type=int, default=64)
@@ -423,16 +499,27 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--learning-rate", type=float, default=1e-3)
     parser.add_argument("--seed", type=int, default=42)
-    args = parser.parse_args()
+    return parser
+
+
+def validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
     for name in ("epochs", "batch_size", "hidden_dim", "num_layers"):
         if getattr(args, name) < 1:
             parser.error(f"--{name.replace('_', '-')} must be positive.")
     if args.activity_window_days < 0:
         parser.error("--activity-window-days must not be negative.")
+    if not 0.0 < args.train_fraction <= 1.0:
+        parser.error("--train-fraction must be in (0, 1].")
     if not 0.0 <= args.dropout < 1.0:
         parser.error("--dropout must be in [0, 1).")
     if args.learning_rate <= 0:
         parser.error("--learning-rate must be positive.")
+
+
+def parse_args() -> argparse.Namespace:
+    parser = build_parser()
+    args = parser.parse_args()
+    validate_args(parser, args)
     return args
 
 

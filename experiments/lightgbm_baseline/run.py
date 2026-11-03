@@ -11,9 +11,10 @@ from typing import Any
 import lightgbm as lgb
 import numpy as np
 import pandas as pd
+from sklearn.compose import ColumnTransformer
 from sklearn.neural_network import MLPClassifier
 from sklearn.pipeline import make_pipeline
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -28,6 +29,7 @@ ELIGIBILITY_WINDOW_DAYS = 90
 DEFAULT_START_CUTOFF = "2026-03-01 00:00:00"
 DEFAULT_PREDICTION_CUTOFF = "2026-11-11 16:00:00"
 USER_COLUMN = "UserID"
+USER_FEATURE_COLUMN = "user_id_feature"
 LABELS = (
     "open_pr",
     "open_issue",
@@ -418,6 +420,34 @@ def frequency_feature_columns(columns: list[str]) -> list[str]:
     return expected
 
 
+def add_user_feature(frame: pd.DataFrame, categories: np.ndarray) -> pd.DataFrame:
+    """Add the user ID as a categorical feature; users outside ``categories`` become NaN."""
+    return frame.assign(
+        **{
+            USER_FEATURE_COLUMN: pd.Categorical(
+                frame["user_id"], categories=categories
+            )
+        }
+    )
+
+
+def frequency_preprocessor(feature_columns: list[str]) -> Any:
+    """Scale numeric columns and one-hot the user feature (a learned embedding)."""
+    numeric = [column for column in feature_columns if column != USER_FEATURE_COLUMN]
+    if len(numeric) == len(feature_columns):
+        return StandardScaler()
+    return ColumnTransformer(
+        [
+            ("numeric", StandardScaler(), numeric),
+            (
+                "user",
+                OneHotEncoder(handle_unknown="ignore"),
+                [USER_FEATURE_COLUMN],
+            ),
+        ]
+    )
+
+
 def scale_pos_weights(train: pd.DataFrame) -> dict[str, float | None]:
     weights: dict[str, float | None] = {}
     for label in LABELS:
@@ -478,7 +508,7 @@ def fit_frequency_nn_models(
     x_train = train[feature_columns]
     if output_mode == "multi_label":
         model = make_pipeline(
-            StandardScaler(),
+            frequency_preprocessor(feature_columns),
             MLPClassifier(
                 hidden_layer_sizes=(32,),
                 activation="relu",
@@ -505,7 +535,7 @@ def fit_frequency_nn_models(
             continue
 
         model = make_pipeline(
-            StandardScaler(),
+            frequency_preprocessor(feature_columns),
             MLPClassifier(
                 hidden_layer_sizes=(32,),
                 activation="relu",
@@ -586,6 +616,7 @@ def fit_temporal_model(
     device_name: str,
     nn_output_mode: str = "per_label",
     use_scale_pos_weight: bool = False,
+    user_embedding: bool = False,
 ) -> tuple[Any, Any]:
     if temporal_model == "lightgbm":
         return fit_models(
@@ -601,6 +632,7 @@ def fit_temporal_model(
     s2p2_class, select_s2p2_device = load_s2p2_adapter()
     model = s2p2_class(
         device=select_s2p2_device(device_name),
+        user_embedding=user_embedding,
         **s2p2_params,
     )
     return model.fit(train, histories), model
@@ -708,6 +740,22 @@ def create_run_output_dir(command: str, temporal_model: str) -> Path:
     return output_dir
 
 
+def apply_train_fraction(
+    train: pd.DataFrame, calibration: pd.DataFrame, fraction: float, seed: int
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Train on a random ``fraction`` of rows; the unused rows join calibration."""
+    if fraction >= 1.0:
+        return train, calibration
+    keep = max(1, round(len(train) * fraction))
+    chosen = np.zeros(len(train), dtype=bool)
+    chosen[np.random.default_rng(seed).choice(len(train), size=keep, replace=False)] = True
+    print(
+        f"Using {keep} of {len(train)} training rows (--train-fraction {fraction}); "
+        "the rest go to calibration"
+    )
+    return train.iloc[chosen], pd.concat([calibration, train.iloc[~chosen]])
+
+
 def run_backtest(
     db_dir: Path,
     output_dir: Path,
@@ -719,6 +767,9 @@ def run_backtest(
     nn_output_mode: str = "per_label",
     calibrated_threshold: bool = False,
     use_scale_pos_weight: bool = True,
+    train_fraction: float = 1.0,
+    seed: int = 42,
+    user_embedding: bool = False,
 ) -> None:
     data, histories, _ = build_training_data(db_dir, start_cutoff)
     unique_cutoffs = sorted(data["cutoff"].unique())
@@ -733,6 +784,14 @@ def run_backtest(
         (data["cutoff"] >= train_end) & (data["cutoff"] < calibration_end)
     ]
     holdout = data.loc[data["cutoff"] >= calibration_end]
+    train, calibration = apply_train_fraction(train, calibration, train_fraction, seed)
+    if user_embedding:
+        user_categories = np.unique(train["user_id"])
+        train, calibration, holdout = (
+            add_user_feature(frame, user_categories)
+            for frame in (train, calibration, holdout)
+        )
+        feature_columns = [*feature_columns, USER_FEATURE_COLUMN]
     print(
         f"\nChronological split: train < {train_end.date()}, "
         f"calibrate < {calibration_end.date()}, holdout >= {calibration_end.date()}"
@@ -749,6 +808,7 @@ def run_backtest(
         device_name,
         nn_output_mode,
         use_scale_pos_weight,
+        user_embedding,
     )
     calibration_probabilities = predict_temporal_probabilities(
         temporal_model,
@@ -779,6 +839,8 @@ def run_backtest(
         "holdout_start": str(calibration_end),
     }
     results["temporal_model"] = temporal_model
+    results["train_fraction"] = train_fraction
+    results["user_embedding"] = user_embedding
     results["threshold_mode"] = (
         "calibrated" if calibrated_threshold else "fixed_default"
     )
@@ -842,6 +904,9 @@ def run_prediction(
     nn_output_mode: str = "per_label",
     calibrated_threshold: bool = False,
     use_scale_pos_weight: bool = True,
+    train_fraction: float = 1.0,
+    seed: int = 42,
+    user_embedding: bool = False,
 ) -> None:
     data, histories, cohort_user_ids = build_training_data(db_dir, start_cutoff)
     data = training_data_before(data, cutoff)
@@ -853,6 +918,13 @@ def run_prediction(
 
     train = data.loc[data["cutoff"] < train_end]
     calibration = data.loc[data["cutoff"] >= train_end]
+    train, calibration = apply_train_fraction(train, calibration, train_fraction, seed)
+    if user_embedding:
+        user_categories = np.unique(train["user_id"])
+        train, calibration = (
+            add_user_feature(frame, user_categories) for frame in (train, calibration)
+        )
+        feature_columns = [*feature_columns, USER_FEATURE_COLUMN]
     s2p2_options = s2p2_params or {}
     models, s2p2_model = fit_temporal_model(
         temporal_model,
@@ -864,6 +936,7 @@ def run_prediction(
         device_name,
         nn_output_mode,
         use_scale_pos_weight,
+        user_embedding,
     )
     calibration_probabilities = predict_temporal_probabilities(
         temporal_model,
@@ -901,6 +974,8 @@ def run_prediction(
 
     inference = row_for_cutoff(cutoff, histories, cohort_user_ids)
     inference = inference.set_index("user_id").loc[internal_ids].reset_index()
+    if user_embedding:
+        inference = add_user_feature(inference, user_categories)
     probabilities = predict_temporal_probabilities(
         temporal_model,
         models,
@@ -932,6 +1007,7 @@ def run_prediction(
         "training_weeks": int(train["cutoff"].nunique()),
         "calibration_weeks": int(calibration["cutoff"].nunique()),
         "feature_columns": feature_columns,
+        "user_embedding": user_embedding,
         "labels": list(LABELS),
     }
     if temporal_model == "lightgbm":
@@ -1038,6 +1114,25 @@ def parse_args() -> argparse.Namespace:
             help="disable per-label negative/positive class weighting (enabled by default)",
         )
         subparser.set_defaults(scale_pos_weight=True)
+        subparser.add_argument(
+            "--train-fraction",
+            type=float,
+            default=1.0,
+            help=(
+                "fraction of training rows to train on, sampled at random "
+                "(seeded by --seed); the unused remainder is added to calibration"
+            ),
+        )
+        subparser.add_argument("--seed", type=int, default=42)
+        subparser.add_argument(
+            "--user-embedding",
+            action="store_true",
+            help=(
+                "give the model the user ID: a categorical feature for lightgbm, a "
+                "one-hot (learned embedding) input for frequency_nn, and a per-user "
+                "logit offset for s2p2; users unseen in training get no user signal"
+            ),
+        )
     predict_parser = subparsers.choices["predict"]
     predict_parser.add_argument("--test-input", type=Path, default=DEFAULT_TEST_INPUT)
     predict_parser.add_argument(
@@ -1053,6 +1148,8 @@ def main() -> None:
     args = parse_args()
     if args.nn_output_mode != "per_label" and args.temporal_model != "frequency_nn":
         raise ValueError("--nn-output-mode applies only to --temporal-model frequency_nn.")
+    if not 0.0 < args.train_fraction <= 1.0:
+        raise ValueError("--train-fraction must be in (0, 1].")
     output_dir = args.output_dir or create_run_output_dir(
         args.command, args.temporal_model
     )
@@ -1087,6 +1184,9 @@ def main() -> None:
             args.nn_output_mode,
             args.calibrated_threshold,
             args.scale_pos_weight,
+            args.train_fraction,
+            args.seed,
+            args.user_embedding,
         )
     else:
         run_prediction(
@@ -1102,6 +1202,9 @@ def main() -> None:
             args.nn_output_mode,
             args.calibrated_threshold,
             args.scale_pos_weight,
+            args.train_fraction,
+            args.seed,
+            args.user_embedding,
         )
 
 

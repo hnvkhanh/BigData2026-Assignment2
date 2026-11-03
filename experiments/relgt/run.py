@@ -311,6 +311,35 @@ def prediction_example_indices(
     return np.flatnonzero(cutoff_ns + horizon_ns <= prediction_cutoff.value)
 
 
+def subsample_train_indices(
+    train_indices: np.ndarray, args: argparse.Namespace
+) -> tuple[np.ndarray, np.ndarray]:
+    """Split off a random ``--train-fraction`` of training examples (seeded).
+
+    Returns ``(kept, unused)``; callers add the unused examples to calibration.
+    With ``--discard-unused-train`` the unused examples are dropped entirely
+    (``unused`` is empty), so they reach neither training nor calibration.
+    """
+    fraction = getattr(args, "train_fraction", 1.0)
+    if fraction >= 1.0:
+        return train_indices, train_indices[:0]
+    keep = max(1, round(len(train_indices) * fraction))
+    chosen = np.sort(
+        np.random.default_rng(args.seed).choice(train_indices, size=keep, replace=False)
+    )
+    if getattr(args, "discard_unused_train", False):
+        print(
+            f"Using {keep} of {len(train_indices)} training examples "
+            f"(--train-fraction {fraction}); the rest are discarded"
+        )
+        return chosen, train_indices[:0]
+    print(
+        f"Using {keep} of {len(train_indices)} training examples "
+        f"(--train-fraction {fraction}); the rest go to calibration"
+    )
+    return chosen, np.setdiff1d(train_indices, chosen)
+
+
 def _model(
     num_entities: int,
     hidden_dim: int,
@@ -318,6 +347,7 @@ def _model(
     num_layers: int,
     dropout: float,
     architecture: str = "relgt",
+    known_user_ids: np.ndarray | None = None,
 ) -> RelGTInspired | RelationalGNN:
     if architecture == "gnn":
         return RelationalGNN(
@@ -325,6 +355,7 @@ def _model(
             hidden_dim=hidden_dim,
             num_layers=num_layers,
             dropout=dropout,
+            known_user_ids=known_user_ids,
         )
     if hidden_dim % num_heads:
         raise ValueError("--hidden-dim must be divisible by --num-heads.")
@@ -336,26 +367,28 @@ def _model(
         num_heads=num_heads,
         num_local_layers=num_layers,
         dropout=dropout,
+        known_user_ids=known_user_ids,
     )
 
 
 def _batch_inputs(
-    tokens: GraphTokens, indices: np.ndarray, device: torch.device
-) -> tuple[
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-]:
-    return (
+    tokens: GraphTokens,
+    indices: np.ndarray,
+    device: torch.device,
+    with_user_ids: bool = False,
+) -> tuple[torch.Tensor, ...]:
+    inputs = (
         torch.as_tensor(tokens.entity_ids[indices], dtype=torch.long, device=device),
         torch.as_tensor(tokens.node_type_ids[indices], dtype=torch.long, device=device),
         torch.as_tensor(tokens.relation_ids[indices], dtype=torch.long, device=device),
         torch.as_tensor(tokens.hop_ids[indices], dtype=torch.long, device=device),
         torch.as_tensor(tokens.node_features[indices], dtype=torch.float32, device=device),
         torch.as_tensor(tokens.relative_days[indices], dtype=torch.float32, device=device),
+    )
+    if not with_user_ids:
+        return inputs
+    return inputs + (
+        torch.as_tensor(tokens.user_ids[indices], dtype=torch.long, device=device),
     )
 
 
@@ -372,12 +405,19 @@ def fit_model(
     dropout: float,
     seed: int,
     architecture: str = "relgt",
+    user_embedding: bool = False,
 ) -> RelGTInspired | RelationalGNN:
     torch.manual_seed(seed)
     np.random.seed(seed)
     random.seed(seed)
     model = _model(
-        num_entities, hidden_dim, num_heads, num_layers, dropout, architecture
+        num_entities,
+        hidden_dim,
+        num_heads,
+        num_layers,
+        dropout,
+        architecture,
+        np.unique(examples.tokens.user_ids[train_indices]) if user_embedding else None,
     )
     model.to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
@@ -391,7 +431,9 @@ def fit_model(
         batches = 0
         for start in range(0, len(shuffled), batch_size):
             batch_indices = shuffled[start : start + batch_size]
-            inputs = _batch_inputs(examples.tokens, batch_indices, device)
+            inputs = _batch_inputs(
+                examples.tokens, batch_indices, device, user_embedding
+            )
             labels = torch.as_tensor(
                 targets[batch_indices], dtype=torch.float32, device=device
             )
@@ -414,11 +456,12 @@ def predict_probabilities(
     batch_size: int,
 ) -> np.ndarray:
     model.eval()
+    with_user_ids = getattr(model, "user_embedding", None) is not None
     predictions: list[np.ndarray] = []
     with torch.inference_mode():
         for start in range(0, len(indices), batch_size):
             batch_indices = indices[start : start + batch_size]
-            inputs = _batch_inputs(tokens, batch_indices, device)
+            inputs = _batch_inputs(tokens, batch_indices, device, with_user_ids)
             probabilities = torch.sigmoid(model(*inputs))
             predictions.append(probabilities.cpu().numpy())
     if not predictions:
@@ -812,6 +855,13 @@ def parse_ensemble_lookbacks(value: str) -> tuple[int, int]:
     return lookbacks
 
 
+def parse_train_fraction(value: str) -> float:
+    fraction = float(value)
+    if not 0.0 < fraction <= 1.0:
+        raise argparse.ArgumentTypeError("--train-fraction must be in (0, 1].")
+    return fraction
+
+
 def parse_unit_interval(value: str) -> float:
     try:
         weight = float(value)
@@ -885,6 +935,7 @@ def _fit_lookback_models(
             args.dropout,
             args.seed + lookback_days,
             architecture,
+            getattr(args, "user_embedding", False),
         )
         models[lookback_days] = model
     return models
@@ -950,10 +1001,12 @@ def run_lookback_ensemble_backtest(
 
     train_end, calibration_end = chronological_splits(reference.cutoff_days)
     train_indices = np.flatnonzero(reference.cutoff_days < train_end)
+    train_indices, unused_train_indices = subsample_train_indices(train_indices, args)
     calibration_indices = np.flatnonzero(
         (reference.cutoff_days >= train_end)
         & (reference.cutoff_days < calibration_end)
     )
+    calibration_indices = np.union1d(calibration_indices, unused_train_indices)
     holdout_indices = np.flatnonzero(reference.cutoff_days >= calibration_end)
     if not len(calibration_indices) or not len(holdout_indices):
         raise ValueError(
@@ -1059,6 +1112,8 @@ def run_lookback_ensemble_backtest(
             "lookback_days": list(lookbacks),
             "eligibility_lookback_days": eligibility_lookback_days,
             "epochs": args.epochs,
+            "train_fraction": getattr(args, "train_fraction", 1.0),
+            "discard_unused_train": getattr(args, "discard_unused_train", False),
             "experiment": args.output_dir.name,
             "fusion": {
                 "method": (
@@ -1092,6 +1147,11 @@ def run_lookback_ensemble_backtest(
 
 
 def run_backtest(args: argparse.Namespace) -> None:
+    if args.temporal_model == "relgt_db":
+        from .db_run import run_db_backtest
+
+        run_db_backtest(args)
+        return
     if args.temporal_model in {"relgt_ensemble", "gnn_ensemble"}:
         architecture = "relgt" if args.temporal_model == "relgt_ensemble" else "gnn"
         run_lookback_ensemble_backtest(args, architecture)
@@ -1101,10 +1161,12 @@ def run_backtest(args: argparse.Namespace) -> None:
     examples = load_or_build_examples(args.db_dir, args.output_dir, args.start_cutoff)
     train_end, calibration_end = chronological_splits(examples.cutoff_days)
     train_indices = np.flatnonzero(examples.cutoff_days < train_end)
+    train_indices, unused_train_indices = subsample_train_indices(train_indices, args)
     calibration_indices = np.flatnonzero(
         (examples.cutoff_days >= train_end)
         & (examples.cutoff_days < calibration_end)
     )
+    calibration_indices = np.union1d(calibration_indices, unused_train_indices)
     holdout_indices = np.flatnonzero(examples.cutoff_days >= calibration_end)
     if not len(calibration_indices) or not len(holdout_indices):
         raise ValueError("The chronological split produced an empty calibration or holdout set.")
@@ -1128,6 +1190,7 @@ def run_backtest(args: argparse.Namespace) -> None:
         args.dropout,
         args.seed,
         "gnn" if args.temporal_model == "gnn" else "relgt",
+        getattr(args, "user_embedding", False),
     )
     graph_calibration_probabilities = predict_probabilities(
         model, examples.tokens, calibration_indices, device, args.batch_size
@@ -1456,7 +1519,9 @@ def run_lookback_ensemble_prediction(
     usable_cutoffs = reference.cutoff_days[usable_indices]
     train_end, _ = chronological_splits(usable_cutoffs)
     train_indices = usable_indices[usable_cutoffs < train_end]
+    train_indices, unused_train_indices = subsample_train_indices(train_indices, args)
     calibration_indices = usable_indices[usable_cutoffs >= train_end]
+    calibration_indices = np.union1d(calibration_indices, unused_train_indices)
     if not len(calibration_indices):
         raise ValueError("No chronological calibration examples are available.")
 
@@ -1571,6 +1636,8 @@ def run_lookback_ensemble_prediction(
         "temporal_model": f"{architecture}_lookback_ensemble",
         "experiment": args.output_dir.name,
         "epochs": args.epochs,
+        "train_fraction": getattr(args, "train_fraction", 1.0),
+        "discard_unused_train": getattr(args, "discard_unused_train", False),
         "batch_size": args.batch_size,
         "hidden_dim": args.hidden_dim,
         "num_heads": args.num_heads,
@@ -1604,6 +1671,11 @@ def run_lookback_ensemble_prediction(
 
 
 def run_prediction(args: argparse.Namespace) -> None:
+    if args.temporal_model == "relgt_db":
+        from .db_run import run_db_prediction
+
+        run_db_prediction(args)
+        return
     if args.temporal_model in {"relgt_ensemble", "gnn_ensemble"}:
         architecture = "relgt" if args.temporal_model == "relgt_ensemble" else "gnn"
         run_lookback_ensemble_prediction(args, architecture)
@@ -1615,7 +1687,9 @@ def run_prediction(args: argparse.Namespace) -> None:
     usable_cutoffs = examples.cutoff_days[usable_indices]
     train_end, _ = chronological_splits(usable_cutoffs)
     train_indices = usable_indices[usable_cutoffs < train_end]
+    train_indices, unused_train_indices = subsample_train_indices(train_indices, args)
     calibration_indices = usable_indices[usable_cutoffs >= train_end]
+    calibration_indices = np.union1d(calibration_indices, unused_train_indices)
     if not len(calibration_indices):
         raise ValueError("No chronological calibration examples are available.")
 
@@ -1633,6 +1707,7 @@ def run_prediction(args: argparse.Namespace) -> None:
         args.dropout,
         args.seed,
         "gnn" if args.temporal_model == "gnn" else "relgt",
+        getattr(args, "user_embedding", False),
     )
     graph_calibration_probabilities = predict_probabilities(
         model, examples.tokens, calibration_indices, device, args.batch_size
@@ -1908,6 +1983,8 @@ def run_prediction(args: argparse.Namespace) -> None:
         "temporal_model": args.temporal_model,
         "experiment": args.output_dir.name,
         "epochs": args.epochs,
+        "train_fraction": getattr(args, "train_fraction", 1.0),
+        "discard_unused_train": getattr(args, "discard_unused_train", False),
         "batch_size": args.batch_size,
         "hidden_dim": args.hidden_dim,
         "num_heads": args.num_heads,
@@ -1987,6 +2064,25 @@ def add_common_arguments(parser: argparse.ArgumentParser) -> None:
         help="first weekly prediction cutoff used to construct training samples",
     )
     parser.add_argument("--device", choices=["auto", "cpu", "mps", "cuda"], default="auto")
+    parser.add_argument(
+        "--train-fraction",
+        type=parse_train_fraction,
+        default=1.0,
+        help="fraction of the training examples to train on, sampled at random (seeded by --seed); the unused remainder is added to calibration",
+    )
+    parser.add_argument(
+        "--discard-unused-train",
+        action="store_true",
+        help="with --train-fraction below 1, drop the unused training examples instead of adding them to calibration",
+    )
+    parser.add_argument(
+        "--user-embedding",
+        action="store_true",
+        help=(
+            "add a learned per-user embedding (gnn: root node, relgt: user token); users "
+            "absent from the training examples get a zero embedding"
+        ),
+    )
     parser.add_argument("--epochs", type=int, default=5)
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--hidden-dim", type=int, default=64)
@@ -2004,12 +2100,52 @@ def add_common_arguments(parser: argparse.ArgumentParser) -> None:
             "hybrid",
             "relgt_lightgbm",
             "relgt_lightgbm_s2p2",
+            "relgt_db",
         ],
         default="relgt",
         help=(
-            "choose RelGT/GNN, a lookback ensemble, or a RelGT ensemble with "
-            "S2P2/LightGBM"
+            "choose RelGT/GNN, a lookback ensemble, a RelGT ensemble with "
+            "S2P2/LightGBM, or relgt_db (RelGT on the full relational database)"
         ),
+    )
+    relgt_db = parser.add_argument_group("relgt_db (RelGT on the relational database)")
+    relgt_db.add_argument(
+        "--num-neighbors",
+        type=int,
+        default=128,
+        help="tokens per seed, including the seed row (upstream K; default: 128)",
+    )
+    relgt_db.add_argument(
+        "--num-centroids",
+        type=int,
+        default=512,
+        help="codebook size of the global attention module (default: 512)",
+    )
+    relgt_db.add_argument(
+        "--conv-type",
+        choices=["full", "local", "global"],
+        default="full",
+        help="local token attention, global codebook attention, or both (default)",
+    )
+    relgt_db.add_argument(
+        "--ablate",
+        choices=["none", "type", "hop", "time", "tfs", "gnn"],
+        default="none",
+        help="drop one of the five token elements",
+    )
+    relgt_db.add_argument(
+        "--text-buckets",
+        type=int,
+        default=2**16,
+        help="hashed vocabulary size shared by all text columns (default: 65536)",
+    )
+    relgt_db.add_argument("--db-lr", type=float, default=1e-3)
+    relgt_db.add_argument("--weight-decay", type=float, default=1e-5)
+    relgt_db.add_argument(
+        "--max-steps-per-epoch",
+        type=int,
+        default=None,
+        help="cap optimizer steps per epoch (default: one full pass)",
     )
     parser.add_argument(
         "--ensemble-lookbacks",
@@ -2110,6 +2246,17 @@ def parse_args() -> argparse.Namespace:
         parser.error("--subsample must be in (0, 1].")
     if not 0.0 < args.colsample_bytree <= 1.0:
         parser.error("--colsample-bytree must be in (0, 1].")
+    if args.temporal_model == "relgt_db":
+        if args.user_embedding:
+            parser.error("--user-embedding is not supported by relgt_db.")
+        if args.hidden_dim % args.num_heads:
+            parser.error("--hidden-dim must be divisible by --num-heads.")
+        if not 2 <= args.num_neighbors <= 32_767:
+            parser.error("--num-neighbors must be between 2 and 32767.")
+        if args.num_centroids < 1 or args.text_buckets < 2:
+            parser.error("--num-centroids must be positive and --text-buckets at least 2.")
+        if args.max_steps_per_epoch is not None and args.max_steps_per_epoch < 1:
+            parser.error("--max-steps-per-epoch must be positive.")
     return args
 
 

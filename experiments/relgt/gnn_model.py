@@ -4,10 +4,23 @@ from __future__ import annotations
 
 import math
 
+import numpy as np
 import torch
 from torch import nn
 
 from .data import LABELS
+
+
+def user_embedding_index(
+    known_user_ids: torch.Tensor, user_ids: torch.Tensor
+) -> torch.Tensor:
+    """Map user IDs to 1..N positions in ``known_user_ids``; unknown users get 0."""
+    user_ids = user_ids.to(torch.long)
+    position = torch.searchsorted(known_user_ids, user_ids).clamp(
+        max=len(known_user_ids) - 1
+    )
+    known = known_user_ids[position] == user_ids
+    return torch.where(known, position + 1, torch.zeros_like(position))
 
 
 class RelationalMessageLayer(nn.Module):
@@ -70,6 +83,7 @@ class RelationalGNN(nn.Module):
         num_layers: int = 2,
         dropout: float = 0.1,
         output_indices: tuple[int, ...] = tuple(range(len(LABELS))),
+        known_user_ids: np.ndarray | None = None,
     ) -> None:
         super().__init__()
         if (
@@ -85,6 +99,19 @@ class RelationalGNN(nn.Module):
         self.node_type_embedding = nn.Embedding(4, hidden_dim)
         self.relation_embedding = nn.Embedding(len(LABELS) + 2, hidden_dim)
         self.hop_embedding = nn.Embedding(3, hidden_dim)
+        # Users seen in training get a learned vector; index 0 (zero vector)
+        # is shared by every other user.
+        known = (
+            np.unique(np.asarray(known_user_ids, dtype=np.int64))
+            if known_user_ids is not None
+            else np.empty(0, dtype=np.int64)
+        )
+        self.register_buffer("known_user_ids", torch.as_tensor(known))
+        self.user_embedding = (
+            nn.Embedding(len(known) + 1, hidden_dim, padding_idx=0)
+            if len(known)
+            else None
+        )
         self.feature_projection = nn.Linear(4, hidden_dim)
         self.time_projection = nn.Linear(7, hidden_dim)
         self.token_norm = nn.LayerNorm(hidden_dim)
@@ -119,7 +146,12 @@ class RelationalGNN(nn.Module):
         hop_ids: torch.Tensor,
         node_features: torch.Tensor,
         relative_days: torch.Tensor,
+        user_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if (self.user_embedding is None) != (user_ids is None):
+            raise ValueError(
+                "user_ids must be given exactly when the model has known_user_ids."
+            )
         neighbor_mask = entity_ids.ne(0)
         neighbors = self.token_norm(
             self.entity_embedding(entity_ids.to(torch.long))
@@ -132,6 +164,8 @@ class RelationalGNN(nn.Module):
         mask = neighbor_mask.unsqueeze(-1)
         neighbors = neighbors * mask
         root = self.root.unsqueeze(0).expand(entity_ids.shape[0], -1)
+        if self.user_embedding is not None:
+            root = root + self.user_embedding(user_embedding_index(self.known_user_ids, user_ids))
         for layer in self.layers:
             root, neighbors = layer(root, neighbors, relation_ids, neighbor_mask)
 

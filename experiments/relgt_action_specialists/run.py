@@ -110,7 +110,10 @@ def fit_specialist(
     device: torch.device,
     args: argparse.Namespace,
     seed: int,
+    *,
+    user_embedding: bool = False,
 ) -> RelationalGNN:
+    """Train a specialist; ``user_embedding`` adds a per-user vector for training users."""
     torch.manual_seed(seed)
     np.random.seed(seed)
     random.seed(seed)
@@ -120,6 +123,9 @@ def fit_specialist(
         num_layers=args.num_layers,
         dropout=args.dropout,
         output_indices=output_indices,
+        known_user_ids=(
+            np.unique(tokens.user_ids[train_indices]) if user_embedding else None
+        ),
     ).to(device)
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=args.learning_rate, weight_decay=1e-4
@@ -133,7 +139,7 @@ def fit_specialist(
         batches = 0
         for start in range(0, len(shuffled), args.batch_size):
             batch_indices = shuffled[start : start + args.batch_size]
-            inputs = _batch_inputs(tokens, batch_indices, device)
+            inputs = _batch_inputs(tokens, batch_indices, device, user_embedding)
             targets = torch.as_tensor(
                 examples.labels[np.ix_(batch_indices, output_indices)],
                 dtype=torch.float32,
@@ -153,9 +159,12 @@ def fit_specialist(
 
 
 def _batch_inputs(
-    tokens: GraphTokens, indices: np.ndarray, device: torch.device
+    tokens: GraphTokens,
+    indices: np.ndarray,
+    device: torch.device,
+    with_user_ids: bool = False,
 ) -> tuple[torch.Tensor, ...]:
-    return (
+    inputs = (
         torch.as_tensor(tokens.entity_ids[indices], dtype=torch.long, device=device),
         torch.as_tensor(
             tokens.node_type_ids[indices], dtype=torch.long, device=device
@@ -169,6 +178,11 @@ def _batch_inputs(
             tokens.relative_days[indices], dtype=torch.float32, device=device
         ),
     )
+    if not with_user_ids:
+        return inputs
+    return inputs + (
+        torch.as_tensor(tokens.user_ids[indices], dtype=torch.long, device=device),
+    )
 
 
 def predict_specialist(
@@ -179,12 +193,15 @@ def predict_specialist(
     batch_size: int,
 ) -> np.ndarray:
     model.eval()
+    with_user_ids = model.user_embedding is not None
     predictions: list[np.ndarray] = []
     with torch.inference_mode():
         for start in range(0, len(indices), batch_size):
             batch_indices = indices[start : start + batch_size]
             predictions.append(
-                torch.sigmoid(model(*_batch_inputs(tokens, batch_indices, device)))
+                torch.sigmoid(
+                    model(*_batch_inputs(tokens, batch_indices, device, with_user_ids))
+                )
                 .cpu()
                 .numpy()
             )
@@ -376,7 +393,14 @@ def run_backtest(args: argparse.Namespace) -> None:
     for name, tokens, output_indices, input_description, seed in specialist_specs:
         print(f"Training {name} for: {', '.join(LABELS[i] for i in output_indices)}")
         model = fit_specialist(
-            examples, tokens, train_indices, output_indices, device, args, seed
+            examples,
+            tokens,
+            train_indices,
+            output_indices,
+            device,
+            args,
+            seed,
+            user_embedding=getattr(args, "user_embedding", False),
         )
         calibration = predict_specialist(
             model, tokens, calibration_indices, device, args.batch_size
@@ -494,6 +518,7 @@ def run_backtest(args: argparse.Namespace) -> None:
             "dropout": args.dropout,
             "learning_rate": args.learning_rate,
             "seed": args.seed,
+            "user_embedding": getattr(args, "user_embedding", False),
         },
         "thresholds": thresholds,
         "holdout_metrics": holdout_metrics[primary_combination],
@@ -516,6 +541,14 @@ def parse_args() -> argparse.Namespace:
         default=pd.Timestamp(DEFAULT_START_CUTOFF),
     )
     parser.add_argument("--device", choices=["auto", "cpu", "mps", "cuda"], default="auto")
+    parser.add_argument(
+        "--user-embedding",
+        action="store_true",
+        help=(
+            "add a learned per-user embedding to the root node; users absent "
+            "from the training examples get a zero embedding"
+        ),
+    )
     parser.add_argument("--epochs", type=int, default=5)
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--hidden-dim", type=int, default=64)
