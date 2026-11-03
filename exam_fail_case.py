@@ -796,7 +796,6 @@ def run_lightgbm(
     port: int = 8050,
     export_all: bool = False,
     calibrated_threshold: bool = False,
-    use_scale_pos_weight: bool = True,
 ) -> None:
     data, _, _ = baseline.build_training_data(db_dir, start_cutoff)
     cutoffs = [pd.Timestamp(value) for value in sorted(data["cutoff"].unique())]
@@ -814,9 +813,7 @@ def run_lightgbm(
         f"calibrate < {calibration_end.date()}, holdout >= {calibration_end.date()}"
     )
 
-    models = baseline.fit_models(
-        train, feature_columns, model_params, use_scale_pos_weight
-    )
+    models = baseline.fit_models(train, feature_columns, model_params)
     calibration_probabilities = baseline.predict_probabilities(models, calibration, feature_columns)
     thresholds = baseline.thresholds_for_predictions(
         calibration, calibration_probabilities, calibrated_threshold
@@ -829,7 +826,6 @@ def run_lightgbm(
             "calibrated" if calibrated_threshold else "fixed_default"
         ),
         "model_params": model_params,
-        "scale_pos_weight": use_scale_pos_weight,
         "split": {
             "train_weeks": int(train["cutoff"].nunique()),
             "calibration_weeks": int(calibration["cutoff"].nunique()),
@@ -1182,13 +1178,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--subsample", type=float, default=0.85)
     parser.add_argument("--colsample-bytree", type=float, default=0.85)
     parser.add_argument("--reg-lambda", type=float, default=2.0)
-    parser.add_argument(
-        "--no-scale-pos-weight",
-        dest="scale_pos_weight",
-        action="store_false",
-        help="disable per-label negative/positive class weighting (enabled by default)",
-    )
-    parser.set_defaults(scale_pos_weight=False)
     args = parser.parse_args()
     if args.model_branch is not None and args.run_dir is None:
         parser.error("--model-branch requires --run-dir.")
@@ -1226,7 +1215,6 @@ def main() -> None:
         args.db_dir, output_dir, args.start_cutoff, model_params,
         launch_dashboard=not args.no_dashboard, port=args.port, export_all=args.export_all,
         calibrated_threshold=args.calibrated_threshold,
-        use_scale_pos_weight=args.scale_pos_weight,
     )
 
 

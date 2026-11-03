@@ -1,3 +1,5 @@
 __pycache__/
 assignment2/
 experiments/*/outputs/
+.pytest_cache/
+results/

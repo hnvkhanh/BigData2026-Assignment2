@@ -454,28 +454,13 @@ def frequency_preprocessor(feature_columns: list[str]) -> Any:
     )
 
 
-def scale_pos_weights(train: pd.DataFrame) -> dict[str, float | None]:
-    weights: dict[str, float | None] = {}
-    for label in LABELS:
-        positive_count = int(train[label].sum())
-        negative_count = len(train) - positive_count
-        weights[label] = (
-            negative_count / positive_count
-            if positive_count > 0 and negative_count > 0
-            else None
-        )
-    return weights
-
-
 def fit_models(
     train: pd.DataFrame,
     feature_columns: list[str],
     model_params: dict[str, int | float],
-    use_scale_pos_weight: bool = True,
 ) -> dict[str, lgb.LGBMClassifier | None]:
     models: dict[str, lgb.LGBMClassifier | None] = {}
     x_train = train[feature_columns]
-    weights = scale_pos_weights(train) if use_scale_pos_weight else {}
 
     for label in LABELS:
         y_train = train[label]
@@ -484,16 +469,12 @@ def fit_models(
             print(f"{label}: only one class in training data; using constant predictions.")
             continue
 
-        params = dict(model_params)
-        weight = weights.get(label)
-        if weight is not None:
-            params["scale_pos_weight"] = weight
         model = lgb.LGBMClassifier(
             objective="binary",
             random_state=42,
             n_jobs=-1,
             verbosity=-1,
-            **params,
+            **model_params,
         )
         model.fit(x_train, y_train)
         models[label] = model
@@ -621,13 +602,10 @@ def fit_temporal_model(
     s2p2_params: dict[str, int],
     device_name: str,
     nn_output_mode: str = "per_label",
-    use_scale_pos_weight: bool = False,
     user_embedding: bool = False,
 ) -> tuple[Any, Any]:
     if temporal_model == "lightgbm":
-        return fit_models(
-            train, feature_columns, model_params, use_scale_pos_weight
-        ), None
+        return fit_models(train, feature_columns, model_params), None
     if temporal_model == "frequency_nn":
         return fit_frequency_nn_models(
             train, feature_columns, nn_output_mode
@@ -770,9 +748,16 @@ def create_run_output_dir(command: str, temporal_model: str) -> Path:
 
 
 def apply_train_fraction(
-    train: pd.DataFrame, calibration: pd.DataFrame, fraction: float, seed: int
+    train: pd.DataFrame,
+    calibration: pd.DataFrame,
+    fraction: float,
+    seed: int,
+    discard: bool = False,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Train on a random ``fraction`` of rows; the unused rows join calibration."""
+    """Train on a random ``fraction`` of rows.
+
+    The unused rows join calibration, or are dropped when ``discard`` is set.
+    """
     if fraction >= 1.0:
         return train, calibration
     keep = max(1, round(len(train) * fraction))
@@ -780,8 +765,10 @@ def apply_train_fraction(
     chosen[np.random.default_rng(seed).choice(len(train), size=keep, replace=False)] = True
     print(
         f"Using {keep} of {len(train)} training rows (--train-fraction {fraction}); "
-        "the rest go to calibration"
+        + ("the rest are discarded" if discard else "the rest go to calibration")
     )
+    if discard:
+        return train.iloc[chosen], calibration
     return train.iloc[chosen], pd.concat([calibration, train.iloc[~chosen]])
 
 
@@ -795,10 +782,10 @@ def run_backtest(
     device_name: str = "auto",
     nn_output_mode: str = "per_label",
     calibrated_threshold: bool = False,
-    use_scale_pos_weight: bool = True,
     train_fraction: float = 1.0,
     seed: int = 42,
     user_embedding: bool = False,
+    discard_unused_train: bool = False,
 ) -> None:
     data, histories, _ = build_training_data(db_dir, start_cutoff)
     unique_cutoffs = sorted(data["cutoff"].unique())
@@ -813,7 +800,9 @@ def run_backtest(
         (data["cutoff"] >= train_end) & (data["cutoff"] < calibration_end)
     ]
     holdout = data.loc[data["cutoff"] >= calibration_end]
-    train, calibration = apply_train_fraction(train, calibration, train_fraction, seed)
+    train, calibration = apply_train_fraction(
+        train, calibration, train_fraction, seed, discard_unused_train
+    )
     if user_embedding:
         user_categories = np.unique(train["user_id"])
         train, calibration, holdout = (
@@ -836,7 +825,6 @@ def run_backtest(
         s2p2_options,
         device_name,
         nn_output_mode,
-        use_scale_pos_weight,
         user_embedding,
     )
     calibration_probabilities = predict_temporal_probabilities(
@@ -875,12 +863,6 @@ def run_backtest(
     )
     if temporal_model == "lightgbm":
         results["model_params"] = model_params
-        results["scale_pos_weight"] = {
-            "enabled": use_scale_pos_weight,
-            "per_label": (
-                scale_pos_weights(train) if use_scale_pos_weight else {}
-            ),
-        }
     elif temporal_model == "frequency_nn":
         results["model_params"] = {
             "architecture": [
@@ -932,10 +914,10 @@ def run_prediction(
     device_name: str = "auto",
     nn_output_mode: str = "per_label",
     calibrated_threshold: bool = False,
-    use_scale_pos_weight: bool = True,
     train_fraction: float = 1.0,
     seed: int = 42,
     user_embedding: bool = False,
+    discard_unused_train: bool = False,
 ) -> None:
     data, histories, cohort_user_ids = build_training_data(db_dir, start_cutoff)
     data = training_data_before(data, cutoff)
@@ -947,7 +929,9 @@ def run_prediction(
 
     train = data.loc[data["cutoff"] < train_end]
     calibration = data.loc[data["cutoff"] >= train_end]
-    train, calibration = apply_train_fraction(train, calibration, train_fraction, seed)
+    train, calibration = apply_train_fraction(
+        train, calibration, train_fraction, seed, discard_unused_train
+    )
     if user_embedding:
         user_categories = np.unique(train["user_id"])
         train, calibration = (
@@ -964,7 +948,6 @@ def run_prediction(
         s2p2_options,
         device_name,
         nn_output_mode,
-        use_scale_pos_weight,
         user_embedding,
     )
     calibration_probabilities = predict_temporal_probabilities(
@@ -1039,13 +1022,6 @@ def run_prediction(
         "user_embedding": user_embedding,
         "labels": list(LABELS),
     }
-    if temporal_model == "lightgbm":
-        metadata["scale_pos_weight"] = {
-            "enabled": use_scale_pos_weight,
-            "per_label": (
-                scale_pos_weights(train) if use_scale_pos_weight else {}
-            ),
-        }
     if temporal_model == "lightgbm":
         metadata["model_params"] = model_params
     elif temporal_model == "frequency_nn":
@@ -1137,13 +1113,6 @@ def parse_args() -> argparse.Namespace:
         subparser.add_argument("--colsample-bytree", type=float, default=0.85)
         subparser.add_argument("--reg-lambda", type=float, default=2.0)
         subparser.add_argument(
-            "--no-scale-pos-weight",
-            dest="scale_pos_weight",
-            action="store_false",
-            help="disable per-label negative/positive class weighting (enabled by default)",
-        )
-        subparser.set_defaults(scale_pos_weight=True)
-        subparser.add_argument(
             "--train-fraction",
             type=float,
             default=1.0,
@@ -1153,6 +1122,11 @@ def parse_args() -> argparse.Namespace:
             ),
         )
         subparser.add_argument("--seed", type=int, default=42)
+        subparser.add_argument(
+            "--discard-unused-train",
+            action="store_true",
+            help="with --train-fraction below 1, drop the unused rows instead of adding them to calibration",
+        )
         subparser.add_argument(
             "--user-embedding",
             action="store_true",
@@ -1212,10 +1186,10 @@ def main() -> None:
             args.device,
             args.nn_output_mode,
             args.calibrated_threshold,
-            args.scale_pos_weight,
             args.train_fraction,
             args.seed,
             args.user_embedding,
+            args.discard_unused_train,
         )
     else:
         run_prediction(
@@ -1230,10 +1204,10 @@ def main() -> None:
             args.device,
             args.nn_output_mode,
             args.calibrated_threshold,
-            args.scale_pos_weight,
             args.train_fraction,
             args.seed,
             args.user_embedding,
+            args.discard_unused_train,
         )
 
 

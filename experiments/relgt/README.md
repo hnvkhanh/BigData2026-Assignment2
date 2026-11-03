@@ -211,8 +211,6 @@ using calibration weeks only. The LightGBM features include 7-day total
 actions, per-action shares over 7- and 30-day windows, 7-day per-action
 frequencies, and median daily activity over both windows. Raw 30-day count
 features are excluded.
-The LightGBM branch applies per-label `scale_pos_weight` based on the training
-split by default; pass `--no-scale-pos-weight` to disable it.
 The baseline's 90-day eligibility filter remains, but 90- and 365-day windows
 are not used as tabular model features. The frequency-only neural network in
 the baseline remains restricted to per-action frequency inputs.

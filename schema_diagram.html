@@ -33,11 +33,18 @@
     .card-line { font-size: 13px; fill: #34425a; }
     .card-note { font-size: 11px; fill: #63728a; }
     .edge { fill: none; stroke: #8091aa; stroke-width: 2; opacity: .8; }
+    .edge-user { fill: none; stroke: #7c5cd6; stroke-width: 2; opacity: .85; }
+    .edge-repo { fill: none; stroke: #2e9e75; stroke-width: 2; opacity: .85; }
+    .bus-label { font-size: 11px; font-weight: 650; paint-order: stroke; stroke: #fff; stroke-width: 5px; stroke-linejoin: round; }
     .edge-label { font-size: 11px; font-weight: 650; fill: #4c5d76; paint-order: stroke; stroke: #fff; stroke-width: 5px; stroke-linejoin: round; }
     .legend { display: flex; flex-wrap: wrap; gap: 12px 24px; padding: 15px 4px 2px; color: #526078; font-size: 13px; }
     .legend span { display: inline-flex; align-items: center; gap: 8px; }
     .swatch { width: 12px; height: 12px; border-radius: 3px; background: #eef5ff; border: 1px solid #5790dc; }
     .arrow { width: 28px; border-top: 2px solid #8091aa; position: relative; }
+    .arrow.user { border-top-color: #7c5cd6; }
+    .arrow.user::after { border-left-color: #7c5cd6; }
+    .arrow.repo { border-top-color: #2e9e75; }
+    .arrow.repo::after { border-left-color: #2e9e75; }
     .arrow::after { content: ""; position: absolute; right: 0; top: -5px; border: 4px solid transparent; border-right: 0; border-left-color: #8091aa; }
     .notes { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 14px; margin-top: 18px; }
     .note { padding: 16px 18px; border: 1px solid #dce4ef; border-radius: 14px; background: #fff; }
@@ -50,32 +57,65 @@
 <body>
 <main>
   <h1>Assignment 2 database schema</h1>
-  <p class="intro">Eight Parquet tables of GitHub activity. Arrows show links between activity tables; user and repository foreign keys are listed on each activity card.</p>
+  <p class="intro">Eight Parquet tables of GitHub activity. Every arrow is a many-to-one foreign key pointing at the referenced table: grey between activity tables, purple to Users, green to Repositories.</p>
   <section class="canvas" aria-label="Database relationship diagram">
-    <svg viewBox="0 0 1280 900" role="img" aria-labelledby="diagram-title diagram-desc">
+    <svg viewBox="0 0 1340 900" role="img" aria-labelledby="diagram-title diagram-desc">
       <title id="diagram-title">Database tables and foreign-key relationships</title>
-      <desc id="diagram-desc">Users and repositories connect to activity tables. Pull requests connect to reviews, review comments, and issue conversations. Issues connect to issue comments.</desc>
+      <desc id="diagram-desc">Every activity table references Users and Repositories. Pull requests are referenced by reviews, review comments, and issues. Issues are referenced by issue comments. Review comments reference reviews and their parent review comment.</desc>
       <defs>
         <marker id="arrowhead" markerWidth="9" markerHeight="7" refX="8" refY="3.5" orient="auto">
           <polygon points="0 0, 9 3.5, 0 7" fill="#8091aa"/>
         </marker>
+        <marker id="arrowhead-user" markerWidth="9" markerHeight="7" refX="8" refY="3.5" orient="auto">
+          <polygon points="0 0, 9 3.5, 0 7" fill="#7c5cd6"/>
+        </marker>
+        <marker id="arrowhead-repo" markerWidth="9" markerHeight="7" refX="8" refY="3.5" orient="auto">
+          <polygon points="0 0, 9 3.5, 0 7" fill="#2e9e75"/>
+        </marker>
       </defs>
 
-      <!-- Arrows show activity-to-activity foreign keys; lookup keys are listed on cards. -->
+      <!-- Users FKs: trunk into Users, bus at y=600, drops into each table -->
+      <g class="edge-user">
+        <path d="M120 650 V260" marker-end="url(#arrowhead-user)"/>
+        <path d="M450 165 H360" marker-end="url(#arrowhead-user)"/>
+        <path d="M120 600 H960"/>
+        <path d="M520 540 V650"/>
+        <path d="M960 540 V650"/>
+      </g>
+
+      <!-- Repositories FKs: trunk into Repositories, bus at y=630, drops into each table -->
+      <g class="edge-repo">
+        <path d="M1320 630 V165 H1240" marker-end="url(#arrowhead-repo)"/>
+        <path d="M830 165 H920" marker-end="url(#arrowhead-repo)"/>
+        <path d="M300 630 H1320"/>
+        <path d="M300 630 V650"/>
+        <path d="M700 650 V630"/>
+        <path d="M780 540 V630"/>
+        <path d="M1200 540 V650"/>
+      </g>
+
+      <!-- Activity-to-activity foreign keys -->
       <g class="edge" marker-end="url(#arrowhead)">
         <path d="M380 705 C420 680 430 540 465 500"/>
         <path d="M465 740 C430 740 410 740 380 740"/>
         <path d="M920 445 C885 445 860 445 830 445"/>
         <path d="M920 680 C870 660 850 570 800 535"/>
-        <path d="M1080 650 C1080 610 1080 580 1080 540"/>
+        <path d="M1030 650 V540"/>
+        <path d="M1000 840 C1000 885 1120 885 1120 840"/>
+      </g>
+
+      <g class="bus-label">
+        <text x="135" y="592" fill="#7c5cd6">→ Users: user_id · author_id · reviewer_id · assignee_id · merged_by_id</text>
+        <text x="1190" y="622" text-anchor="end" fill="#2e9e75">→ Repositories: repo_id</text>
       </g>
 
       <g class="edge-label">
-        <text x="387" y="612">pull_request_id</text>
+        <text x="440" y="560" text-anchor="end">pull_request_id</text>
         <text x="387" y="727">issue_id</text>
         <text x="850" y="430">pr_id</text>
-        <text x="842" y="625">pr_id</text>
-        <text x="1092" y="604">pull_request_review_id</text>
+        <text x="860" y="585">pr_id</text>
+        <text x="1038" y="585">pull_request_review_id</text>
+        <text x="1060" y="878" text-anchor="middle">in_reply_to_id (self)</text>
       </g>
 
       <g>
@@ -140,13 +180,16 @@
         <text class="card-count" x="940" y="703">67,114 rows</text>
         <text class="card-line" x="940" y="734">author_id → Users · pr_id → PullRequests</text>
         <text class="card-line" x="940" y="757">pull_request_review_id → PRReviews (optional)</text>
+        <text class="card-line" x="940" y="776">in_reply_to_id → PRReviewComments (optional)</text>
         <text class="card-note" x="940" y="795">Row time: created_at</text>
         <text class="card-note" x="940" y="814">Comments on lines/files in a PR diff</text>
       </g>
     </svg>
     <div class="legend">
       <span><i class="swatch"></i> Core lookup table</span>
-      <span><i class="arrow"></i> Activity-table foreign-key reference</span>
+      <span><i class="arrow"></i> Activity-to-activity FK</span>
+      <span><i class="arrow user"></i> FK to Users</span>
+      <span><i class="arrow repo"></i> FK to Repositories</span>
       <span>PK = primary key · FK = foreign key</span>
     </div>
   </section>

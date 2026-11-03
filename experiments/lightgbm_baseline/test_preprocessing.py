@@ -26,34 +26,6 @@ from experiments.lightgbm_baseline.run import (
 
 
 class LifecycleFeatureTests(unittest.TestCase):
-    def test_scale_pos_weight_is_enabled_by_default_and_can_be_disabled(self) -> None:
-        train = pd.DataFrame(
-            {
-                "feature": [0.0, 1.0, 2.0, 3.0],
-                **{label: [1, 1, 1, 0] for label in LABELS},
-            }
-        )
-        with patch("experiments.lightgbm_baseline.run.lgb.LGBMClassifier") as classifier:
-            classifier.return_value.fit.return_value = None
-            fit_models(train, ["feature"], {})
-            self.assertEqual(classifier.call_count, len(LABELS))
-            self.assertTrue(
-                all(
-                    call.kwargs["scale_pos_weight"] == 1 / 3
-                    for call in classifier.call_args_list
-                )
-            )
-
-        with patch("experiments.lightgbm_baseline.run.lgb.LGBMClassifier") as classifier:
-            classifier.return_value.fit.return_value = None
-            fit_models(train, ["feature"], {}, use_scale_pos_weight=False)
-            self.assertTrue(
-                all(
-                    "scale_pos_weight" not in call.kwargs
-                    for call in classifier.call_args_list
-                )
-            )
-
     def test_fixed_thresholds_are_defaults_and_calibration_is_opt_in(self) -> None:
         calibration = pd.DataFrame(
             {label: [0, 1, 0, 1] for label in LABELS}

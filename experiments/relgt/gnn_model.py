@@ -84,6 +84,9 @@ class RelationalGNN(nn.Module):
         dropout: float = 0.1,
         output_indices: tuple[int, ...] = tuple(range(len(LABELS))),
         known_user_ids: np.ndarray | None = None,
+        num_root_features: int = 0,
+        num_node_types: int = 4,
+        num_relations: int = len(LABELS) + 2,
     ) -> None:
         super().__init__()
         if (
@@ -96,8 +99,8 @@ class RelationalGNN(nn.Module):
             )
         self.output_indices = output_indices
         self.entity_embedding = nn.Embedding(num_entities, hidden_dim, padding_idx=0)
-        self.node_type_embedding = nn.Embedding(4, hidden_dim)
-        self.relation_embedding = nn.Embedding(len(LABELS) + 2, hidden_dim)
+        self.node_type_embedding = nn.Embedding(num_node_types, hidden_dim)
+        self.relation_embedding = nn.Embedding(num_relations, hidden_dim)
         self.hop_embedding = nn.Embedding(3, hidden_dim)
         # Users seen in training get a learned vector; index 0 (zero vector)
         # is shared by every other user.
@@ -115,10 +118,14 @@ class RelationalGNN(nn.Module):
         self.feature_projection = nn.Linear(4, hidden_dim)
         self.time_projection = nn.Linear(7, hidden_dim)
         self.token_norm = nn.LayerNorm(hidden_dim)
+        # Optional per-user feature vector projected onto the root.
+        self.root_feature_projection = (
+            nn.Linear(num_root_features, hidden_dim) if num_root_features else None
+        )
         self.root = nn.Parameter(torch.empty(hidden_dim))
         nn.init.normal_(self.root, mean=0.0, std=hidden_dim**-0.5)
         self.layers = nn.ModuleList(
-            RelationalMessageLayer(hidden_dim, len(LABELS) + 2, dropout)
+            RelationalMessageLayer(hidden_dim, num_relations, dropout)
             for _ in range(num_layers)
         )
         self.output = nn.Sequential(
@@ -147,10 +154,15 @@ class RelationalGNN(nn.Module):
         node_features: torch.Tensor,
         relative_days: torch.Tensor,
         user_ids: torch.Tensor | None = None,
+        root_features: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if (self.user_embedding is None) != (user_ids is None):
             raise ValueError(
                 "user_ids must be given exactly when the model has known_user_ids."
+            )
+        if (self.root_feature_projection is None) != (root_features is None):
+            raise ValueError(
+                "root_features must be given exactly when the model has num_root_features."
             )
         neighbor_mask = entity_ids.ne(0)
         neighbors = self.token_norm(
@@ -166,6 +178,8 @@ class RelationalGNN(nn.Module):
         root = self.root.unsqueeze(0).expand(entity_ids.shape[0], -1)
         if self.user_embedding is not None:
             root = root + self.user_embedding(user_embedding_index(self.known_user_ids, user_ids))
+        if self.root_feature_projection is not None:
+            root = root + self.root_feature_projection(root_features)
         for layer in self.layers:
             root, neighbors = layer(root, neighbors, relation_ids, neighbor_mask)
 

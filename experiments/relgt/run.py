@@ -821,9 +821,7 @@ def fit_lightgbm_branch(
         aligned_data.iloc[train_indices],
         feature_columns,
         params,
-        args.scale_pos_weight,
     )
-    params["use_scale_pos_weight"] = int(args.scale_pos_weight)
     return models, histories, aligned_data, feature_columns, params
 
 
@@ -2246,13 +2244,6 @@ def add_common_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--subsample", type=float, default=0.85)
     parser.add_argument("--colsample-bytree", type=float, default=0.85)
     parser.add_argument("--reg-lambda", type=float, default=2.0)
-    parser.add_argument(
-        "--no-scale-pos-weight",
-        dest="scale_pos_weight",
-        action="store_false",
-        help="disable per-label negative/positive class weighting (enabled by default)",
-    )
-    parser.set_defaults(scale_pos_weight=True)
     parser.add_argument("--s2p2-epochs", type=int, default=3)
     parser.add_argument("--s2p2-batch-size", type=int, default=128)
     parser.add_argument("--s2p2-max-sequence-length", type=int, default=128)

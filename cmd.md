@@ -1,11 +1,7 @@
 # Run from the repository root.
 
 # LightGBM (fixed thresholds: 0.30 for all labels except push at 0.45)
-# Per-label scale_pos_weight class weighting is enabled by default.
 python experiments/lightgbm_baseline/run.py backtest
-
-# Disable class weighting for a LightGBM run (also supported by RelGT+LightGBM)
-python experiments/lightgbm_baseline/run.py backtest --no-scale-pos-weight
 
 # Opt in to per-label threshold calibration for LightGBM
 python experiments/lightgbm_baseline/run.py backtest --calibrated-threshold
@@ -20,7 +16,7 @@ python experiments/lightgbm_baseline/run.py backtest --temporal-model frequency_
 python experiments/lightgbm_baseline/run.py backtest --temporal-model frequency_nn --nn-output-mode multi_label
 
 # Train LightGBM / S2P2 / frequency NN on a random 30% of training rows (seeded by --seed);
-# the unused 70% is added to calibration. Works for backtest and predict.
+# pass --discard-unused-train to drop the unused 70% instead of adding it to calibration. Works for backtest and predict.
 python experiments/lightgbm_baseline/run.py backtest --train-fraction 0.3
 python experiments/lightgbm_baseline/run.py backtest --temporal-model s2p2 --train-fraction 0.3
 python experiments/lightgbm_baseline/run.py backtest --temporal-model frequency_nn --train-fraction 0.3 --seed 7
@@ -75,7 +71,7 @@ python -m experiments.relgt_lookback_chunks.run --chunk-thresholds 20,200 --look
 # --no-global-baseline, --global-lookback 14, --inspect-only
 python -m experiments.relgt_lookback_chunks.run --chunk-thresholds 20,200 --train-fraction 0.5 --user-embedding
 
-# Train on only 25% of the training partition (random, seeded by --seed); the unused 75% is added to calibration
+# Train on only 25% of the training partition (random, seeded by --seed); the unused 75% is added to calibration (or dropped with --discard-unused-train)
 python -m experiments.relgt_activity_chunks.run --chunk-thresholds 20,200 --train-fraction 0.25
 
 # Equal training size per chunk: downsample larger chunks to the smallest chunk's size
@@ -178,3 +174,32 @@ python -m experiments.relgt.run predict --temporal-model gnn_ensemble
 
 # Generate LightGBM predictions with calibrated thresholds
 python experiments/lightgbm_baseline/run.py predict --calibrated-threshold
+
+# LightGBM + cross-action relational features (owner / author / reviewer / assignee / sequence)
+python -m experiments.relational_lightgbm.run backtest
+# Ablation: drop all relational features (same code path as the plain baseline features)
+python -m experiments.relational_lightgbm.run backtest --groups none
+# Ablation: only some groups (owner, sequence, assigned, reviewer, author, repo_activity)
+python -m experiments.relational_lightgbm.run backtest --groups reviewer,sequence
+python -m experiments.relational_lightgbm.run predict
+# Measure candidate relationships on the training weeks (writes relationship_lift.csv, transition_lift.csv)
+python -m experiments.relational_lightgbm.explore
+
+# RelGT / GNN with the relational features added to the user root token (--groups none = control)
+python -m experiments.relgt_relational.run backtest
+python -m experiments.relgt_relational.run backtest --architecture gnn
+python -m experiments.relgt_relational.run backtest --architecture gnn --groups none
+python -m experiments.relgt_relational.run predict --architecture gnn
+
+# RelGT / GNN on the 14-day graph plus typed relationship edges (owns, assigned, mentioned_in,
+# review_candidate, open_authored_*, thread, reviewed_repo, unpaired_branch, interacted users)
+python -m experiments.relgt_relgraph.run backtest --select-epoch
+python -m experiments.relgt_relgraph.run backtest --architecture gnn --select-epoch
+python -m experiments.relgt_relgraph.run backtest --architecture gnn --relations none --select-epoch  # control
+python -m experiments.relgt_relgraph.run backtest --relations interacted,review_candidate --select-epoch
+python -m experiments.relgt_relgraph.run predict --architecture gnn --select-epoch
+
+# Run every experiment and write a ranked comparison (experiments/results/<tag>/RESULTS.md)
+python run_all_experiments.py --list
+python run_all_experiments.py --quick --tag smoke
+python run_all_experiments.py --tag full

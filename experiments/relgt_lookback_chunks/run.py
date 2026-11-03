@@ -118,7 +118,9 @@ def run_backtest(args: argparse.Namespace) -> None:
     partitions = _partition_indices(reference)
     train_end, calibration_end = (int(day) for day in partitions.pop("_bounds"))
     available_train_examples = len(partitions["train"])
-    apply_train_fraction(partitions, args.train_fraction, args.seed)
+    apply_train_fraction(
+        partitions, args.train_fraction, args.seed, getattr(args, "discard_unused_train", False)
+    )
     train_indices = partitions["train"]
     calibration_indices = partitions["calibration"]
     holdout_indices = partitions["holdout"]

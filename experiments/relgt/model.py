@@ -29,11 +29,18 @@ class RelGTInspired(nn.Module):
         num_centroids: int = 8,
         dropout: float = 0.1,
         known_user_ids: np.ndarray | None = None,
+        num_root_features: int = 0,
+        num_node_types: int = 4,
+        num_relations: int = len(LABELS) + 2,
     ) -> None:
         super().__init__()
+        # Optional per-user feature vector projected onto the user (root) token.
+        self.root_feature_projection = (
+            nn.Linear(num_root_features, hidden_dim) if num_root_features else None
+        )
         self.entity_embedding = nn.Embedding(num_entities, hidden_dim, padding_idx=0)
-        self.node_type_embedding = nn.Embedding(4, hidden_dim)
-        self.relation_embedding = nn.Embedding(len(LABELS) + 2, hidden_dim)
+        self.node_type_embedding = nn.Embedding(num_node_types, hidden_dim)
+        self.relation_embedding = nn.Embedding(num_relations, hidden_dim)
         self.hop_embedding = nn.Embedding(3, hidden_dim)
         self.feature_projection = nn.Linear(4, hidden_dim)
         self.time_projection = nn.Linear(7, hidden_dim)
@@ -100,6 +107,7 @@ class RelGTInspired(nn.Module):
         node_features: torch.Tensor,
         relative_days: torch.Tensor,
         user_ids: torch.Tensor | None = None,
+        root_features: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Return six logits for each user in a batch."""
         return self.output(
@@ -111,6 +119,7 @@ class RelGTInspired(nn.Module):
                 node_features,
                 relative_days,
                 user_ids,
+                root_features,
             )
         )
 
@@ -123,11 +132,16 @@ class RelGTInspired(nn.Module):
         node_features: torch.Tensor,
         relative_days: torch.Tensor,
         user_ids: torch.Tensor | None = None,
+        root_features: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Return each user's local-plus-global relational graph representation."""
         if (self.user_embedding is None) != (user_ids is None):
             raise ValueError(
                 "user_ids must be given exactly when the model has known_user_ids."
+            )
+        if (self.root_feature_projection is None) != (root_features is None):
+            raise ValueError(
+                "root_features must be given exactly when the model has num_root_features."
             )
         batch_size = entity_ids.shape[0]
         device = entity_ids.device
@@ -190,6 +204,12 @@ class RelGTInspired(nn.Module):
             )
             local_tokens = torch.cat(
                 [local_tokens[:, :1] + user_vectors.unsqueeze(1), local_tokens[:, 1:]],
+                dim=1,
+            )
+        if self.root_feature_projection is not None:
+            root_vectors = self.root_feature_projection(root_features)
+            local_tokens = torch.cat(
+                [local_tokens[:, :1] + root_vectors.unsqueeze(1), local_tokens[:, 1:]],
                 dim=1,
             )
 

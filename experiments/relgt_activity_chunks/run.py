@@ -192,9 +192,12 @@ def _partition_indices(examples: TrainingExamples) -> dict[str, np.ndarray]:
 
 
 def apply_train_fraction(
-    partitions: dict[str, np.ndarray], fraction: float, seed: int
+    partitions: dict[str, np.ndarray], fraction: float, seed: int, discard: bool = False
 ) -> None:
-    """Keep a random ``fraction`` of the train partition; the rest joins calibration."""
+    """Keep a random ``fraction`` of the train partition.
+
+    The rest joins calibration, or is dropped entirely when ``discard`` is set.
+    """
     if fraction >= 1.0:
         return
     available = len(partitions["train"])
@@ -204,13 +207,15 @@ def apply_train_fraction(
             partitions["train"], size=keep, replace=False
         )
     )
-    partitions["calibration"] = np.union1d(
-        partitions["calibration"], np.setdiff1d(partitions["train"], chosen)
-    )
+    if not discard:
+        partitions["calibration"] = np.union1d(
+            partitions["calibration"], np.setdiff1d(partitions["train"], chosen)
+        )
     partitions["train"] = chosen
     print(
         f"Using {keep} of {available} training examples "
-        f"(--train-fraction {fraction}); the rest go to calibration"
+        f"(--train-fraction {fraction}); the rest "
+        + ("are discarded" if discard else "go to calibration")
     )
 
 
@@ -236,7 +241,9 @@ def run_backtest(args: argparse.Namespace) -> None:
     partitions = _partition_indices(examples)
     train_end, calibration_end = (int(day) for day in partitions.pop("_bounds"))
     available_train_examples = len(partitions["train"])
-    apply_train_fraction(partitions, args.train_fraction, args.seed)
+    apply_train_fraction(
+        partitions, args.train_fraction, args.seed, getattr(args, "discard_unused_train", False)
+    )
     train_indices = partitions["train"]
     calibration_indices = partitions["calibration"]
     holdout_indices = partitions["holdout"]
@@ -481,6 +488,11 @@ def build_parser() -> argparse.ArgumentParser:
             "fraction of the training partition to use, sampled at random "
             "(seeded by --seed); the unused remainder is added to calibration"
         ),
+    )
+    parser.add_argument(
+        "--discard-unused-train",
+        action="store_true",
+        help="with --train-fraction below 1, drop the unused training examples instead of adding them to calibration",
     )
     parser.add_argument(
         "--balance-chunks",

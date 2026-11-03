@@ -113,11 +113,6 @@ Change one or two settings at a time, keep the same cutoff/data/split, and use
 the chronological holdout only for comparing a small number of final candidates.
 Repeatedly tuning to that holdout can overfit it.
 
-LightGBM uses `scale_pos_weight = negative_count / positive_count` separately
-for each label by default, calculated from the training split only. Pass
-`--no-scale-pos-weight` to disable class weighting for either `backtest` or
-`predict`.
-
 ## Export LightGBM holdout failures
 
 From the repository root, run:
@@ -133,8 +128,7 @@ row per misclassified user-week-label, including actual/predicted values,
 probability, threshold, failure type, user IDs, cutoff, and feature values.
 It uses the default fixed thresholds; pass `--calibrated-threshold` to opt in to
 calibration-based thresholds. Override the output folder or LightGBM parameters
-with the script's CLI flags. Per-label `scale_pos_weight` is enabled by
-default; pass `--no-scale-pos-weight` to disable it.
+with the script's CLI flags.
 Failure interpretation is intentionally left as a TODO in the script.
 
 To analyze a previously completed backtest from any supported experiment
@@ -273,3 +267,6 @@ python assignment2/evaluation/evaluate.py \
   upstream S2P2 implementation is available at
   https://github.com/UCIDataLab/state_space_point_process and is pinned in the
   optional requirements file.
+
+`run_all_experiments.py` never trains on less than 50% of the data and always passes
+`--discard-unused-train`, so the unused rows are dropped rather than added to calibration.

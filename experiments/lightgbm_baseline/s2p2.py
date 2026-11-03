@@ -15,7 +15,7 @@ import pandas as pd
 import torch
 
 DAY_NS = pd.Timedelta(days=1).value
-LOOKBACK_DAYS = 30
+LOOKBACK_DAYS = 14
 PREDICTION_GRID_SIZE = 33
 LABELS = (
     "open_pr",
