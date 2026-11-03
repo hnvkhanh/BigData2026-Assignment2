@@ -12,6 +12,8 @@ Follows upstream ``gather_1_and_2_hop_with_seed_time`` / ``_process_one_seed``
 4. shuffle all tokens except the seed and keep the edges among them for the
    GNN positional encoding.
 
+``context`` selects the relational-context configuration (see ``CONTEXT_MODES``).
+
 Unlike upstream, every node, edge, and fallback node must be known strictly
 before the seed time, so future rows and edges never enter a token set.
 """
@@ -28,6 +30,11 @@ from .database import SECONDS_PER_DAY, TemporalGraph
 MAX_ONE_HOP = 5_000
 MAX_TWO_HOP_PER_NODE = 1_000
 FALLBACK_HOP = 3
+# r0: the user's own rows only (hop 1).
+# r1: r0 plus other rows that directly touch them (hop 2, excluding Repositories).
+# r2: full upstream 1/2-hop context, including Repositories.
+# r3: control; random known rows, as many as r2 would have candidates.
+CONTEXT_MODES = ("r0", "r1", "r2", "r3")
 
 
 @dataclass
@@ -105,8 +112,11 @@ def sample_seed(
     seed_time: int,
     num_tokens: int,
     rng: np.random.Generator,
+    context: str = "r2",
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Return global node ids, hops, and local edges for one seed."""
+    if context not in CONTEXT_MODES:
+        raise ValueError(f"context must be one of {CONTEXT_MODES}.")
     one_hop, _ = _neighbors_before(graph, np.array([seed_node]), seed_time)
     one_hop = np.unique(one_hop)
     if len(one_hop) > MAX_ONE_HOP:
@@ -116,11 +126,24 @@ def sample_seed(
     two_hop = np.unique(two_hop[_cap_per_owner(owners, MAX_TWO_HOP_PER_NODE, rng)])
     two_hop = two_hop[(two_hop != seed_node) & ~np.isin(two_hop, one_hop)]
 
+    needed = num_tokens - 1
+    full_count = len(one_hop) + len(two_hop)  # r2 candidate count
+    if context == "r0":
+        two_hop = two_hop[:0]
+    elif context == "r1":
+        repositories = graph.table_names.index("Repositories")
+        types = np.searchsorted(graph.table_offsets, two_hop, side="right") - 1
+        two_hop = two_hop[types != repositories]
+
     candidates = np.concatenate([one_hop, two_hop])
     candidate_hops = np.concatenate(
         [np.ones(len(one_hop), np.int8), np.full(len(two_hop), 2, np.int8)]
     )
-    needed = num_tokens - 1
+    if context == "r3":
+        # Same number of candidates as r2 would have (capped at what is drawn).
+        candidates = _fallback_nodes(graph, seed_time, min(full_count, needed), rng)
+        candidates = candidates[candidates != seed_node]
+        candidate_hops = np.full(len(candidates), FALLBACK_HOP, np.int8)
     if len(candidates) >= needed:
         chosen = rng.choice(len(candidates), needed, replace=False)
     elif len(candidates):
@@ -157,6 +180,7 @@ def sample_tokens(
     seed_times: np.ndarray,
     num_tokens: int,
     seed: int,
+    context: str = "r2",
 ) -> TokenSets:
     """Sample a token set for every (seed node, seed time) pair."""
     if num_tokens < 2:
@@ -177,7 +201,7 @@ def sample_tokens(
         # batching and worker count.
         rng = np.random.default_rng([seed, int(seed_node), int(seed_time)])
         nodes, sample_hops, edges = sample_seed(
-            graph, int(seed_node), int(seed_time), num_tokens, rng
+            graph, int(seed_node), int(seed_time), num_tokens, rng, context
         )
         types = np.searchsorted(graph.table_offsets, nodes, side="right") - 1
         node_types[index] = types

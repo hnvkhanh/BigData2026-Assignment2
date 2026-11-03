@@ -22,6 +22,7 @@ from experiments.relgt.data import (
 )
 from experiments.relgt.run import (
     calculate_metrics,
+    weekly_scores,
     choose_thresholds,
     chronological_splits,
     load_or_build_examples,
@@ -36,7 +37,7 @@ from experiments.relgt_action_specialists.run import (
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_DB_DIR = ROOT / "assignment2" / "data" / "db"
 DEFAULT_OUTPUT_ROOT = Path(__file__).resolve().parent / "outputs"
-DEFAULT_START_CUTOFF = "2026-03-01 00:00:00"
+DEFAULT_START_CUTOFF = "2026-03-11 16:00:00"
 LOOKBACK_DAYS = 14
 CHUNK_NAMES = ("low", "mid", "high")
 ALL_OUTPUTS = tuple(range(len(LABELS)))
@@ -141,8 +142,10 @@ def require_populated_chunks(
 
 
 def metrics_from_predictions(
-    labels: np.ndarray, predictions: np.ndarray
+    labels: np.ndarray, predictions: np.ndarray, cutoffs: np.ndarray | None = None
 ) -> dict[str, Any]:
+    if cutoffs is not None:
+        return weekly_scores(labels, predictions, cutoffs)
     per_action = {
         label: float(
             f1_score(labels[:, column], predictions[:, column], zero_division=0)
@@ -327,8 +330,11 @@ def run_backtest(args: argparse.Namespace) -> None:
         chunked_probabilities >= route_by_chunk(threshold_matrix, holdout_chunks)
     ).astype(np.uint8)
 
+    holdout_cutoffs = examples.cutoff_days[holdout_indices]
     holdout_metrics: dict[str, Any] = {
-        "chunked": metrics_from_predictions(holdout_labels, chunked_predictions)
+        "chunked": metrics_from_predictions(
+            holdout_labels, chunked_predictions, holdout_cutoffs
+        )
         | {"thresholds": {name: chunk_thresholds[name] for name in CHUNK_NAMES}}
     }
     per_chunk: dict[str, Any] = {}
@@ -351,6 +357,7 @@ def run_backtest(args: argparse.Namespace) -> None:
             holdout_labels,
             holdout_probabilities["global"],
             chunk_thresholds["global"],
+            holdout_cutoffs,
         )
 
     probability_columns: dict[str, np.ndarray] = {

@@ -223,8 +223,11 @@ def run_backtest(args: argparse.Namespace) -> None:
         chunked_probabilities >= route_by_chunk(threshold_matrix, holdout_chunks)
     ).astype(np.uint8)
 
+    holdout_cutoffs = reference.cutoff_days[holdout_indices]
     holdout_metrics: dict[str, Any] = {
-        "chunked": metrics_from_predictions(holdout_labels, chunked_predictions)
+        "chunked": metrics_from_predictions(
+            holdout_labels, chunked_predictions, holdout_cutoffs
+        )
         | {"thresholds": {name: chunk_thresholds[name] for name in CHUNK_NAMES}}
     }
     per_chunk: dict[str, Any] = {}
@@ -248,6 +251,7 @@ def run_backtest(args: argparse.Namespace) -> None:
             holdout_labels,
             holdout_probabilities["global"],
             chunk_thresholds["global"],
+            holdout_cutoffs,
         )
 
     tokens = reference.tokens

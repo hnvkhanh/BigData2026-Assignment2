@@ -122,6 +122,7 @@ def _signature(args: argparse.Namespace) -> dict[str, Any]:
         sampler_version=SAMPLER_VERSION,
         num_neighbors=args.num_neighbors,
         seed=args.seed,
+        context_mode=args.context_mode,
     )
     return signature
 
@@ -129,7 +130,7 @@ def _signature(args: argparse.Namespace) -> dict[str, Any]:
 def load_or_build_db_examples(
     args: argparse.Namespace, context: DatabaseContext
 ) -> DatabaseExamples:
-    cache_path = args.output_dir / "cache" / f"relgt_db_examples_k{args.num_neighbors}.npz"
+    cache_path = args.output_dir / "cache" / f"relgt_db_examples_k{args.num_neighbors}_{args.context_mode}.npz"
     metadata_path = cache_path.with_suffix(".json")
     signature = _signature(args)
     if cache_path.exists() and metadata_path.exists():
@@ -173,6 +174,7 @@ def load_or_build_db_examples(
         cutoff_days.astype(np.int64) * SECONDS_PER_DAY,
         args.num_neighbors,
         args.seed,
+        args.context_mode,
     )
     examples = DatabaseExamples(user_ids, cutoff_days, np.concatenate(label_batches), tokens)
 
@@ -355,6 +357,7 @@ def _settings(args: argparse.Namespace, history: list[dict[str, float]]) -> dict
         "num_centroids": args.num_centroids,
         "conv_type": args.conv_type,
         "ablate": args.ablate,
+        "context_mode": args.context_mode,
         "text_buckets": args.text_buckets,
         "learning_rate": args.db_lr,
         "weight_decay": args.weight_decay,
@@ -429,7 +432,10 @@ def run_db_backtest(args: argparse.Namespace) -> None:
     )
     holdout_probabilities = probabilities_for(holdout_indices)
     results = calculate_metrics(
-        examples.labels[holdout_indices], holdout_probabilities, thresholds
+        examples.labels[holdout_indices],
+        holdout_probabilities,
+        thresholds,
+        examples.cutoff_days[holdout_indices],
     )
     unique_cutoffs = np.unique(examples.cutoff_days)
     results["split"] = {
@@ -509,6 +515,7 @@ def run_db_prediction(args: argparse.Namespace) -> None:
         cutoff_seconds,
         args.num_neighbors,
         args.seed,
+        args.context_mode,
     )
     probabilities = predict_db_probabilities(
         model,

@@ -34,7 +34,7 @@ from experiments.gru_relational_ple.model import GRURelationalAttentionPLE
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_DB_DIR = ROOT / "assignment2" / "data" / "db"
 DEFAULT_OUTPUT_ROOT = Path(__file__).resolve().parent / "outputs"
-DEFAULT_START_CUTOFF = "2026-03-01 00:00:00"
+DEFAULT_START_CUTOFF = "2026-03-11 16:00:00"
 LOOKBACK_DAYS = 14
 DAY_NS = pd.Timedelta(days=1).value
 
@@ -261,7 +261,10 @@ def run_backtest(args: argparse.Namespace) -> None:
         examples.labels[calibration_indices], calibration_probabilities
     )
     metrics = calculate_metrics(
-        examples.labels[holdout_indices], holdout_probabilities, thresholds
+        examples.labels[holdout_indices],
+        holdout_probabilities,
+        thresholds,
+        examples.cutoff_days[holdout_indices],
     )
     torch.save(model.state_dict(), args.output_dir / "gru_relational_ple_model.pt")
     holdout_cutoffs = pd.to_datetime(

@@ -10,6 +10,7 @@ import os
 import random
 import shutil
 import subprocess
+import sys
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -36,10 +37,15 @@ from .gnn_model import RelationalGNN
 
 
 ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT / "assignment2" / "evaluation"))
+import evaluate as official_eval  # noqa: E402
+
 DEFAULT_DB_DIR = ROOT / "assignment2" / "data" / "db"
 DEFAULT_TEST_INPUT = ROOT / "assignment2" / "evaluation" / "test_input.csv"
 DEFAULT_OUTPUT_ROOT = Path(__file__).resolve().parent / "outputs"
-DEFAULT_START_CUTOFF = "2026-03-01 00:00:00"
+# Same weekday and hour as the official test window so each label is a full
+# test-style week (cutoffs are stored as whole days and used only to group weeks).
+DEFAULT_START_CUTOFF = "2026-03-11 16:00:00"
 DEFAULT_PREDICTION_CUTOFF = "2026-11-11 16:00:00"
 CACHE_VERSION = 3
 ENSEMBLE_LOOKBACK_OPTIONS = (7, 14, 21, 30, 90)
@@ -483,13 +489,53 @@ def choose_thresholds(
     return thresholds
 
 
+def weekly_scores(
+    labels: np.ndarray, predictions: np.ndarray, cutoffs: np.ndarray
+) -> dict[str, Any]:
+    """Score each cutoff week as its own submission with the official evaluator.
+
+    Returns the mean over weeks of macro-F1, micro-F1, Score and per-action F1,
+    plus the per-week results under ``per_week``.
+    """
+    columns = list(official_eval.EVENT_COLS)
+    weekly = []
+    for cutoff in np.unique(cutoffs):
+        rows = np.flatnonzero(cutoffs == cutoff)
+        users = np.arange(len(rows))
+        truth = pd.DataFrame(labels[rows].astype(np.int64), columns=columns)
+        pred = pd.DataFrame(predictions[rows].astype(np.int64), columns=columns)
+        truth.insert(0, official_eval.USER_COL, users)
+        pred.insert(0, official_eval.USER_COL, users)
+        week = official_eval.scores(pred, truth)
+        week["per_action_f1"] = dict(
+            zip(LABELS, official_eval.f1_per_event(pred, truth))
+        )
+        week["cutoff"] = str(pd.Timestamp(int(cutoff), unit="D"))
+        weekly.append(week)
+    mean = lambda key: float(np.mean([week[key] for week in weekly]))
+    return {
+        "macro_f1": mean("macro_f1"),
+        "micro_f1": mean("micro_f1"),
+        "score": mean("score"),
+        "per_action_f1": {
+            label: float(np.mean([week["per_action_f1"][label] for week in weekly]))
+            for label in LABELS
+        },
+        "per_week": weekly,
+    }
+
+
 def calculate_metrics(
     labels: np.ndarray,
     probabilities: np.ndarray,
     thresholds: dict[str, float],
+    cutoffs: np.ndarray | None = None,
 ) -> dict[str, Any]:
+    """F1 metrics; with ``cutoffs`` they are the per-week mean (official scoring)."""
     threshold_array = np.array([thresholds[label] for label in LABELS])
     predictions = (probabilities >= threshold_array).astype(np.uint8)
+    if cutoffs is not None:
+        return {**weekly_scores(labels, predictions, cutoffs), "thresholds": thresholds}
     per_action = {
         label: float(
             f1_score(labels[:, index], predictions[:, index], zero_division=0)
@@ -1069,7 +1115,10 @@ def run_lookback_ensemble_backtest(
     branch_thresholds["fused"] = thresholds
     branch_metrics = {
         branch: calculate_metrics(
-            reference.labels[holdout_indices], values, branch_thresholds[branch]
+            reference.labels[holdout_indices],
+            values,
+            branch_thresholds[branch],
+            reference.cutoff_days[holdout_indices],
         )
         for branch, values in branch_probabilities.items()
     }
@@ -1086,7 +1135,10 @@ def run_lookback_ensemble_backtest(
         args.output_dir / "holdout_probabilities.csv",
     )
     results = calculate_metrics(
-        reference.labels[holdout_indices], fused_holdout, thresholds
+        reference.labels[holdout_indices],
+        fused_holdout,
+        thresholds,
+        reference.cutoff_days[holdout_indices],
     )
     unique_cutoffs = np.unique(reference.cutoff_days)
     results.update(
@@ -1231,11 +1283,13 @@ def run_backtest(args: argparse.Namespace) -> None:
             examples.labels[holdout_indices],
             graph_holdout_probabilities,
             graph_only_thresholds,
+            examples.cutoff_days[holdout_indices],
         )
         s2p2_only_metrics = calculate_metrics(
             examples.labels[holdout_indices],
             s2p2_holdout_probabilities,
             s2p2_only_thresholds,
+            examples.cutoff_days[holdout_indices],
         )
         holdout_probabilities = fuse_probabilities(
             graph_holdout_probabilities,
@@ -1291,11 +1345,13 @@ def run_backtest(args: argparse.Namespace) -> None:
             examples.labels[holdout_indices],
             graph_holdout_probabilities,
             graph_only_thresholds,
+            examples.cutoff_days[holdout_indices],
         )
         lightgbm_only_metrics = calculate_metrics(
             examples.labels[holdout_indices],
             lightgbm_holdout_probabilities,
             lightgbm_only_thresholds,
+            examples.cutoff_days[holdout_indices],
         )
         holdout_probabilities = fuse_probabilities(
             graph_holdout_probabilities,
@@ -1379,6 +1435,7 @@ def run_backtest(args: argparse.Namespace) -> None:
                 examples.labels[holdout_indices],
                 branch_probabilities[name],
                 branch_thresholds[name],
+                examples.cutoff_days[holdout_indices],
             )
             for name in branch_probabilities
         }
@@ -1421,7 +1478,10 @@ def run_backtest(args: argparse.Namespace) -> None:
             args.output_dir / "holdout_probabilities.csv",
         )
     results = calculate_metrics(
-        examples.labels[holdout_indices], holdout_probabilities, thresholds
+        examples.labels[holdout_indices],
+        holdout_probabilities,
+        thresholds,
+        examples.cutoff_days[holdout_indices],
     )
     unique_cutoffs = np.unique(examples.cutoff_days)
     results["split"] = {
@@ -2132,6 +2192,15 @@ def add_common_arguments(parser: argparse.ArgumentParser) -> None:
         choices=["none", "type", "hop", "time", "tfs", "gnn"],
         default="none",
         help="drop one of the five token elements",
+    )
+    relgt_db.add_argument(
+        "--context-mode",
+        choices=["r0", "r1", "r2", "r3"],
+        default="r2",
+        help=(
+            "relational context: r0 own rows only, r1 plus other rows touching them, "
+            "r2 full 1/2-hop incl. repositories (default), r3 random rows matched in number"
+        ),
     )
     relgt_db.add_argument(
         "--text-buckets",

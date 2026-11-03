@@ -68,7 +68,13 @@ probability for one activity label; the selected fixed or calibrated
 thresholds turn those probabilities into the six binary predictions. The
 single model is saved as `models/frequency_nn_multilabel.joblib`.
 
-The script uses weekly forecast cutoffs beginning on 2026-03-01. It trains on the
+The script uses weekly forecast cutoffs beginning on 2026-03-11 16:00 UTC, the
+same weekday and hour as the official test window (2026-11-11 16:00 UTC), so each
+label is the whole 7-day week. Backtest metrics follow
+`assignment2/evaluation/evaluate.py`: each holdout week is scored as its own
+submission (macro-F1 and micro-F1 over users, averaged into the Score) and the
+reported numbers are the mean over weeks, with the per-week scores in
+`per_week`. It trains on the
 oldest 70% of weeks, reserves the next 15% for calibration, and reports the
 untouched final 15% holdout. By default, decisions use fixed thresholds:
 `0.30` for all labels except `push`, which uses `0.45`. Add

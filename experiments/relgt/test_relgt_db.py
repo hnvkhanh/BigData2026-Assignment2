@@ -234,6 +234,28 @@ class SamplerTests(DatabaseTestCase):
         self.assertEqual(found[self.node("Repositories", 0)], 2)
         self.assertNotIn(self.node("Pushes", 2), found)  # created after the cutoff
 
+    def test_context_modes(self) -> None:
+        alice = self.node("Users", 0)
+        repo = self.node("Repositories", 0)
+
+        def run(mode: str):
+            return sample_seed(
+                self.graph, alice, self.cutoff, 64, np.random.default_rng(1), mode
+            )
+
+        _, hops, _ = run("r0")
+        self.assertTrue(set(hops[1:].tolist()) <= {1})
+        nodes, hops, _ = run("r1")
+        self.assertNotIn(repo, nodes)
+        self.assertIn(1, hops)
+        nodes, hops, _ = run("r2")
+        self.assertIn(repo, nodes)
+        nodes, hops, _ = run("r3")
+        self.assertTrue(np.all(hops[1:] == FALLBACK_HOP))
+        self.assertTrue(np.all(self.graph.node_time[nodes] < self.cutoff))
+        with self.assertRaises(ValueError):
+            run("r9")
+
     def test_merged_by_edge_appears_once_known(self) -> None:
         later = timestamp_seconds(pd.Timestamp("2026-01-26"))
         nodes, hops, _ = sample_seed(

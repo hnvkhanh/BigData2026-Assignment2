@@ -115,10 +115,21 @@ cache exactly, so holdout scores compare directly.
   evaluation.
 - One head predicts all six labels.
 
+**Relational-context configurations** (`--context-mode`). Only the token
+candidates change; everything else is identical:
+
+| Mode | Candidates for the K-1 tokens |
+| --- | --- |
+| `r0` | the user's own rows only (hop 1) |
+| `r1` | `r0` plus other rows that directly touch them (hop 2, no `Repositories`) |
+| `r2` (default) | upstream full 1/2-hop context, including `Repositories` |
+| `r3` | control: random rows known before the cutoff, as many as `r2` has candidates (capped at K-1), marked hop 3 |
+
 Run it:
 
 ```bash
 python -m experiments.relgt.run backtest --temporal-model relgt_db
+python -m experiments.relgt.run backtest --temporal-model relgt_db --context-mode r0
 python -m experiments.relgt.run predict --temporal-model relgt_db
 ```
 
@@ -458,3 +469,11 @@ Compare the assignment score
 `(macro-F1 + micro-F1) / 2` on the untouched holdout. Combined models are
 experiments, not assumed improvements; retain one only if it improves the
 measured holdout score over the individual branches.
+
+## Weekly scoring
+
+Weekly cutoffs now start at `2026-03-11 16:00` (the test window's weekday and
+hour). Holdout metrics (`calculate_metrics(..., cutoffs=...)`) score every
+holdout week as a separate submission with `assignment2/evaluation/evaluate.py`
+and report the mean over weeks, with the per-week scores under `per_week`.
+The same applies to the GNN, DB, GRU, action-specialist and chunk experiments.

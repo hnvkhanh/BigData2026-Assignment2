@@ -36,7 +36,7 @@ from experiments.relgt.run import (
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_DB_DIR = ROOT / "assignment2" / "data" / "db"
 DEFAULT_OUTPUT_ROOT = Path(__file__).resolve().parent / "outputs"
-DEFAULT_START_CUTOFF = "2026-03-01 00:00:00"
+DEFAULT_START_CUTOFF = "2026-03-11 16:00:00"
 LOOKBACK_DAYS = 14
 PUSH_INDEX = LABELS.index("push")
 PUSH_RELATION_ID = PUSH_INDEX + 1
@@ -449,7 +449,10 @@ def run_backtest(args: argparse.Namespace) -> None:
         combined_probability_sets[combined_name] = probabilities
         combined_threshold_sets[combined_name] = branch_thresholds
         holdout_metrics[combined_name] = calculate_metrics(
-            examples.labels[holdout_indices], probabilities, branch_thresholds
+            examples.labels[holdout_indices],
+            probabilities,
+            branch_thresholds,
+            examples.cutoff_days[holdout_indices],
         )
 
     primary_combination = (

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -18,6 +19,9 @@ from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
 
 ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT / "assignment2" / "evaluation"))
+import evaluate as official_eval  # noqa: E402
+
 DEFAULT_DB_DIR = ROOT / "assignment2" / "data" / "db"
 DEFAULT_TEST_INPUT = ROOT / "assignment2" / "evaluation" / "test_input.csv"
 DEFAULT_OUTPUT_DIR = Path(__file__).resolve().parent / "outputs"
@@ -26,7 +30,9 @@ HORIZON_DAYS = 7
 LOOKBACK_DAYS = (7, 30)
 FREQUENCY_LOOKBACK_DAYS = (7,)
 ELIGIBILITY_WINDOW_DAYS = 90
-DEFAULT_START_CUTOFF = "2026-03-01 00:00:00"
+# Weekly cutoffs share the test window's phase (Wednesday 16:00 UTC), so every
+# training label covers the same weekly span as the official 7-day target.
+DEFAULT_START_CUTOFF = "2026-03-11 16:00:00"
 DEFAULT_PREDICTION_CUTOFF = "2026-11-11 16:00:00"
 USER_COLUMN = "UserID"
 USER_FEATURE_COLUMN = "user_id_feature"
@@ -671,21 +677,44 @@ def evaluate_predictions(
     probabilities: dict[str, np.ndarray],
     thresholds: dict[str, float],
 ) -> dict[str, Any]:
-    true_values = truth[list(LABELS)].to_numpy(dtype=np.int8)
-    predicted_values = np.column_stack(
-        [probabilities[label] >= thresholds[label] for label in LABELS]
-    ).astype(np.int8)
-    per_action = {
-        label: f1_score(true_values[:, index], predicted_values[:, index])
-        for index, label in enumerate(LABELS)
-    }
-    micro = f1_score(true_values.ravel(), predicted_values.ravel())
-    macro = float(np.mean(list(per_action.values())))
+    """Score like the official evaluator: one whole-week submission per cutoff.
+
+    Each holdout week is a separate submission (one row per user, 7-day labels),
+    scored with ``evaluate.scores``; the reported metrics are the mean over weeks.
+    """
+    predicted = pd.DataFrame(
+        {
+            label: (probabilities[label] >= thresholds[label]).astype(np.int64)
+            for label in LABELS
+        }
+    )
+    predicted.insert(0, USER_COLUMN, truth["user_id"].to_numpy())
+    actual = truth[["user_id", *LABELS]].rename(columns={"user_id": USER_COLUMN})
+    actual = actual.astype({label: np.int64 for label in LABELS})
+    cutoffs = truth["cutoff"].to_numpy()
+
+    weekly = []
+    for cutoff in np.unique(cutoffs):
+        in_week = cutoffs == cutoff
+        week_truth = actual.loc[in_week].reset_index(drop=True)
+        week_pred = predicted.loc[in_week].reset_index(drop=True)
+        week = official_eval.scores(week_pred, week_truth)
+        week["per_action_f1"] = dict(
+            zip(LABELS, official_eval.f1_per_event(week_pred, week_truth))
+        )
+        week["cutoff"] = str(pd.Timestamp(cutoff))
+        weekly.append(week)
+
+    mean = lambda key: float(np.mean([week[key] for week in weekly]))
     return {
-        "macro_f1": macro,
-        "micro_f1": micro,
-        "score": (macro + micro) / 2,
-        "per_action_f1": per_action,
+        "macro_f1": mean("macro_f1"),
+        "micro_f1": mean("micro_f1"),
+        "score": mean("score"),
+        "per_action_f1": {
+            label: float(np.mean([week["per_action_f1"][label] for week in weekly]))
+            for label in LABELS
+        },
+        "per_week": weekly,
         "thresholds": thresholds,
     }
 
