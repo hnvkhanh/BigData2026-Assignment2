@@ -3,3 +3,6 @@ pyarrow
 numpy
 lightgbm>=4.0
 scikit-learn
+torch
+dash>=2.17
+plotly>=5.0
