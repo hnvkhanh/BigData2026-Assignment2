@@ -168,7 +168,6 @@ class RelationalGNNTests(unittest.TestCase):
         )
 
         for temporal_model, architecture in (
-            ("relgt_ensemble", "relgt"),
             ("gnn_ensemble", "gnn"),
         ):
             with self.subTest(temporal_model=temporal_model):

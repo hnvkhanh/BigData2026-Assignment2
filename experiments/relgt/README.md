@@ -276,23 +276,21 @@ and the run saves its weights as `gnn_model.pt`.
 
 ## Lookback ensembles
 
-The `relgt_ensemble` and `gnn_ensemble` modes independently train two models
-from the selected lookback windows, then choose their probability-fusion weight
-and per-label thresholds using calibration weeks only. The default pair is
-30 and 14 days; `--ensemble-lookbacks` accepts any two distinct values from
-14, 30, and 90. Both branches use the same users, labels, and chronological
-split; eligibility is determined using the longer selected window.
+The `gnn_ensemble` mode independently trains two GNNs from the selected
+lookback windows, then chooses their probability-fusion weight and per-label
+thresholds using calibration weeks only. The default pair is 30 and 14 days;
+`--ensemble-lookbacks` accepts any two distinct values from 7, 14, 21, 30, and
+90. Both branches use the same users, labels, and chronological split;
+eligibility is determined using the longer selected window. (The RelGT version,
+`relgt_ensemble`, and `gnn_ensemble --user-embedding` were removed after
+scoring below 0.5.)
 
 ```bash
-python -m experiments.relgt.run backtest --temporal-model relgt_ensemble
 python -m experiments.relgt.run backtest --temporal-model gnn_ensemble
-python -m experiments.relgt.run backtest \
-  --temporal-model relgt_ensemble \
-  --ensemble-lookbacks 90,14
 ```
 
 Backtests save one checkpoint per lookback and branch probabilities named
-`relgt_30d_<label>` / `relgt_14d_<label>` (or `gnn_*`), plus `fused_<label>`,
+`gnn_30d_<label>` / `gnn_14d_<label>`, plus `fused_<label>`,
 in the shared holdout CSV format. `backtest_metrics.json` includes holdout
 metrics and the selected weights for each branch. To set the first
 branch's weight manually (the second branch receives the remainder), pass
@@ -300,7 +298,7 @@ branch's weight manually (the second branch receives the remainder), pass
 
 ```bash
 python -m experiments.relgt.run backtest \
-  --temporal-model relgt_ensemble \
+  --temporal-model gnn_ensemble \
   --fusion-weight 0.7
 ```
 
@@ -309,7 +307,7 @@ are always calibrated on calibration probabilities using the selected or
 manually specified blend. The same ensemble
 modes are available with `predict`. Analyze the fused holdout or either branch
 with `exam_fail_case.py --run-dir <run-folder> --model-branch fused` or, for
-example, `--model-branch relgt_14d`.
+example, `--model-branch gnn_14d`.
 
 Run the combined RelGT + S2P2 model with:
 
@@ -460,6 +458,21 @@ available. Use a separate output directory to keep candidate metrics and
 predictions from overwriting one another.
 
 ## Compare with LightGBM
+
+By default the graph modes keep only users with at least 5 events in the
+14-day graph lookback (about 1.7k users per week). LightGBM and the official
+test list use at least 5 events in **90** days (about 4.7k users per week, 3,960
+test users), so graph and LightGBM scores are not comparable unless the graph
+model is run on the same population:
+
+```bash
+python -m experiments.relgt.run backtest --eligibility-days 90
+python -m experiments.relgt.run backtest --temporal-model gnn --eligibility-days 90
+```
+
+On that population (data release with pushes up to 2026-10-26) RelGT scores
+46.11 and the GNN 44.66, against 53.39 for the LightGBM baseline and 54.08
+for relational LightGBM; see `experiments/drift_lightgbm/README.md`.
 
 Compare LightGBM, RelGT, RelGT+S2P2, RelGT+LightGBM, and
 RelGT+LightGBM+S2P2 runs using the same cutoff dates and chronological split.

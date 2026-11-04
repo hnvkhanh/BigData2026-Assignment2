@@ -17,8 +17,14 @@ features.
     of the six labels.
   - **frequency_nn** is a small neural network that uses only per-action
     frequencies to predict all six labels; it never uses user IDs as inputs.
-  - **S2P2** is an optional marked temporal point-process model, provided
-    through the pinned EasyTPP dependency.
+  - `s2p2.py` holds the S2P2 marked temporal point-process adapter (pinned
+    EasyTPP dependency) used by RelGT's hybrid modes.
+- [`experiments/drift_lightgbm/`](./experiments/drift_lightgbm/README.md)
+  tests the LightGBM follow-ups (relational/history/regime features, ingestion
+  anomaly masking, recency weights, refits, bagging, threshold tuning, push
+  ingestion lag) as named variants under one protocol, compares the graph
+  models on the official 90-day test population, and documents the
+  recommended submission model. Start there for current results.
 - [`experiments/relgt/`](./experiments/relgt/README.md) contains a compact,
   assignment-specific **RelGT-inspired** graph model. It is not a drop-in
   execution of Stanford's RelGT/RelBench implementation.
@@ -45,8 +51,8 @@ PyTorch dependency for RelGT:
 python -m pip install -r requirements.txt -r experiments/relgt/requirements.txt
 ```
 
-S2P2 is optional. Install it only when running the `s2p2` baseline or RelGT's
-`hybrid` mode:
+S2P2 is optional. Install it only when running RelGT's `hybrid` or
+`relgt_lightgbm_s2p2` modes:
 
 ```powershell
 python -m pip install -r experiments/lightgbm_baseline/s2p2-requirements.txt
@@ -64,15 +70,7 @@ Run a LightGBM chronological backtest:
 python experiments/lightgbm_baseline/run.py backtest
 ```
 
-By default, the fixed decision thresholds are `0.30` for all labels except
-push (`0.45`). Add `--calibrated-threshold` to select thresholds from
-chronological calibration data for backtests and predictions.
-
-Select S2P2 instead:
-
-```powershell
-python experiments/lightgbm_baseline/run.py backtest --temporal-model s2p2
-```
+The fixed decision thresholds are `0.30` for all labels except push (`0.45`).
 
 Run the frequency-only neural network:
 
@@ -132,9 +130,8 @@ Typical outputs:
 
 | Experiment and command | Files saved |
 |---|---|
-| LightGBM or S2P2 backtest | `backtest_metrics.json` with holdout metrics, split details, thresholds, and model settings |
+| LightGBM backtest | `backtest_metrics.json` with holdout metrics, split details, thresholds, and model settings |
 | LightGBM prediction | `predictions.csv`, `metadata.json`, and files under `models/` (`<label>.txt` for trained LightGBM labels) |
-| S2P2 prediction | `predictions.csv`, `metadata.json`, and `models/s2p2.pt` |
 | RelGT prediction | `predictions.csv`, `probabilities.csv`, `model.pt`, and `metadata.json` |
 | RelGT + S2P2 prediction | The RelGT prediction files, with `relgt_model.pt` and `s2p2_model.pt` saved as model weights |
 | RelGT + LightGBM prediction | Fused prediction/probability files, `relgt_model.pt`, `lightgbm_<label>.txt` files, and `metadata.json` |

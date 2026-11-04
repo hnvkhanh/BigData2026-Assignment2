@@ -21,7 +21,6 @@ through this code path.
 python -m experiments.relational_lightgbm.run backtest
 python -m experiments.relational_lightgbm.run backtest --groups none              # baseline control
 python -m experiments.relational_lightgbm.run backtest --groups reviewer,sequence  # ablation
-python -m experiments.relational_lightgbm.run backtest --calibrated-threshold
 python -m experiments.relational_lightgbm.run predict
 python -m pytest experiments/relational_lightgbm
 ```

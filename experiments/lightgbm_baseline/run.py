@@ -12,10 +12,9 @@ from typing import Any
 import lightgbm as lgb
 import numpy as np
 import pandas as pd
-from sklearn.compose import ColumnTransformer
 from sklearn.neural_network import MLPClassifier
 from sklearn.pipeline import make_pipeline
-from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.preprocessing import StandardScaler
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -385,34 +384,6 @@ def training_data_before(
     return data.loc[label_window_ends <= prediction_cutoff].copy()
 
 
-def choose_threshold(y_true: np.ndarray, probabilities: np.ndarray) -> float:
-    candidates = np.linspace(0.02, 0.98, 97)
-    scores = []
-    for threshold in candidates:
-        predicted = probabilities >= threshold
-        tp = int(np.sum(predicted & (y_true == 1)))
-        fp = int(np.sum(predicted & (y_true == 0)))
-        fn = int(np.sum(~predicted & (y_true == 1)))
-        denominator = 2 * tp + fp + fn
-        scores.append(2 * tp / denominator if denominator else 1.0)
-    return float(candidates[int(np.argmax(scores))])
-
-
-def thresholds_for_predictions(
-    calibration: pd.DataFrame,
-    probabilities: dict[str, np.ndarray],
-    calibrated_threshold: bool,
-) -> dict[str, float]:
-    if not calibrated_threshold:
-        return DEFAULT_THRESHOLDS.copy()
-    return {
-        label: choose_threshold(
-            calibration[label].to_numpy(dtype=np.int8), probabilities[label]
-        )
-        for label in LABELS
-    }
-
-
 def frequency_feature_columns(columns: list[str]) -> list[str]:
     """Return only the per-action frequencies, excluding identifiers and labels."""
     expected = [
@@ -437,21 +408,8 @@ def add_user_feature(frame: pd.DataFrame, categories: np.ndarray) -> pd.DataFram
     )
 
 
-def frequency_preprocessor(feature_columns: list[str]) -> Any:
-    """Scale numeric columns and one-hot the user feature (a learned embedding)."""
-    numeric = [column for column in feature_columns if column != USER_FEATURE_COLUMN]
-    if len(numeric) == len(feature_columns):
-        return StandardScaler()
-    return ColumnTransformer(
-        [
-            ("numeric", StandardScaler(), numeric),
-            (
-                "user",
-                OneHotEncoder(handle_unknown="ignore"),
-                [USER_FEATURE_COLUMN],
-            ),
-        ]
-    )
+def frequency_preprocessor() -> Any:
+    return StandardScaler()
 
 
 def fit_models(
@@ -495,7 +453,7 @@ def fit_frequency_nn_models(
     x_train = train[feature_columns]
     if output_mode == "multi_label":
         model = make_pipeline(
-            frequency_preprocessor(feature_columns),
+            frequency_preprocessor(),
             MLPClassifier(
                 hidden_layer_sizes=(32,),
                 activation="relu",
@@ -522,7 +480,7 @@ def fit_frequency_nn_models(
             continue
 
         model = make_pipeline(
-            frequency_preprocessor(feature_columns),
+            frequency_preprocessor(),
             MLPClassifier(
                 hidden_layer_sizes=(32,),
                 activation="relu",
@@ -585,50 +543,25 @@ def predict_probabilities(
     return probabilities
 
 
-def load_s2p2_adapter() -> tuple[Any, Any]:
-    if __package__:
-        from .s2p2 import S2P2TemporalModel, select_device
-    else:
-        from s2p2 import S2P2TemporalModel, select_device
-    return S2P2TemporalModel, select_device
-
-
 def fit_temporal_model(
     temporal_model: str,
     train: pd.DataFrame,
-    histories: dict[str, pd.DataFrame],
     feature_columns: list[str],
     model_params: dict[str, int | float],
-    s2p2_params: dict[str, int],
-    device_name: str,
     nn_output_mode: str = "per_label",
-    user_embedding: bool = False,
-) -> tuple[Any, Any]:
+) -> Any:
     if temporal_model == "lightgbm":
-        return fit_models(train, feature_columns, model_params), None
+        return fit_models(train, feature_columns, model_params)
     if temporal_model == "frequency_nn":
-        return fit_frequency_nn_models(
-            train, feature_columns, nn_output_mode
-        ), None
-    if temporal_model != "s2p2":
-        raise ValueError(f"Unknown temporal model: {temporal_model}")
-
-    s2p2_class, select_s2p2_device = load_s2p2_adapter()
-    model = s2p2_class(
-        device=select_s2p2_device(device_name),
-        user_embedding=user_embedding,
-        **s2p2_params,
-    )
-    return model.fit(train, histories), model
+        return fit_frequency_nn_models(train, feature_columns, nn_output_mode)
+    raise ValueError(f"Unknown temporal model: {temporal_model}")
 
 
 def predict_temporal_probabilities(
     temporal_model: str,
     models: Any,
-    s2p2_model: Any,
     frame: pd.DataFrame,
     feature_columns: list[str],
-    histories: dict[str, pd.DataFrame],
     nn_output_mode: str = "per_label",
 ) -> dict[str, np.ndarray]:
     if temporal_model == "lightgbm":
@@ -637,8 +570,6 @@ def predict_temporal_probabilities(
         return predict_frequency_nn_probabilities(
             models, frame, feature_columns, nn_output_mode
         )
-    if temporal_model == "s2p2":
-        return s2p2_model.predict(frame, histories)
     raise ValueError(f"Unknown temporal model: {temporal_model}")
 
 
@@ -713,14 +644,11 @@ def save_models(
     output_dir: Path,
     metadata: dict[str, Any],
     temporal_model: str = "lightgbm",
-    s2p2_model: Any = None,
     nn_output_mode: str = "per_label",
 ) -> None:
     model_dir = output_dir / "models"
     model_dir.mkdir(parents=True, exist_ok=True)
-    if temporal_model == "s2p2":
-        s2p2_model.save(model_dir / "s2p2.pt")
-    elif temporal_model == "frequency_nn":
+    if temporal_model == "frequency_nn":
         import joblib
 
         if nn_output_mode == "multi_label":
@@ -778,16 +706,13 @@ def run_backtest(
     start_cutoff: pd.Timestamp,
     model_params: dict[str, int | float],
     temporal_model: str = "lightgbm",
-    s2p2_params: dict[str, int] | None = None,
-    device_name: str = "auto",
     nn_output_mode: str = "per_label",
-    calibrated_threshold: bool = False,
     train_fraction: float = 1.0,
     seed: int = 42,
     user_embedding: bool = False,
     discard_unused_train: bool = False,
 ) -> None:
-    data, histories, _ = build_training_data(db_dir, start_cutoff)
+    data, _, _ = build_training_data(db_dir, start_cutoff)
     unique_cutoffs = sorted(data["cutoff"].unique())
     cutoffs = [pd.Timestamp(value) for value in unique_cutoffs]
     train_end, calibration_end = chronological_splits(cutoffs)
@@ -815,38 +740,12 @@ def run_backtest(
         f"calibrate < {calibration_end.date()}, holdout >= {calibration_end.date()}"
     )
 
-    s2p2_options = s2p2_params or {}
-    models, s2p2_model = fit_temporal_model(
-        temporal_model,
-        train,
-        histories,
-        feature_columns,
-        model_params,
-        s2p2_options,
-        device_name,
-        nn_output_mode,
-        user_embedding,
+    models = fit_temporal_model(
+        temporal_model, train, feature_columns, model_params, nn_output_mode
     )
-    calibration_probabilities = predict_temporal_probabilities(
-        temporal_model,
-        models,
-        s2p2_model,
-        calibration,
-        feature_columns,
-        histories,
-        nn_output_mode,
-    )
-    thresholds = thresholds_for_predictions(
-        calibration, calibration_probabilities, calibrated_threshold
-    )
+    thresholds = DEFAULT_THRESHOLDS.copy()
     holdout_probabilities = predict_temporal_probabilities(
-        temporal_model,
-        models,
-        s2p2_model,
-        holdout,
-        feature_columns,
-        histories,
-        nn_output_mode,
+        temporal_model, models, holdout, feature_columns, nn_output_mode
     )
     results = evaluate_predictions(holdout, holdout_probabilities, thresholds)
     results["split"] = {
@@ -858,12 +757,10 @@ def run_backtest(
     results["temporal_model"] = temporal_model
     results["train_fraction"] = train_fraction
     results["user_embedding"] = user_embedding
-    results["threshold_mode"] = (
-        "calibrated" if calibrated_threshold else "fixed_default"
-    )
+    results["threshold_mode"] = "fixed_default"
     if temporal_model == "lightgbm":
         results["model_params"] = model_params
-    elif temporal_model == "frequency_nn":
+    else:
         results["model_params"] = {
             "architecture": [
                 len(feature_columns),
@@ -874,11 +771,6 @@ def run_backtest(
             "input_features": "per-action daily frequencies over 7 days only",
             "user_id_used_as_feature": False,
             "max_iter": 100,
-        }
-    else:
-        results["s2p2_params"] = {
-            **s2p2_options,
-            "device": str(s2p2_model.device),
         }
 
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -893,10 +785,7 @@ def run_backtest(
         json.dumps(results, indent=2) + "\n",
         encoding="utf-8",
     )
-    threshold_description = (
-        "calibrated on earlier weeks" if calibrated_threshold else "fixed defaults"
-    )
-    print(f"\nHOLDOUT RESULTS (thresholds: {threshold_description})")
+    print("\nHOLDOUT RESULTS (thresholds: fixed defaults)")
     print(json.dumps(results, indent=2))
     print(f"Saved metrics to {output_dir / 'backtest_metrics.json'}")
     print(f"Saved holdout probabilities to {output_dir / 'holdout_probabilities.csv'}")
@@ -910,10 +799,7 @@ def run_prediction(
     start_cutoff: pd.Timestamp,
     model_params: dict[str, int | float],
     temporal_model: str = "lightgbm",
-    s2p2_params: dict[str, int] | None = None,
-    device_name: str = "auto",
     nn_output_mode: str = "per_label",
-    calibrated_threshold: bool = False,
     train_fraction: float = 1.0,
     seed: int = 42,
     user_embedding: bool = False,
@@ -938,30 +824,10 @@ def run_prediction(
             add_user_feature(frame, user_categories) for frame in (train, calibration)
         )
         feature_columns = [*feature_columns, USER_FEATURE_COLUMN]
-    s2p2_options = s2p2_params or {}
-    models, s2p2_model = fit_temporal_model(
-        temporal_model,
-        train,
-        histories,
-        feature_columns,
-        model_params,
-        s2p2_options,
-        device_name,
-        nn_output_mode,
-        user_embedding,
+    models = fit_temporal_model(
+        temporal_model, train, feature_columns, model_params, nn_output_mode
     )
-    calibration_probabilities = predict_temporal_probabilities(
-        temporal_model,
-        models,
-        s2p2_model,
-        calibration,
-        feature_columns,
-        histories,
-        nn_output_mode,
-    )
-    thresholds = thresholds_for_predictions(
-        calibration, calibration_probabilities, calibrated_threshold
-    )
+    thresholds = DEFAULT_THRESHOLDS.copy()
 
     target_users = pd.read_csv(test_input, dtype={"UserID": "int64"})
     if target_users["UserID"].duplicated().any():
@@ -989,13 +855,7 @@ def run_prediction(
     if user_embedding:
         inference = add_user_feature(inference, user_categories)
     probabilities = predict_temporal_probabilities(
-        temporal_model,
-        models,
-        s2p2_model,
-        inference,
-        feature_columns,
-        histories,
-        nn_output_mode,
+        temporal_model, models, inference, feature_columns, nn_output_mode
     )
     output = pd.DataFrame({USER_COLUMN: target_users[USER_COLUMN]})
     for label in LABELS:
@@ -1011,9 +871,7 @@ def run_prediction(
         probability_output.to_csv(output_dir / "probabilities.csv", index=False)
     metadata = {
         "temporal_model": temporal_model,
-        "threshold_mode": (
-            "calibrated" if calibrated_threshold else "fixed_default"
-        ),
+        "threshold_mode": "fixed_default",
         "prediction_cutoff_utc": str(cutoff),
         "training_start_cutoff_utc": str(start_cutoff),
         "training_weeks": int(train["cutoff"].nunique()),
@@ -1024,7 +882,7 @@ def run_prediction(
     }
     if temporal_model == "lightgbm":
         metadata["model_params"] = model_params
-    elif temporal_model == "frequency_nn":
+    else:
         metadata["model_params"] = {
             "architecture": [
                 len(feature_columns),
@@ -1036,19 +894,8 @@ def run_prediction(
             "user_id_used_as_feature": False,
             "max_iter": 100,
         }
-    else:
-        metadata["s2p2_params"] = {
-            **s2p2_options,
-            "device": str(s2p2_model.device),
-        }
     save_models(
-        models,
-        thresholds,
-        output_dir,
-        metadata,
-        temporal_model,
-        s2p2_model,
-        nn_output_mode,
+        models, thresholds, output_dir, metadata, temporal_model, nn_output_mode
     )
     print(f"Saved predictions for {len(output):,} users to {prediction_path}")
     print(f"Saved model files and thresholds to {output_dir}")
@@ -1069,9 +916,9 @@ def parse_args() -> argparse.Namespace:
         )
         subparser.add_argument(
             "--temporal-model",
-            choices=("lightgbm", "frequency_nn", "s2p2"),
+            choices=("lightgbm", "frequency_nn"),
             default="lightgbm",
-            help="model; S2P2 requires its optional dependencies",
+            help="model",
         )
         subparser.add_argument(
             "--nn-output-mode",
@@ -1079,26 +926,6 @@ def parse_args() -> argparse.Namespace:
             default="per_label",
             help="frequency_nn: use six models or one six-output model",
         )
-        subparser.add_argument(
-            "--calibrated-threshold",
-            "--calibrate-thresholds",
-            dest="calibrated_threshold",
-            action="store_true",
-            help="select per-label thresholds from chronological calibration data",
-        )
-        subparser.add_argument(
-            "--device",
-            choices=("auto", "cpu", "cuda"),
-            default="auto",
-            help="S2P2 device; auto selects the least-loaded CUDA GPU or CPU",
-        )
-        subparser.add_argument("--s2p2-epochs", type=int, default=3)
-        subparser.add_argument("--s2p2-batch-size", type=int, default=128)
-        subparser.add_argument("--s2p2-max-sequence-length", type=int, default=128)
-        subparser.add_argument("--s2p2-hidden-size", type=int, default=32)
-        subparser.add_argument("--s2p2-state-size", type=int, default=8)
-        subparser.add_argument("--s2p2-num-layers", type=int, default=2)
-        subparser.add_argument("--s2p2-integral-samples", type=int, default=8)
         subparser.add_argument(
             "--start-cutoff",
             type=pd.Timestamp,
@@ -1131,9 +958,8 @@ def parse_args() -> argparse.Namespace:
             "--user-embedding",
             action="store_true",
             help=(
-                "give the model the user ID: a categorical feature for lightgbm, a "
-                "one-hot (learned embedding) input for frequency_nn, and a per-user "
-                "logit offset for s2p2; users unseen in training get no user signal"
+                "lightgbm only: give the model the user ID as a categorical feature; "
+                "users unseen in training get no user signal"
             ),
         )
     predict_parser = subparsers.choices["predict"]
@@ -1151,6 +977,8 @@ def main() -> None:
     args = parse_args()
     if args.nn_output_mode != "per_label" and args.temporal_model != "frequency_nn":
         raise ValueError("--nn-output-mode applies only to --temporal-model frequency_nn.")
+    if args.user_embedding and args.temporal_model != "lightgbm":
+        raise ValueError("--user-embedding applies only to --temporal-model lightgbm.")
     if not 0.0 < args.train_fraction <= 1.0:
         raise ValueError("--train-fraction must be in (0, 1].")
     output_dir = args.output_dir or create_run_output_dir(
@@ -1166,15 +994,6 @@ def main() -> None:
         "colsample_bytree": args.colsample_bytree,
         "reg_lambda": args.reg_lambda,
     }
-    s2p2_params = {
-        "epochs": args.s2p2_epochs,
-        "batch_size": args.s2p2_batch_size,
-        "max_sequence_length": args.s2p2_max_sequence_length,
-        "hidden_size": args.s2p2_hidden_size,
-        "state_size": args.s2p2_state_size,
-        "num_layers": args.s2p2_num_layers,
-        "integral_samples": args.s2p2_integral_samples,
-    }
     if args.command == "backtest":
         run_backtest(
             args.db_dir,
@@ -1182,10 +1001,7 @@ def main() -> None:
             args.start_cutoff,
             model_params,
             args.temporal_model,
-            s2p2_params,
-            args.device,
             args.nn_output_mode,
-            args.calibrated_threshold,
             args.train_fraction,
             args.seed,
             args.user_embedding,
@@ -1200,10 +1016,7 @@ def main() -> None:
             args.start_cutoff,
             model_params,
             args.temporal_model,
-            s2p2_params,
-            args.device,
             args.nn_output_mode,
-            args.calibrated_threshold,
             args.train_fraction,
             args.seed,
             args.user_embedding,

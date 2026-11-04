@@ -53,13 +53,15 @@ LABELS = (
 LGBM = ["experiments/lightgbm_baseline/run.py", "backtest"]
 RELGT = ["-m", "experiments.relgt.run", "backtest"]
 CHUNKS = "experiments.relgt_activity_chunks.run"
-LOOKBACK = "experiments.relgt_lookback_chunks.run"
 SPECIALISTS = "experiments.relgt_action_specialists.run"
 GRU = "experiments.gru_relational_ple.run"
 WEEKLY = "experiments.relgt_weekly.run"
 RELATIONAL = ["-m", "experiments.relational_lightgbm.run", "backtest"]
 RELGT_RELATIONAL = ["-m", "experiments.relgt_relational.run", "backtest"]
 RELGRAPH = ["-m", "experiments.relgt_relgraph.run", "backtest", "--select-epoch"]
+DB_RELATIONAL = ["-m", "experiments.relgt_db_relational.run", "backtest"]
+DRIFT = ["-m", "experiments.drift_lightgbm.run", "backtest"]
+ELIG90 = ["--eligibility-days", "90"]
 THRESHOLDS = ["--chunk-thresholds", "20,200"]
 # Never train on less than half the data; the unused half is abandoned, not
 # moved into calibration, so every run calibrates on the same weeks.
@@ -87,33 +89,6 @@ FAST_EPOCH = ["--epochs", "1", "--batch-size", "64"]
 FAST_DB = ["--epochs", "1", "--max-steps-per-epoch", "30"]
 
 EXPERIMENTS: list[Experiment] = [
-    # --- LightGBM / frequency NN / S2P2 temporal baselines -------------------
-    _e("lgbm", "lightgbm", LGBM, description="LightGBM, fixed thresholds"),
-    _e("lgbm_calibrated", "lightgbm", [*LGBM, "--calibrated-threshold"],
-       description="LightGBM, thresholds calibrated per label"),
-    _e("lgbm_user_emb", "lightgbm", [*LGBM, "--user-embedding"],
-       description="LightGBM + user ID categorical"),
-    _e("lgbm_frac50", "lightgbm", [*LGBM, *HALF],
-       description="LightGBM trained on 50% of rows"),
-    _e("freq_nn", "lightgbm", [*LGBM, "--temporal-model", "frequency_nn"],
-       description="Frequency NN, six models"),
-    _e("freq_nn_multilabel", "lightgbm",
-       [*LGBM, "--temporal-model", "frequency_nn", "--nn-output-mode", "multi_label"],
-       description="Frequency NN, one six-output model"),
-    _e("freq_nn_user_emb", "lightgbm",
-       [*LGBM, "--temporal-model", "frequency_nn", "--user-embedding"],
-       description="Frequency NN + one-hot user"),
-    _e("freq_nn_frac50", "lightgbm",
-       [*LGBM, "--temporal-model", "frequency_nn", *HALF],
-       description="Frequency NN on 50% of rows"),
-    _e("s2p2", "lightgbm", [*LGBM, "--temporal-model", "s2p2"], FAST_S2P2,
-       needs="easy_tpp", description="S2P2 point process"),
-    _e("s2p2_user_emb", "lightgbm",
-       [*LGBM, "--temporal-model", "s2p2", "--user-embedding"], FAST_S2P2,
-       needs="easy_tpp", description="S2P2 + per-user logit offset"),
-    _e("s2p2_frac50", "lightgbm",
-       [*LGBM, "--temporal-model", "s2p2", *HALF], FAST_S2P2,
-       needs="easy_tpp", description="S2P2 on 50% of rows"),
     # --- GRU ------------------------------------------------------------------
     _e("gru", "gru", ["-m", GRU], FAST_EPOCH,
        description="GRU + relational attention + PLE"),
@@ -129,16 +104,10 @@ EXPERIMENTS: list[Experiment] = [
        FAST_EPOCH, description="GNN + user embedding"),
     _e("gnn_frac50", "relgt", [*RELGT, "--temporal-model", "gnn", *HALF],
        FAST_EPOCH, description="GNN on 50% of examples"),
-    _e("relgt_ensemble", "relgt", [*RELGT, "--temporal-model", "relgt_ensemble"],
-       FAST_EPOCH, description="RelGT 30/14-day ensemble"),
-    _e("relgt_ensemble_90_14", "relgt",
-       [*RELGT, "--temporal-model", "relgt_ensemble", "--ensemble-lookbacks", "90,14"],
-       FAST_EPOCH, description="RelGT 90/14-day ensemble"),
-    _e("gnn_ensemble", "relgt", [*RELGT, "--temporal-model", "gnn_ensemble"],
-       FAST_EPOCH, description="GNN 30/14-day ensemble"),
-    _e("gnn_ensemble_user_emb", "relgt",
-       [*RELGT, "--temporal-model", "gnn_ensemble", "--user-embedding"],
-       FAST_EPOCH, description="GNN ensemble + user embedding"),
+    _e("relgt_elig90", "relgt", [*RELGT, *ELIG90], FAST_EPOCH,
+       description="RelGT on the official test population (5 events in 90 days)"),
+    _e("gnn_elig90", "relgt", [*RELGT, "--temporal-model", "gnn", *ELIG90], FAST_EPOCH,
+       description="GNN on the official test population (5 events in 90 days)"),
     _e("hybrid_relgt_s2p2", "relgt", [*RELGT, "--temporal-model", "hybrid"],
        [*FAST_EPOCH, *FAST_S2P2], needs="easy_tpp", description="RelGT + S2P2 fusion"),
     _e("relgt_lightgbm", "relgt", [*RELGT, "--temporal-model", "relgt_lightgbm"],
@@ -159,16 +128,6 @@ EXPERIMENTS: list[Experiment] = [
     _e("relgt_db_no_tfs", "relgt_db",
        [*RELGT, "--temporal-model", "relgt_db", "--ablate", "tfs"], FAST_DB,
        description="relgt_db ablation: no column features"),
-    _e("relgt_db_frac50", "relgt_db",
-       [*RELGT, "--temporal-model", "relgt_db", *HALF], FAST_DB,
-       description="relgt_db on 50% of examples"),
-    # --- Action specialists ---------------------------------------------------
-    _e("specialists", "specialists", ["-m", SPECIALISTS], FAST_EPOCH,
-       description="Push / non-push and grouped specialists"),
-    _e("specialists_grouped", "specialists", ["-m", SPECIALISTS, "--variant", "grouped"],
-       FAST_EPOCH, description="Push / PR / issue specialists"),
-    _e("specialists_user_emb", "specialists", ["-m", SPECIALISTS, "--user-embedding"],
-       FAST_EPOCH, description="Specialists + user embedding"),
     # --- Activity chunks ------------------------------------------------------
     _e("chunks", "chunks", ["-m", CHUNKS, *THRESHOLDS], FAST_EPOCH,
        description="GNN per prior-activity chunk + global"),
@@ -180,11 +139,6 @@ EXPERIMENTS: list[Experiment] = [
        FAST_EPOCH, description="Chunk GNNs + user embedding"),
     _e("chunks_frac50", "chunks", ["-m", CHUNKS, *THRESHOLDS, *HALF],
        FAST_EPOCH, description="Chunk GNNs on 50% of training"),
-    _e("lookback_chunks", "chunks", ["-m", LOOKBACK, *THRESHOLDS], FAST_EPOCH,
-       description="Chunk GNNs with per-chunk lookback 180/21/7d"),
-    _e("lookback_chunks_90_30_7", "chunks",
-       ["-m", LOOKBACK, *THRESHOLDS, "--lookbacks", "90,30,7"], FAST_EPOCH,
-       description="Chunk GNNs with lookback 90/30/7d"),
     # --- RelGT on weekly activity vectors ------------------------------------
     _e("relgt_weekly", "weekly", ["-m", WEEKLY], FAST_EPOCH,
        description="RelGT over the last 8 weekly vectors"),
@@ -221,8 +175,9 @@ EXPERIMENTS: list[Experiment] = [
     # --- LightGBM + cross-action relational features -------------------------
     _e("relational_lgbm", "relational", RELATIONAL,
        description="LightGBM + owner/author/reviewer/assignee/sequence features"),
-    _e("relational_lgbm_calibrated", "relational", [*RELATIONAL, "--calibrated-threshold"],
-       description="Relational LightGBM, thresholds calibrated per label"),
+    # --- Drift-robust LightGBM (every variant is a branch) -------------------
+    _e("drift_lgbm", "drift", DRIFT,
+       description="LightGBM + history/regime/coverage features, anomaly masking, recency, refits"),
     _e("relgt_relational", "relational", RELGT_RELATIONAL, FAST_EPOCH,
        description="RelGT + relational features on the root token"),
     _e("gnn_relational", "relational", [*RELGT_RELATIONAL, "--architecture", "gnn"],
@@ -231,6 +186,11 @@ EXPERIMENTS: list[Experiment] = [
        description="RelGT on the graph + typed relationship edges (owner, assignee, people, ...)"),
     _e("gnn_relgraph", "relational", [*RELGRAPH, "--architecture", "gnn"], FAST_EPOCH,
        description="GNN on the graph + typed relationship edges"),
+    _e("relgt_db_relational", "relational", [*DB_RELATIONAL, "--epochs", "10"], FAST_DB,
+       description="relgt_db on the database + relationship tables (owners, notifications, collaborations)"),
+    _e("relgt_db_relational_reserve", "relational",
+       [*DB_RELATIONAL, "--epochs", "10", "--reserve", "32"], FAST_DB,
+       description="relgt_db_relational with 32 tokens reserved for relationship rows"),
 ]
 
 

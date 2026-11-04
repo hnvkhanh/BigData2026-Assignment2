@@ -3,29 +3,19 @@
 # LightGBM (fixed thresholds: 0.30 for all labels except push at 0.45)
 python experiments/lightgbm_baseline/run.py backtest
 
-# Opt in to per-label threshold calibration for LightGBM
-python experiments/lightgbm_baseline/run.py backtest --calibrated-threshold
-
-# S2P2 baseline (requires optional S2P2 dependencies)
-python experiments/lightgbm_baseline/run.py backtest --temporal-model s2p2
-
 # Frequency neural network (six independent models)
 python experiments/lightgbm_baseline/run.py backtest --temporal-model frequency_nn
 
 # Frequency neural network (one six-output model)
 python experiments/lightgbm_baseline/run.py backtest --temporal-model frequency_nn --nn-output-mode multi_label
 
-# Train LightGBM / S2P2 / frequency NN on a random 30% of training rows (seeded by --seed);
+# Train LightGBM / frequency NN on a random 30% of training rows (seeded by --seed);
 # pass --discard-unused-train to drop the unused 70% instead of adding it to calibration. Works for backtest and predict.
 python experiments/lightgbm_baseline/run.py backtest --train-fraction 0.3
-python experiments/lightgbm_baseline/run.py backtest --temporal-model s2p2 --train-fraction 0.3
 python experiments/lightgbm_baseline/run.py backtest --temporal-model frequency_nn --train-fraction 0.3 --seed 7
 
-# Let the baselines see the user ID: categorical feature (lightgbm), one-hot/learned embedding
-# input (frequency_nn), per-user logit offset on top of S2P2 (s2p2). Unseen users get no signal.
+# Let LightGBM see the user ID as a categorical feature. Unseen users get no signal.
 python experiments/lightgbm_baseline/run.py backtest --user-embedding
-python experiments/lightgbm_baseline/run.py backtest --temporal-model frequency_nn --user-embedding
-python experiments/lightgbm_baseline/run.py backtest --temporal-model s2p2 --user-embedding
 python experiments/lightgbm_baseline/run.py predict --user-embedding --train-fraction 0.5
 
 # GRU + relational attention + PLE experiment
@@ -61,16 +51,6 @@ python -m experiments.relgt_activity_chunks.run --no-global-baseline
 # Count only the last 90 days of activity; quick smoke run
 python -m experiments.relgt_activity_chunks.run --activity-window-days 90 --epochs 1 --batch-size 64
 
-# Activity-chunk GNNs with a different graph lookback per chunk (low 180d, mid 21d, high 7d)
-python -m experiments.relgt_lookback_chunks.run --chunk-thresholds 20,200
-
-# Custom lookbacks (LOW,MID,HIGH), reusing cached graphs via a fixed output dir
-python -m experiments.relgt_lookback_chunks.run --chunk-thresholds 20,200 --lookbacks 90,30,7 --output-dir experiments/relgt_lookback_chunks/outputs/run1
-
-# Same options as the chunk experiment: --train-fraction, --balance-chunks, --user-embedding,
-# --no-global-baseline, --global-lookback 14, --inspect-only
-python -m experiments.relgt_lookback_chunks.run --chunk-thresholds 20,200 --train-fraction 0.5 --user-embedding
-
 # Train on only 25% of the training partition (random, seeded by --seed); the unused 75% is added to calibration (or dropped with --discard-unused-train)
 python -m experiments.relgt_activity_chunks.run --chunk-thresholds 20,200 --train-fraction 0.25
 
@@ -90,15 +70,15 @@ python -m experiments.relgt.run backtest
 # Standalone relational GNN experiment
 python -m experiments.relgt.run backtest --temporal-model gnn
 
-# RelGT / GNN with a learned per-user embedding (both architectures and their ensembles;
-# users unseen in training get a zero vector). The LightGBM/S2P2 branches of hybrid modes
-# do not use it.
+# RelGT / GNN with a learned per-user embedding (users unseen in training get a zero vector).
+# The LightGBM/S2P2 branches of hybrid modes do not use it.
 python -m experiments.relgt.run backtest --temporal-model gnn --user-embedding
-python -m experiments.relgt.run backtest --temporal-model gnn_ensemble --user-embedding
 python -m experiments.relgt.run predict --temporal-model gnn --user-embedding
-python -m experiments.relgt.run predict --temporal-model gnn_ensemble --user-embedding
 python -m experiments.relgt.run backtest --user-embedding
-python -m experiments.relgt.run backtest --temporal-model relgt_ensemble --user-embedding
+
+# RelGT / GNN on the official test population (>= 5 events in 90 days instead of 14)
+python -m experiments.relgt.run backtest --eligibility-days 90
+python -m experiments.relgt.run backtest --temporal-model gnn --eligibility-days 90
 
 # Train on only a random fraction of the training examples (seeded by --seed); the unused rest
 # is added to calibration. Works for every relgt backtest/predict mode, including hybrids.
@@ -110,17 +90,10 @@ python -m experiments.relgt.run predict --temporal-model gnn_ensemble --train-fr
 # Combine both
 python -m experiments.relgt.run backtest --temporal-model gnn --train-fraction 0.5 --user-embedding
 
-# Calibrated 30/14-day RelGT ensemble
-python -m experiments.relgt.run backtest --temporal-model relgt_ensemble
-
 # Calibrated 30/14-day GNN ensemble
 python -m experiments.relgt.run backtest --temporal-model gnn_ensemble
 
-# Compare a different pair of windows (also supports 90,30 or 90,14)
-python -m experiments.relgt.run backtest --temporal-model relgt_ensemble --ensemble-lookbacks 90,14
-
 # Set the first lookback model's ensemble weight manually (second gets 1 - weight)
-python -m experiments.relgt.run backtest --temporal-model relgt_ensemble --fusion-weight 0.7
 python -m experiments.relgt.run predict --temporal-model gnn_ensemble --fusion-weight 0.6
 
 # RelGT + S2P2 (requires optional S2P2 dependencies)
@@ -152,9 +125,6 @@ python -m experiments.relgt.run backtest --temporal-model relgt_db --conv-type l
 python -m experiments.relgt.run backtest --temporal-model relgt_db --ablate gnn
 python -m experiments.relgt.run backtest --temporal-model relgt_db --ablate tfs
 
-# relgt_db on a random fraction of the training examples (the rest goes to calibration)
-python -m experiments.relgt.run backtest --temporal-model relgt_db --train-fraction 0.5
-
 # Failure analysis of a relgt_db backtest
 python exam_fail_case.py --run-dir experiments/relgt/outputs/<run-folder> --model-branch relgt_db
 
@@ -168,12 +138,8 @@ python -m experiments.relgt.run predict
 # Generate predictions with the relational GNN
 python -m experiments.relgt.run predict --temporal-model gnn
 
-# Generate predictions with the 30/14-day RelGT or GNN ensemble
-python -m experiments.relgt.run predict --temporal-model relgt_ensemble
+# Generate predictions with the 30/14-day GNN ensemble
 python -m experiments.relgt.run predict --temporal-model gnn_ensemble
-
-# Generate LightGBM predictions with calibrated thresholds
-python experiments/lightgbm_baseline/run.py predict --calibrated-threshold
 
 # LightGBM + cross-action relational features (owner / author / reviewer / assignee / sequence)
 python -m experiments.relational_lightgbm.run backtest
@@ -198,6 +164,20 @@ python -m experiments.relgt_relgraph.run backtest --architecture gnn --select-ep
 python -m experiments.relgt_relgraph.run backtest --architecture gnn --relations none --select-epoch  # control
 python -m experiments.relgt_relgraph.run backtest --relations interacted,review_candidate --select-epoch
 python -m experiments.relgt_relgraph.run predict --architecture gnn --select-epoch
+
+# relgt_db on the database plus relationship tables (RepoOwners, Notifications, Collaborations);
+# --reserve keeps N of the K tokens for relationship rows and the rows they point to
+python -m experiments.relgt_db_relational.run backtest --epochs 10
+python -m experiments.relgt_db_relational.run backtest --epochs 10 --reserve 32
+python -m experiments.relgt_db_relational.run backtest --epochs 10 --tables none  # control (plain relgt_db)
+python -m experiments.relgt_db_relational.run backtest --epochs 10 --tables Notifications --reserve 32
+python -m experiments.relgt_db_relational.run predict --epochs 10 --reserve 32
+
+# Drift-robust LightGBM: all LightGBM improvements as named variants scored under one protocol
+# (validation = calibration weeks, holdout = last 15%); results in outputs/<run>/RESULTS.md
+python -m experiments.drift_lightgbm.run backtest
+python -m experiments.drift_lightgbm.run backtest --variants relational,mask,rolling_half_life_8
+python -m experiments.drift_lightgbm.run predict --variant relational
 
 # Run every experiment and write a ranked comparison (experiments/results/<tag>/RESULTS.md)
 python run_all_experiments.py --list

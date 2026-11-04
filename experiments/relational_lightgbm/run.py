@@ -14,6 +14,7 @@ import pandas as pd
 from experiments.lightgbm_baseline.run import (
     DEFAULT_DB_DIR,
     DEFAULT_PREDICTION_CUTOFF,
+    DEFAULT_THRESHOLDS,
     DEFAULT_START_CUTOFF,
     DEFAULT_TEST_INPUT,
     LABELS,
@@ -25,7 +26,6 @@ from experiments.lightgbm_baseline.run import (
     predict_probabilities,
     row_for_cutoff,
     save_models,
-    thresholds_for_predictions,
     training_data_before,
 )
 from experiments.relational_lightgbm.features import (
@@ -105,7 +105,6 @@ def run_backtest(
     start_cutoff: pd.Timestamp,
     model_params: dict[str, int | float],
     groups: list[str],
-    calibrated_threshold: bool,
 ) -> dict[str, Any]:
     data, _, _, _ = build_examples(db_dir, start_cutoff, groups)
     cutoffs = [pd.Timestamp(value) for value in sorted(data["cutoff"].unique())]
@@ -124,8 +123,7 @@ def run_backtest(
     )
 
     models = fit_models(train, feature_columns, model_params)
-    calibration_probabilities = predict_probabilities(models, calibration, feature_columns)
-    thresholds = thresholds_for_predictions(calibration, calibration_probabilities, calibrated_threshold)
+    thresholds = DEFAULT_THRESHOLDS.copy()
     holdout_probabilities = predict_probabilities(models, holdout, feature_columns)
     results = evaluate_predictions(holdout, holdout_probabilities, thresholds)
     results.update(
@@ -135,7 +133,7 @@ def run_backtest(
             "feature_version": FEATURE_VERSION,
             "relational_groups": groups,
             "relational_features": feature_names(groups),
-            "threshold_mode": "calibrated" if calibrated_threshold else "fixed_default",
+            "threshold_mode": "fixed_default",
             "model_params": model_params,
             "seed": 42,
             "split": {
@@ -185,7 +183,6 @@ def run_prediction(
     start_cutoff: pd.Timestamp,
     model_params: dict[str, int | float],
     groups: list[str],
-    calibrated_threshold: bool,
 ) -> None:
     data, histories, cohort_user_ids, tables = build_examples(db_dir, start_cutoff, groups)
     data = training_data_before(data, cutoff)
@@ -196,8 +193,7 @@ def run_prediction(
     calibration = data.loc[data["cutoff"] >= train_end]
 
     models = fit_models(train, feature_columns, model_params)
-    calibration_probabilities = predict_probabilities(models, calibration, feature_columns)
-    thresholds = thresholds_for_predictions(calibration, calibration_probabilities, calibrated_threshold)
+    thresholds = DEFAULT_THRESHOLDS.copy()
 
     target_users = pd.read_csv(test_input, dtype={USER_COLUMN: "int64"})
     if target_users[USER_COLUMN].duplicated().any():
@@ -235,7 +231,7 @@ def run_prediction(
             "training_start_cutoff_utc": str(start_cutoff),
             "training_weeks": int(train["cutoff"].nunique()),
             "calibration_weeks": int(calibration["cutoff"].nunique()),
-            "threshold_mode": "calibrated" if calibrated_threshold else "fixed_default",
+            "threshold_mode": "fixed_default",
             "relational_groups": groups,
             "feature_columns": feature_columns,
             "model_params": model_params,
@@ -279,8 +275,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             help=f"comma-separated relational feature groups ({', '.join(FEATURE_GROUPS)}) or 'none' "
                  "for the plain LightGBM baseline features; 'hypotheses' = the first six groups (default: all)",
         )
-        sub.add_argument("--calibrated-threshold", action="store_true",
-                         help="select per-label thresholds on calibration weeks instead of fixed defaults")
         sub.add_argument("--n-estimators", type=int, default=300)
         sub.add_argument("--learning-rate", type=float, default=0.03)
         sub.add_argument("--num-leaves", type=int, default=15)
@@ -311,11 +305,10 @@ def main(argv: list[str] | None = None) -> None:
         "reg_lambda": args.reg_lambda,
     }
     if args.command == "backtest":
-        run_backtest(args.db_dir, output_dir, args.start_cutoff, model_params, args.groups,
-                     args.calibrated_threshold)
+        run_backtest(args.db_dir, output_dir, args.start_cutoff, model_params, args.groups)
     else:
         run_prediction(args.db_dir, args.test_input, output_dir, args.cutoff, args.start_cutoff,
-                       model_params, args.groups, args.calibrated_threshold)
+                       model_params, args.groups)
 
 
 if __name__ == "__main__":

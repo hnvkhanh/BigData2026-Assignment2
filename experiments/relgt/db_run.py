@@ -12,9 +12,9 @@ import argparse
 import copy
 import json
 import random
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 import pandas as pd
@@ -31,6 +31,7 @@ from .data import (
 )
 from .database import (
     SECONDS_PER_DAY,
+    RelationalDatabase,
     TableFeatures,
     TemporalGraph,
     build_temporal_graph,
@@ -39,7 +40,7 @@ from .database import (
     timestamp_seconds,
 )
 from .db_model import RelGT
-from .db_sampler import TokenSets, batch_edge_index, sample_tokens
+from .db_sampler import TokenSets, batch_edge_index, sample_seed, sample_tokens
 from .run import (
     _data_signature,
     calculate_metrics,
@@ -79,6 +80,10 @@ class DatabaseContext:
     graph: TemporalGraph
     features: dict[str, TableFeatures]
     num_users: int
+    # Replaces ``sample_seed`` (see ``sample_tokens``); ``signature`` must then
+    # describe it so cached token sets are not reused across samplers.
+    seed_sampler: Callable[..., tuple[np.ndarray, np.ndarray, np.ndarray]] = sample_seed
+    signature: dict[str, Any] = field(default_factory=dict)
 
 
 def eligible_users(
@@ -105,8 +110,10 @@ def eligible_users(
     return np.asarray([uid for uid in user_ids if int(uid) in eligible], dtype=np.int32)
 
 
-def load_database_context(db_dir: Path, text_buckets: int) -> DatabaseContext:
-    database = load_database(db_dir)
+def load_database_context(
+    db_dir: Path, text_buckets: int, database: RelationalDatabase | None = None
+) -> DatabaseContext:
+    database = database or load_database(db_dir)
     features = materialize_features(database, text_buckets)
     graph = build_temporal_graph(database)
     print(
@@ -116,13 +123,14 @@ def load_database_context(db_dir: Path, text_buckets: int) -> DatabaseContext:
     return DatabaseContext(graph, features, len(database.tables["Users"]))
 
 
-def _signature(args: argparse.Namespace) -> dict[str, Any]:
+def _signature(args: argparse.Namespace, context: DatabaseContext) -> dict[str, Any]:
     signature = _data_signature(args.db_dir, args.start_cutoff, LOOKBACK_DAYS, LOOKBACK_DAYS)
     signature.update(
         sampler_version=SAMPLER_VERSION,
         num_neighbors=args.num_neighbors,
         seed=args.seed,
         context_mode=args.context_mode,
+        **context.signature,
     )
     return signature
 
@@ -132,7 +140,7 @@ def load_or_build_db_examples(
 ) -> DatabaseExamples:
     cache_path = args.output_dir / "cache" / f"relgt_db_examples_k{args.num_neighbors}_{args.context_mode}.npz"
     metadata_path = cache_path.with_suffix(".json")
-    signature = _signature(args)
+    signature = _signature(args, context)
     if cache_path.exists() and metadata_path.exists():
         if json.loads(metadata_path.read_text(encoding="utf-8")) == signature:
             with np.load(cache_path, allow_pickle=False) as stored:
@@ -175,6 +183,7 @@ def load_or_build_db_examples(
         args.num_neighbors,
         args.seed,
         args.context_mode,
+        context.seed_sampler,
     )
     examples = DatabaseExamples(user_ids, cutoff_days, np.concatenate(label_batches), tokens)
 
@@ -391,8 +400,8 @@ def save_db_holdout_probabilities(
     output.to_csv(output_path, index=False)
 
 
-def run_db_backtest(args: argparse.Namespace) -> None:
-    context = load_database_context(args.db_dir, args.text_buckets)
+def run_db_backtest(args: argparse.Namespace, context: DatabaseContext | None = None) -> None:
+    context = context or load_database_context(args.db_dir, args.text_buckets)
     examples = load_or_build_db_examples(args, context)
     train_end, calibration_end = chronological_splits(examples.cutoff_days)
     train_indices = np.flatnonzero(examples.cutoff_days < train_end)
@@ -450,6 +459,7 @@ def run_db_backtest(args: argparse.Namespace) -> None:
     results["temporal_model"] = args.temporal_model
     results["experiment"] = args.output_dir.name
     results.update(_settings(args, history))
+    results.update(context.signature)
 
     torch.save(model.state_dict(), args.output_dir / MODEL_FILE)
     holdout_path = args.output_dir / "holdout_probabilities.csv"
@@ -461,8 +471,8 @@ def run_db_backtest(args: argparse.Namespace) -> None:
     print(f"Saved holdout probabilities to {holdout_path}")
 
 
-def run_db_prediction(args: argparse.Namespace) -> None:
-    context = load_database_context(args.db_dir, args.text_buckets)
+def run_db_prediction(args: argparse.Namespace, context: DatabaseContext | None = None) -> None:
+    context = context or load_database_context(args.db_dir, args.text_buckets)
     examples = load_or_build_db_examples(args, context)
     usable_indices = prediction_example_indices(examples.cutoff_days, args.cutoff)
     usable_cutoffs = examples.cutoff_days[usable_indices]
@@ -516,6 +526,7 @@ def run_db_prediction(args: argparse.Namespace) -> None:
         args.num_neighbors,
         args.seed,
         args.context_mode,
+        context.seed_sampler,
     )
     probabilities = predict_db_probabilities(
         model,
@@ -555,6 +566,7 @@ def run_db_prediction(args: argparse.Namespace) -> None:
         "temporal_model": args.temporal_model,
         "experiment": args.output_dir.name,
         **_settings(args, history),
+        **context.signature,
     }
     (args.output_dir / "metadata.json").write_text(
         json.dumps(metadata, indent=2) + "\n", encoding="utf-8"

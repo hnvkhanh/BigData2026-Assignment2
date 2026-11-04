@@ -1202,13 +1202,18 @@ def run_backtest(args: argparse.Namespace) -> None:
 
         run_db_backtest(args)
         return
-    if args.temporal_model in {"relgt_ensemble", "gnn_ensemble"}:
-        architecture = "relgt" if args.temporal_model == "relgt_ensemble" else "gnn"
+    if args.temporal_model == "gnn_ensemble":
+        architecture = "gnn"
         run_lookback_ensemble_backtest(args, architecture)
         return
     if args.temporal_model in {"hybrid", "relgt_lightgbm_s2p2"}:
         require_s2p2_dependency()
-    examples = load_or_build_examples(args.db_dir, args.output_dir, args.start_cutoff)
+    examples = load_or_build_examples(
+        args.db_dir,
+        args.output_dir,
+        args.start_cutoff,
+        eligibility_lookback_days=getattr(args, "eligibility_days", None),
+    )
     train_end, calibration_end = chronological_splits(examples.cutoff_days)
     train_indices = np.flatnonzero(examples.cutoff_days < train_end)
     train_indices, unused_train_indices = subsample_train_indices(train_indices, args)
@@ -1734,13 +1739,18 @@ def run_prediction(args: argparse.Namespace) -> None:
 
         run_db_prediction(args)
         return
-    if args.temporal_model in {"relgt_ensemble", "gnn_ensemble"}:
-        architecture = "relgt" if args.temporal_model == "relgt_ensemble" else "gnn"
+    if args.temporal_model == "gnn_ensemble":
+        architecture = "gnn"
         run_lookback_ensemble_prediction(args, architecture)
         return
     if args.temporal_model in {"hybrid", "relgt_lightgbm_s2p2"}:
         require_s2p2_dependency()
-    examples = load_or_build_examples(args.db_dir, args.output_dir, args.start_cutoff)
+    examples = load_or_build_examples(
+        args.db_dir,
+        args.output_dir,
+        args.start_cutoff,
+        eligibility_lookback_days=getattr(args, "eligibility_days", None),
+    )
     usable_indices = prediction_example_indices(examples.cutoff_days, args.cutoff)
     usable_cutoffs = examples.cutoff_days[usable_indices]
     train_end, _ = chronological_splits(usable_cutoffs)
@@ -2141,6 +2151,15 @@ def add_common_arguments(parser: argparse.ArgumentParser) -> None:
             "absent from the training examples get a zero embedding"
         ),
     )
+    parser.add_argument(
+        "--eligibility-days",
+        type=int,
+        default=None,
+        help=(
+            "keep users with at least 5 events in this many days before each cutoff "
+            "(default: the 14-day graph lookback; 90 matches the official test sample)"
+        ),
+    )
     parser.add_argument("--epochs", type=int, default=5)
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--hidden-dim", type=int, default=64)
@@ -2153,7 +2172,6 @@ def add_common_arguments(parser: argparse.ArgumentParser) -> None:
         choices=[
             "relgt",
             "gnn",
-            "relgt_ensemble",
             "gnn_ensemble",
             "hybrid",
             "relgt_lightgbm",
@@ -2285,7 +2303,6 @@ def parse_args() -> argparse.Namespace:
     if args.min_child_samples < 1:
         parser.error("--min-child-samples must be positive.")
     two_branch_modes = {
-        "relgt_ensemble",
         "gnn_ensemble",
         "hybrid",
         "relgt_lightgbm",
@@ -2306,6 +2323,16 @@ def parse_args() -> argparse.Namespace:
         parser.error("--subsample must be in (0, 1].")
     if not 0.0 < args.colsample_bytree <= 1.0:
         parser.error("--colsample-bytree must be in (0, 1].")
+    if args.user_embedding and args.temporal_model == "gnn_ensemble":
+        parser.error("--user-embedding is not supported by gnn_ensemble.")
+    if args.eligibility_days is not None and args.temporal_model not in {
+        "relgt",
+        "gnn",
+        "hybrid",
+        "relgt_lightgbm",
+        "relgt_lightgbm_s2p2",
+    }:
+        parser.error("--eligibility-days applies to the single-lookback graph modes only.")
     if args.temporal_model == "relgt_db":
         if args.user_embedding:
             parser.error("--user-embedding is not supported by relgt_db.")

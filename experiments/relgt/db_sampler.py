@@ -21,6 +21,7 @@ before the seed time, so future rows and edges never enter a token set.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Callable
 
 import numpy as np
 
@@ -113,18 +114,27 @@ def sample_seed(
     num_tokens: int,
     rng: np.random.Generator,
     context: str = "r2",
+    exclude: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Return global node ids, hops, and local edges for one seed."""
+    """Return global node ids, hops, and local edges for one seed.
+
+    Nodes in ``exclude`` are never sampled (used when some tokens are chosen
+    by another rule).
+    """
     if context not in CONTEXT_MODES:
         raise ValueError(f"context must be one of {CONTEXT_MODES}.")
     one_hop, _ = _neighbors_before(graph, np.array([seed_node]), seed_time)
     one_hop = np.unique(one_hop)
+    if exclude is not None:
+        one_hop = one_hop[~np.isin(one_hop, exclude)]
     if len(one_hop) > MAX_ONE_HOP:
         one_hop = np.sort(rng.choice(one_hop, MAX_ONE_HOP, replace=False))
 
     two_hop, owners = _neighbors_before(graph, one_hop, seed_time)
     two_hop = np.unique(two_hop[_cap_per_owner(owners, MAX_TWO_HOP_PER_NODE, rng)])
     two_hop = two_hop[(two_hop != seed_node) & ~np.isin(two_hop, one_hop)]
+    if exclude is not None:
+        two_hop = two_hop[~np.isin(two_hop, exclude)]
 
     needed = num_tokens - 1
     full_count = len(one_hop) + len(two_hop)  # r2 candidate count
@@ -159,19 +169,22 @@ def sample_seed(
         neighbor_hops = candidate_hops[chosen][order]
     nodes = np.concatenate([[seed_node], neighbors]).astype(np.int64)
     hops = np.concatenate([[0], neighbor_hops]).astype(np.int8)
+    return nodes, hops, local_edges(graph, nodes, seed_time)
 
+
+def local_edges(graph: TemporalGraph, nodes: np.ndarray, seed_time: int) -> np.ndarray:
+    """Edges known before the seed time among ``nodes``, as local token positions."""
     # A repeated node maps to its last token, as in upstream's local_map.
     unique_nodes, last_reversed = np.unique(nodes[::-1], return_index=True)
     position_of = len(nodes) - 1 - last_reversed
     targets, sources = _neighbors_before(graph, unique_nodes, seed_time)
     inside = np.isin(targets, unique_nodes)
-    edges = np.stack(
+    return np.stack(
         [
             position_of[sources[inside]],
             position_of[np.searchsorted(unique_nodes, targets[inside])],
         ]
     ).astype(np.int16)
-    return nodes, hops, edges
 
 
 def sample_tokens(
@@ -181,8 +194,12 @@ def sample_tokens(
     num_tokens: int,
     seed: int,
     context: str = "r2",
+    seed_sampler: Callable[..., tuple[np.ndarray, np.ndarray, np.ndarray]] = sample_seed,
 ) -> TokenSets:
-    """Sample a token set for every (seed node, seed time) pair."""
+    """Sample a token set for every (seed node, seed time) pair.
+
+    ``seed_sampler`` has the signature of ``sample_seed`` and may replace it.
+    """
     if num_tokens < 2:
         raise ValueError("num_tokens must be at least 2.")
     if num_tokens > np.iinfo(np.int16).max:
@@ -200,7 +217,7 @@ def sample_tokens(
         # One generator per (seed node, seed time) keeps samples independent of
         # batching and worker count.
         rng = np.random.default_rng([seed, int(seed_node), int(seed_time)])
-        nodes, sample_hops, edges = sample_seed(
+        nodes, sample_hops, edges = seed_sampler(
             graph, int(seed_node), int(seed_time), num_tokens, rng, context
         )
         types = np.searchsorted(graph.table_offsets, nodes, side="right") - 1

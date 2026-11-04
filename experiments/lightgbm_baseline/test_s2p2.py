@@ -134,7 +134,7 @@ class S2P2SequenceTests(unittest.TestCase):
 
 
 class CliTests(unittest.TestCase):
-    def test_cli_accepts_s2p2_selection(self) -> None:
+    def test_cli_lists_the_supported_models(self) -> None:
         result = subprocess.run(
             [
                 sys.executable,
@@ -146,12 +146,9 @@ class CliTests(unittest.TestCase):
             capture_output=True,
             text=True,
         )
-        self.assertIn(
-            "--temporal-model {lightgbm,frequency_nn,s2p2}", result.stdout
-        )
+        self.assertIn("--temporal-model {lightgbm,frequency_nn}", result.stdout)
         self.assertIn("--nn-output-mode {per_label,multi_label}", result.stdout)
-        self.assertIn("--calibrated-threshold", result.stdout)
-        self.assertIn("--device {auto,cpu,cuda}", result.stdout)
+        self.assertNotIn("--calibrated-threshold", result.stdout)
 
     def test_default_run_directories_are_timestamped_and_unique(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_dir:

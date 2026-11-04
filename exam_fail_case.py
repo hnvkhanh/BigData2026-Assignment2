@@ -795,7 +795,6 @@ def run_lightgbm(
     launch_dashboard: bool = True,
     port: int = 8050,
     export_all: bool = False,
-    calibrated_threshold: bool = False,
 ) -> None:
     data, _, _ = baseline.build_training_data(db_dir, start_cutoff)
     cutoffs = [pd.Timestamp(value) for value in sorted(data["cutoff"].unique())]
@@ -814,17 +813,12 @@ def run_lightgbm(
     )
 
     models = baseline.fit_models(train, feature_columns, model_params)
-    calibration_probabilities = baseline.predict_probabilities(models, calibration, feature_columns)
-    thresholds = baseline.thresholds_for_predictions(
-        calibration, calibration_probabilities, calibrated_threshold
-    )
+    thresholds = baseline.DEFAULT_THRESHOLDS.copy()
     holdout_probabilities = baseline.predict_probabilities(models, holdout, feature_columns)
     metrics = baseline.evaluate_predictions(holdout, holdout_probabilities, thresholds)
     metrics.update({
         "temporal_model": "lightgbm",
-        "threshold_mode": (
-            "calibrated" if calibrated_threshold else "fixed_default"
-        ),
+        "threshold_mode": "fixed_default",
         "model_params": model_params,
         "split": {
             "train_weeks": int(train["cutoff"].nunique()),
@@ -1164,13 +1158,6 @@ def parse_args() -> argparse.Namespace:
                         help="only train and export files, do not start the dashboard")
     parser.add_argument("--export-all", action="store_true",
                         help="also save every holdout case (correct and wrong) to all_cases.csv")
-    parser.add_argument(
-        "--calibrated-threshold",
-        "--calibrate-thresholds",
-        dest="calibrated_threshold",
-        action="store_true",
-        help="select per-label thresholds from chronological calibration data",
-    )
     parser.add_argument("--n-estimators", type=int, default=300)
     parser.add_argument("--learning-rate", type=float, default=0.03)
     parser.add_argument("--num-leaves", type=int, default=15)
@@ -1214,7 +1201,6 @@ def main() -> None:
     run_lightgbm(
         args.db_dir, output_dir, args.start_cutoff, model_params,
         launch_dashboard=not args.no_dashboard, port=args.port, export_all=args.export_all,
-        calibrated_threshold=args.calibrated_threshold,
     )
 
 

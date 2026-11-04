@@ -1,8 +1,7 @@
 # Temporal activity models
 
-This experiment supports LightGBM (the default), a frequency-only neural
-network, and S2P2, the state-space marked temporal point process from UCI
-DataLab's EasyTPP repository. All predict the six weekly activity labels using
+This experiment supports LightGBM (the default) and a frequency-only neural
+network. Both predict the six weekly activity labels using
 historical user-week examples and chronological validation. Historical
 user-week rows are restricted to users with at least five recorded activity
 rows in the preceding 90 days, matching the test-list activity filter. That
@@ -16,32 +15,21 @@ From the repository root:
 python -m pip install -r requirements.txt
 ```
 
-S2P2 is optional; install its pinned upstream implementation only when selecting
-that model:
+`s2p2.py` is the S2P2 adapter (the state-space marked temporal point process
+from UCI DataLab's EasyTPP) used by RelGT's `hybrid` and `relgt_lightgbm_s2p2`
+modes. Its standalone `--temporal-model s2p2` baseline, the frequency NN's
+`--user-embedding` and `--calibrated-threshold` were removed after scoring below
+0.5 (see `experiments/drift_lightgbm/README.md`). Install S2P2 only for those
+RelGT modes:
 
 ```bash
 python -m pip install -r experiments/lightgbm_baseline/s2p2-requirements.txt
 ```
 
-The upstream S2P2 README recommends CPU or CUDA and warns that MPS can produce
-incorrect results. S2P2 therefore uses CPU if CUDA is unavailable; with CUDA it
-reports the available devices and selects the least-utilized GPU (using memory
-use if utilization is unavailable). CPU training uses one PyTorch thread to
-avoid a native CPU crash observed with the upstream scan implementation.
-`--device cpu` and `--device cuda` can override automatic selection.
-
 ## Run a time-based backtest
 
 ```bash
 python experiments/lightgbm_baseline/run.py backtest
-```
-
-Choose S2P2 instead of LightGBM with:
-
-```bash
-python experiments/lightgbm_baseline/run.py backtest \
-  --temporal-model s2p2 --device auto \
-  --s2p2-epochs 3 --output-dir experiments/lightgbm_baseline/outputs/s2p2
 ```
 
 Choose the small neural network with:
@@ -64,8 +52,7 @@ python experiments/lightgbm_baseline/run.py backtest \
 ```
 
 The same option is available for `predict`. Each output value is the
-probability for one activity label; the selected fixed or calibrated
-thresholds turn those probabilities into the six binary predictions. The
+probability for one activity label; the fixed thresholds turn those probabilities into the six binary predictions. The
 single model is saved as `models/frequency_nn_multilabel.joblib`.
 
 The script uses weekly forecast cutoffs beginning on 2026-03-11 16:00 UTC, the
@@ -76,10 +63,11 @@ submission (macro-F1 and micro-F1 over users, averaged into the Score) and the
 reported numbers are the mean over weeks, with the per-week scores in
 `per_week`. It trains on the
 oldest 70% of weeks, reserves the next 15% for calibration, and reports the
-untouched final 15% holdout. By default, decisions use fixed thresholds:
-`0.30` for all labels except `push`, which uses `0.45`. Add
-`--calibrated-threshold` to choose per-label thresholds on the calibration
-weeks instead. Metrics are written to
+untouched final 15% holdout. Decisions use fixed thresholds:
+`0.30` for all labels except `push`, which uses `0.45`. (Per-label F1
+calibration was removed: the calibration weeks fall in the September activity
+surge, so it picked thresholds of 0.05-0.10 and scored 43.4 vs 53.4.) Metrics
+are written to
 `experiments/lightgbm_baseline/outputs/backtest_<model>_<timestamp>/backtest_metrics.json`.
 Each run gets a new timestamped output folder by default. Supply `--output-dir`
 to choose a fixed folder explicitly.
@@ -100,9 +88,6 @@ python experiments/lightgbm_baseline/run.py backtest \
 python experiments/lightgbm_baseline/run.py backtest \
   --num-leaves 31 --min-child-samples 30 --n-estimators 500 \
   --output-dir experiments/lightgbm_baseline/outputs/larger_trees
-
-# Opt in to per-label threshold calibration
-python experiments/lightgbm_baseline/run.py backtest --calibrated-threshold
 ```
 
 Each run writes `backtest_metrics.json`, including the parameters, per-label F1,
@@ -126,8 +111,7 @@ LightGBM backtest. It saves holdout metrics and `failure_cases.csv` under a new
 timestamped folder in `experiments/lightgbm_baseline/outputs/`. The CSV has one
 row per misclassified user-week-label, including actual/predicted values,
 probability, threshold, failure type, user IDs, cutoff, and feature values.
-It uses the default fixed thresholds; pass `--calibrated-threshold` to opt in to
-calibration-based thresholds. Override the output folder or LightGBM parameters
+It uses the default fixed thresholds. Override the output folder or LightGBM parameters
 with the script's CLI flags.
 Failure interpretation is intentionally left as a TODO in the script.
 
@@ -148,9 +132,6 @@ Supported LightGBM options are `--n-estimators`, `--learning-rate`,
 `--num-leaves`, `--min-child-samples`, `--subsample`, `--colsample-bytree`,
 and `--reg-lambda`. The baseline defaults are 300, 0.03, 15, 40, 0.85, 0.85,
 and 2.0 respectively. Row subsampling is enabled with a sampling frequency of 1.
-S2P2 options are `--s2p2-epochs`, `--s2p2-batch-size`,
-`--s2p2-max-sequence-length`, `--s2p2-hidden-size`, `--s2p2-state-size`,
-`--s2p2-num-layers`, and `--s2p2-integral-samples`.
 
 For each historical cutoff, LightGBM receives the total action count across
 the six activity types for the preceding 7 days, each action's share of the
@@ -167,14 +148,6 @@ the prediction cutoff, and exclude events or rows unavailable at that cutoff.
 The frequency-only neural network continues to use only its per-action daily
 frequency inputs.
 
-S2P2 represents each user's six activity types as marked events. It trains on
-historical sequences containing the prior 90-day context and the labeled
-seven-day window. Weekly probabilities are estimated as
-`1 - exp(-integrated mark intensity)` over the seven days starting at the
-forecast cutoff, then per-label thresholds are calibrated on earlier weeks.
-This is a point-process-to-weekly-label approximation; compare its chronological
-holdout results with LightGBM rather than assuming it will perform better.
-
 ## Generate predictions
 
 ```bash
@@ -186,24 +159,10 @@ cutoff of `2026-11-11 16:00:00 UTC`, and writes to a new timestamped folder unde
 `experiments/lightgbm_baseline/outputs/`:
 
 - `predictions.csv`
-- Model files under `models/` (six LightGBM models or S2P2 weights)
+- Model files under `models/` (six LightGBM models)
 - `metadata.json`, including feature names, thresholds, and threshold mode
 
-Prediction uses the same fixed thresholds by default. Add
-`--calibrated-threshold` to calibrate thresholds from the earlier validation
-weeks, for example:
-
-```bash
-python experiments/lightgbm_baseline/run.py predict --calibrated-threshold
-```
-
-To generate predictions with S2P2, use `--temporal-model s2p2`, for example:
-
-```bash
-python experiments/lightgbm_baseline/run.py predict \
-  --temporal-model s2p2 --device auto \
-  --output-dir experiments/lightgbm_baseline/outputs/s2p2_prediction
-```
+Prediction uses the same fixed thresholds.
 
 To generate neural-network predictions and probabilities:
 
@@ -218,9 +177,6 @@ This writes evaluator-format binary labels to `predictions.csv` and per-label
 probabilities to `probabilities.csv`. The six trained models are saved as
 `models/<label>.joblib`; multi-label mode saves one
 `models/frequency_nn_multilabel.joblib` model instead.
-
-For S2P2, the model file is `models/s2p2.pt`. The default LightGBM model choice
-remains unchanged.
 
 Override data, dates, input users, or output location with flags:
 
@@ -263,10 +219,7 @@ python assignment2/evaluation/evaluate.py \
   against the latest data release available before that target window.
 - Generated outputs are ignored by Git so experiments do not clutter the source
   tree. Each default run gets its own timestamped folder; provide a distinct
-  `--output-dir` to choose output paths explicitly. The
-  upstream S2P2 implementation is available at
-  https://github.com/UCIDataLab/state_space_point_process and is pinned in the
-  optional requirements file.
+  `--output-dir` to choose output paths explicitly.
 
 `run_all_experiments.py` never trains on less than 50% of the data and always passes
 `--discard-unused-train`, so the unused rows are dropped rather than added to calibration.

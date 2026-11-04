@@ -21,28 +21,16 @@ from experiments.lightgbm_baseline.run import (
     row_for_cutoff,
     save_models,
     training_data_before,
-    thresholds_for_predictions,
 )
 
 
 class LifecycleFeatureTests(unittest.TestCase):
-    def test_fixed_thresholds_are_defaults_and_calibration_is_opt_in(self) -> None:
-        calibration = pd.DataFrame(
-            {label: [0, 1, 0, 1] for label in LABELS}
+    def test_fixed_thresholds_are_the_defaults(self) -> None:
+        self.assertEqual(set(DEFAULT_THRESHOLDS), set(LABELS))
+        self.assertEqual(DEFAULT_THRESHOLDS["push"], 0.45)
+        self.assertTrue(
+            all(DEFAULT_THRESHOLDS[label] == 0.30 for label in LABELS if label != "push")
         )
-        probabilities = {
-            label: pd.Series([0.01, 0.99, 0.02, 0.98]).to_numpy()
-            for label in LABELS
-        }
-
-        fixed = thresholds_for_predictions(calibration, probabilities, False)
-        calibrated = thresholds_for_predictions(calibration, probabilities, True)
-
-        self.assertEqual(fixed, DEFAULT_THRESHOLDS)
-        self.assertEqual(fixed["push"], 0.45)
-        self.assertTrue(all(fixed[label] == 0.30 for label in LABELS if label != "push"))
-        self.assertEqual(set(calibrated), set(LABELS))
-        self.assertNotEqual(calibrated, fixed)
 
     def test_frequency_nn_uses_only_frequency_inputs_and_returns_probabilities(self) -> None:
         feature_columns = [

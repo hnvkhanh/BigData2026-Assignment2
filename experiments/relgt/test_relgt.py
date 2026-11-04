@@ -230,7 +230,7 @@ class HybridFusionTests(unittest.TestCase):
                 "run.py",
                 "backtest",
                 "--temporal-model",
-                "relgt_ensemble",
+                "gnn_ensemble",
                 "--fusion-weight",
                 "0.7",
             ],
