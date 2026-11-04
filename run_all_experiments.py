@@ -11,8 +11,8 @@ Examples (from the repository root):
     python run_all_experiments.py --list
     python run_all_experiments.py --dry-run
     python run_all_experiments.py --quick --tag smoke          # 1 epoch each
-    python run_all_experiments.py --group lightgbm --group relgt
-    python run_all_experiments.py --only gnn --skip ensemble
+    python run_all_experiments.py --group relgt --group chunks
+    python run_all_experiments.py --only gnn --skip frac50
     python run_all_experiments.py --tag full                   # everything
     python run_all_experiments.py --tag full --report-only     # rebuild report
 
@@ -50,10 +50,8 @@ LABELS = (
     "push",
 )
 
-LGBM = ["experiments/lightgbm_baseline/run.py", "backtest"]
 RELGT = ["-m", "experiments.relgt.run", "backtest"]
 CHUNKS = "experiments.relgt_activity_chunks.run"
-SPECIALISTS = "experiments.relgt_action_specialists.run"
 GRU = "experiments.gru_relational_ple.run"
 WEEKLY = "experiments.relgt_weekly.run"
 RELATIONAL = ["-m", "experiments.relational_lightgbm.run", "backtest"]
@@ -61,6 +59,9 @@ RELGT_RELATIONAL = ["-m", "experiments.relgt_relational.run", "backtest"]
 RELGRAPH = ["-m", "experiments.relgt_relgraph.run", "backtest", "--select-epoch"]
 DB_RELATIONAL = ["-m", "experiments.relgt_db_relational.run", "backtest"]
 DRIFT = ["-m", "experiments.drift_lightgbm.run", "backtest"]
+NO_SUMMER = ["-m", "experiments.gnn_no_summer.run", "backtest"]
+SEQUENCE = ["-m", "experiments.sequence_forecasters.run", "backtest"]
+RT = ["-m", "experiments.relational_transformer.run", "backtest"]
 ELIG90 = ["--eligibility-days", "90"]
 THRESHOLDS = ["--chunk-thresholds", "20,200"]
 # Never train on less than half the data; the unused half is abandoned, not
@@ -83,10 +84,10 @@ def _e(name, group, command, quick=(), needs=None, description=""):
     return Experiment(name, group, list(command), list(quick), needs, description)
 
 
-FAST_LGBM: list[str] = []
 FAST_S2P2 = ["--s2p2-epochs", "1"]
 FAST_EPOCH = ["--epochs", "1", "--batch-size", "64"]
 FAST_DB = ["--epochs", "1", "--max-steps-per-epoch", "30"]
+FAST_SEQUENCE = ["--epochs", "1"]
 
 EXPERIMENTS: list[Experiment] = [
     # --- GRU ------------------------------------------------------------------
@@ -104,6 +105,17 @@ EXPERIMENTS: list[Experiment] = [
        FAST_EPOCH, description="GNN + user embedding"),
     _e("gnn_frac50", "relgt", [*RELGT, "--temporal-model", "gnn", *HALF],
        FAST_EPOCH, description="GNN on 50% of examples"),
+    _e("gnn_no_summer", "relgt", [*NO_SUMMER], FAST_EPOCH,
+       description="GNN trained without Jun-Aug label weeks"),
+    _e("gnn_no_summer_jul_aug", "relgt", [*NO_SUMMER, "--summer-months", "7,8"],
+       FAST_EPOCH, description="GNN trained without Jul-Aug label weeks"),
+    _e("gnn_no_summer_cal_sep", "relgt", [*NO_SUMMER, "--calibration-months", "9"],
+       FAST_EPOCH, description="GNN without Jun-Aug, thresholds calibrated on September"),
+    _e("gnn_september", "relgt", ["-m", "experiments.gnn_september.run", "backtest"],
+       FAST_EPOCH, description="GNN trained only on September weeks"),
+    _e("gnn_september_ensemble", "relgt",
+       ["-m", "experiments.gnn_september_ensemble.run", "backtest"], FAST_EPOCH,
+       description="Ensemble: GNN on all weeks + GNN on September only"),
     _e("relgt_elig90", "relgt", [*RELGT, *ELIG90], FAST_EPOCH,
        description="RelGT on the official test population (5 events in 90 days)"),
     _e("gnn_elig90", "relgt", [*RELGT, "--temporal-model", "gnn", *ELIG90], FAST_EPOCH,
@@ -128,6 +140,21 @@ EXPERIMENTS: list[Experiment] = [
     _e("relgt_db_no_tfs", "relgt_db",
        [*RELGT, "--temporal-model", "relgt_db", "--ablate", "tfs"], FAST_DB,
        description="relgt_db ablation: no column features"),
+    # --- Relational Transformer (stanford-star) on the relational database --
+    _e("relational_transformer", "relational_transformer", RT, FAST_DB,
+       description="Relational Transformer: cell tokens, column/feature/neighbor attention"),
+    _e("relational_transformer_no_history", "relational_transformer",
+       [*RT, "--history-weeks", "0"], FAST_DB,
+       description="Relational Transformer ablation: no in-context history weeks"),
+    _e("relational_transformer_mtp", "relational_transformer",
+       [*RT, "--mtp-weight", "0.1"], FAST_DB,
+       description="Relational Transformer + masked-token auxiliary loss"),
+    # --- DM2026 sequence forecasters (LSTM / Informer / FEDformer) -------------
+    _e("sequence_forecasters", "sequence", [*SEQUENCE], FAST_SEQUENCE,
+       description="LSTM + Informer + FEDformer on 91-day activity, calibrated blend"),
+    _e("sequence_forecasters_dm2026_blend", "sequence",
+       [*SEQUENCE, "--fusion-weights", "lstm=0.4,informer=0.2,fedformer=0.4"], FAST_SEQUENCE,
+       description="Sequence forecasters with DM2026's fixed 0.4/0.2/0.4 blend"),
     # --- Activity chunks ------------------------------------------------------
     _e("chunks", "chunks", ["-m", CHUNKS, *THRESHOLDS], FAST_EPOCH,
        description="GNN per prior-activity chunk + global"),
@@ -367,7 +394,7 @@ def write_report(tag_dir: Path, rows: list[dict], args: argparse.Namespace) -> N
         "All numbers are percentages on the chronological holdout weeks. Each holdout week "
         "is scored as its own submission with `assignment2/evaluation/evaluate.py` "
         "(Score = (macro-F1 + micro-F1) / 2) and averaged over weeks. Rows with a "
-        "branch are sub-models reported by multi-model experiments (chunks, specialists).",
+        "branch are sub-models reported by multi-model experiments (chunks, drift).",
         "",
         "## Ranking",
         "",

@@ -54,8 +54,9 @@ constructs 14 days of data.
 
 Use weekly cutoffs in time order; never randomly split user-week rows across
 time. Unless there is a specific justified design, follow the repository's
-chronological split convention: oldest 70% of cutoffs for training, next 15%
-for calibration, and latest 15% for holdout. Keep all users for a cutoff in
+chronological split convention: the latest cutoff week for holdout (the task predicts
+a single week), the week before it for calibration, and every earlier week for
+training. Keep all users for a cutoff in
 the same temporal partition.
 
 - Fit model parameters only on the training partition.

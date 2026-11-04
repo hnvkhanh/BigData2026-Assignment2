@@ -1,7 +1,7 @@
 """Measure how strongly candidate relationships predict next-week actions.
 
-Uses only the training weeks of the chronological split (the oldest 70% of
-weekly cutoffs), so exploring never looks at calibration or holdout weeks.
+Uses only the training weeks of the chronological split (all weekly cutoffs
+before the calibration and holdout weeks), so exploring never looks at calibration or holdout weeks.
 For every relational feature and every label it reports:
 
 - ``lift``: P(label | feature > 0) / P(label | feature = 0);

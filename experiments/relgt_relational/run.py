@@ -377,7 +377,7 @@ def run_prediction(args: argparse.Namespace) -> None:
     examples = load_or_build_examples(args.db_dir, output_dir, args.start_cutoff)
     raw = load_or_build_root_features(args.db_dir, output_dir, examples, args.start_cutoff, args.groups)
     usable = prediction_example_indices(examples.cutoff_days, args.cutoff)
-    train_end, _ = chronological_splits(examples.cutoff_days[usable])
+    train_end, _ = chronological_splits(examples.cutoff_days[usable], holdout=False)
     train = usable[examples.cutoff_days[usable] < train_end]
     calibration = usable[examples.cutoff_days[usable] >= train_end]
     if not len(train) or not len(calibration):

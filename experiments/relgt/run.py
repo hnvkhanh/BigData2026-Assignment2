@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import importlib
 import json
 import os
@@ -22,6 +23,7 @@ import torch
 from sklearn.metrics import f1_score
 
 from .data import (
+    ALL_USERS,
     HORIZON_DAYS,
     LABELS,
     LOOKBACK_DAYS,
@@ -217,30 +219,39 @@ def load_or_build_examples(
     start_cutoff: pd.Timestamp,
     lookback_days: int = LOOKBACK_DAYS,
     eligibility_lookback_days: int | None = None,
+    user_ids: np.ndarray | None = None,
 ) -> TrainingExamples:
+    """Load cached weekly examples or build them; ``user_ids`` limits the users."""
     if lookback_days < 1:
         raise ValueError("lookback_days must be positive.")
     if eligibility_lookback_days is None:
         eligibility_lookback_days = lookback_days
-    if eligibility_lookback_days < lookback_days:
+    if ALL_USERS < eligibility_lookback_days < lookback_days or eligibility_lookback_days < 0:
         raise ValueError(
-            "eligibility_lookback_days must be at least lookback_days."
+            "eligibility_lookback_days must be ALL_USERS (0) or at least lookback_days."
         )
     if (
         lookback_days == LOOKBACK_DAYS
         and eligibility_lookback_days == LOOKBACK_DAYS
     ):
         cache_name = "weekly_graph_examples.npz"
+    elif eligibility_lookback_days == ALL_USERS:
+        cache_name = f"weekly_graph_examples_{lookback_days}d_all_users.npz"
     else:
         cache_name = (
             f"weekly_graph_examples_{lookback_days}d_"
             f"eligible_{eligibility_lookback_days}d.npz"
         )
-    cache_path = output_dir / "cache" / cache_name
-    metadata_path = cache_path.with_suffix(".json")
     signature = _data_signature(
         db_dir, start_cutoff, lookback_days, eligibility_lookback_days
     )
+    if user_ids is not None:
+        user_ids = np.unique(np.asarray(user_ids, dtype=np.int32))
+        cache_name = cache_name.replace(".npz", "_selected_users.npz")
+        signature["user_ids_sha1"] = hashlib.sha1(user_ids.tobytes()).hexdigest()
+        signature["num_user_ids"] = int(len(user_ids))
+    cache_path = output_dir / "cache" / cache_name
+    metadata_path = cache_path.with_suffix(".json")
 
     if cache_path.exists() and metadata_path.exists():
         metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
@@ -271,6 +282,7 @@ def load_or_build_examples(
         vocabulary,
         lookback_days=lookback_days,
         eligibility_lookback_days=eligibility_lookback_days,
+        user_ids=user_ids,
     )
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     temporary_path = cache_path.with_suffix(".tmp.npz")
@@ -293,14 +305,56 @@ def load_or_build_examples(
     return examples
 
 
-def chronological_splits(cutoff_days: np.ndarray) -> tuple[int, int]:
+def eligibility_description(
+    eligibility_days: int | None,
+    test_users: bool = False,
+    lookback_days: int = LOOKBACK_DAYS,
+) -> str:
+    """Which users become examples at each cutoff, for run metadata."""
+    users = "test_input.csv users" if test_users else "cohort users"
+    if eligibility_days == ALL_USERS:
+        return f"all {users} (no activity filter)"
+    days = lookback_days if eligibility_days is None else eligibility_days
+    return f"{users} with >= 5 cutoff-safe actions in the {days} days before the cutoff"
+
+
+def load_test_user_ids(db_dir: Path, test_input: Path) -> np.ndarray:
+    """Map ``test_input.csv`` GitHub ``UserID``s to cohort ``Users`` rows."""
+    target_users = pd.read_csv(test_input, dtype={"UserID": "int64"})
+    if target_users["UserID"].duplicated().any():
+        raise ValueError(f"{test_input} contains duplicate UserIDs.")
+    users = pd.read_parquet(
+        db_dir / "Users.parquet", columns=["user_id", "github_user_id", "is_cohort"]
+    )
+    user_lookup = users.loc[users["is_cohort"]].set_index("github_user_id")["user_id"]
+    mapped_ids = target_users["UserID"].map(user_lookup)
+    if mapped_ids.isna().any():
+        raise ValueError(
+            f"{int(mapped_ids.isna().sum())} test UserID(s) are not in the cohort "
+            "for this data release."
+        )
+    return mapped_ids.to_numpy(dtype=np.int32)
+
+
+def example_user_ids(args: argparse.Namespace) -> np.ndarray | None:
+    """Users to build examples for: the test users with ``--test-users``, else everyone."""
+    if not getattr(args, "test_users", False):
+        return None
+    return load_test_user_ids(args.db_dir, args.test_input)
+
+
+def chronological_splits(cutoff_days: np.ndarray, holdout: bool = True) -> tuple[int, int]:
+    """Return ``(train_end, calibration_end)`` days: one calibration week, one holdout week.
+
+    The latest cutoff is the holdout and the one before it is calibration; every
+    earlier week trains. With ``holdout=False`` (prediction runs) the latest
+    cutoff is the calibration week instead.
+    """
     unique_cutoffs = np.unique(cutoff_days)
     if len(unique_cutoffs) < 10:
         raise ValueError("At least 10 weekly cutoffs are needed for chronological splits.")
-    train_end_index = max(1, int(len(unique_cutoffs) * 0.70))
-    calibration_end_index = max(train_end_index + 1, int(len(unique_cutoffs) * 0.85))
-    if calibration_end_index >= len(unique_cutoffs):
-        calibration_end_index = len(unique_cutoffs) - 1
+    calibration_end_index = len(unique_cutoffs) - 1
+    train_end_index = calibration_end_index - 1 if holdout else calibration_end_index
     return (
         int(unique_cutoffs[train_end_index]),
         int(unique_cutoffs[calibration_end_index]),
@@ -412,6 +466,7 @@ def fit_model(
     seed: int,
     architecture: str = "relgt",
     user_embedding: bool = False,
+    learning_rate: float = 1e-3,
 ) -> RelGTInspired | RelationalGNN:
     torch.manual_seed(seed)
     np.random.seed(seed)
@@ -426,7 +481,7 @@ def fit_model(
         np.unique(examples.tokens.user_ids[train_indices]) if user_embedding else None,
     )
     model.to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=1e-4)
     criterion = torch.nn.BCEWithLogitsLoss()
     targets = examples.labels
 
@@ -1212,7 +1267,9 @@ def run_backtest(args: argparse.Namespace) -> None:
         args.db_dir,
         args.output_dir,
         args.start_cutoff,
+        lookback_days=getattr(args, "lookback_days", LOOKBACK_DAYS),
         eligibility_lookback_days=getattr(args, "eligibility_days", None),
+        user_ids=example_user_ids(args),
     )
     train_end, calibration_end = chronological_splits(examples.cutoff_days)
     train_indices = np.flatnonzero(examples.cutoff_days < train_end)
@@ -1498,6 +1555,17 @@ def run_backtest(args: argparse.Namespace) -> None:
     results["device"] = str(device)
     results["temporal_model"] = args.temporal_model
     results["epochs"] = args.epochs
+    results["lookback_days"] = getattr(args, "lookback_days", LOOKBACK_DAYS)
+    results["eligibility"] = eligibility_description(
+        getattr(args, "eligibility_days", None),
+        getattr(args, "test_users", False),
+        getattr(args, "lookback_days", LOOKBACK_DAYS),
+    )
+    results["split"].update(
+        train_examples=int(len(train_indices)),
+        calibration_examples=int(len(calibration_indices)),
+        holdout_examples=int(len(holdout_indices)),
+    )
     results["experiment"] = args.output_dir.name
     results["architecture"] = (
         "Relation-aware message passing over sampled user ego graphs"
@@ -1580,7 +1648,7 @@ def run_lookback_ensemble_prediction(
 
     usable_indices = prediction_example_indices(reference.cutoff_days, args.cutoff)
     usable_cutoffs = reference.cutoff_days[usable_indices]
-    train_end, _ = chronological_splits(usable_cutoffs)
+    train_end, _ = chronological_splits(usable_cutoffs, holdout=False)
     train_indices = usable_indices[usable_cutoffs < train_end]
     train_indices, unused_train_indices = subsample_train_indices(train_indices, args)
     calibration_indices = usable_indices[usable_cutoffs >= train_end]
@@ -1749,11 +1817,13 @@ def run_prediction(args: argparse.Namespace) -> None:
         args.db_dir,
         args.output_dir,
         args.start_cutoff,
+        lookback_days=getattr(args, "lookback_days", LOOKBACK_DAYS),
         eligibility_lookback_days=getattr(args, "eligibility_days", None),
+        user_ids=example_user_ids(args),
     )
     usable_indices = prediction_example_indices(examples.cutoff_days, args.cutoff)
     usable_cutoffs = examples.cutoff_days[usable_indices]
-    train_end, _ = chronological_splits(usable_cutoffs)
+    train_end, _ = chronological_splits(usable_cutoffs, holdout=False)
     train_indices = usable_indices[usable_cutoffs < train_end]
     train_indices, unused_train_indices = subsample_train_indices(train_indices, args)
     calibration_indices = usable_indices[usable_cutoffs >= train_end]
@@ -1888,7 +1958,13 @@ def run_prediction(args: argparse.Namespace) -> None:
     events = load_events(
         args.db_dir, cohort_users["user_id"].astype(int).tolist(), vocabulary
     )
-    inference_tokens = snapshot_tokens(events, args.cutoff, internal_ids, vocabulary)
+    inference_tokens = snapshot_tokens(
+        events,
+        args.cutoff,
+        internal_ids,
+        vocabulary,
+        lookback_days=getattr(args, "lookback_days", LOOKBACK_DAYS),
+    )
     row_indices = np.arange(len(internal_ids), dtype=np.int64)
     graph_probabilities = predict_probabilities(
         model, inference_tokens, row_indices, device, args.batch_size
@@ -2051,6 +2127,12 @@ def run_prediction(args: argparse.Namespace) -> None:
         "temporal_model": args.temporal_model,
         "experiment": args.output_dir.name,
         "epochs": args.epochs,
+        "lookback_days": getattr(args, "lookback_days", LOOKBACK_DAYS),
+        "eligibility": eligibility_description(
+            getattr(args, "eligibility_days", None),
+        getattr(args, "test_users", False),
+        getattr(args, "lookback_days", LOOKBACK_DAYS),
+        ),
         "train_fraction": getattr(args, "train_fraction", 1.0),
         "discard_unused_train": getattr(args, "discard_unused_train", False),
         "batch_size": args.batch_size,
@@ -2157,7 +2239,8 @@ def add_common_arguments(parser: argparse.ArgumentParser) -> None:
         default=None,
         help=(
             "keep users with at least 5 events in this many days before each cutoff "
-            "(default: the 14-day graph lookback; 90 matches the official test sample)"
+            "(default: the 14-day graph lookback; 90 matches the official test sample; "
+            "0 keeps every cohort user, including inactive ones)"
         ),
     )
     parser.add_argument("--epochs", type=int, default=5)
@@ -2278,7 +2361,26 @@ def parse_args() -> argparse.Namespace:
     add_common_arguments(backtest_parser)
     predict_parser = subparsers.add_parser("predict")
     add_common_arguments(predict_parser)
-    predict_parser.add_argument("--test-input", type=Path, default=DEFAULT_TEST_INPUT)
+    for command_parser in (backtest_parser, predict_parser):
+        command_parser.add_argument(
+            "--lookback-days",
+            type=int,
+            default=LOOKBACK_DAYS,
+            help=(
+                f"days of history in each user's graph (default: {LOOKBACK_DAYS}); "
+                "single-lookback graph modes only, *_ensemble modes use --ensemble-lookbacks"
+            ),
+        )
+        command_parser.add_argument("--test-input", type=Path, default=DEFAULT_TEST_INPUT)
+        command_parser.add_argument(
+            "--test-users",
+            action="store_true",
+            help=(
+                "build training, calibration and holdout examples only for the users in "
+                "--test-input, at every cutoff and with no activity filter (unless "
+                "--eligibility-days is given)"
+            ),
+        )
     predict_parser.add_argument(
         "--cutoff",
         type=pd.Timestamp,
@@ -2333,6 +2435,39 @@ def parse_args() -> argparse.Namespace:
         "relgt_lightgbm_s2p2",
     }:
         parser.error("--eligibility-days applies to the single-lookback graph modes only.")
+    if args.lookback_days < 1:
+        parser.error("--lookback-days must be positive.")
+    if args.lookback_days != LOOKBACK_DAYS and args.temporal_model not in {
+        "relgt",
+        "gnn",
+        "hybrid",
+        "relgt_lightgbm",
+        "relgt_lightgbm_s2p2",
+    }:
+        parser.error(
+            "--lookback-days applies to the single-lookback graph modes only "
+            "(use --ensemble-lookbacks for *_ensemble)."
+        )
+    if args.eligibility_days is not None and not (
+        args.eligibility_days == ALL_USERS or args.eligibility_days >= args.lookback_days
+    ):
+        parser.error(
+            "--eligibility-days must be 0 (all cohort users) or at least "
+            f"--lookback-days ({args.lookback_days})."
+        )
+    if args.test_users:
+        if args.temporal_model not in {
+            "relgt",
+            "gnn",
+            "hybrid",
+            "relgt_lightgbm",
+            "relgt_lightgbm_s2p2",
+        }:
+            parser.error("--test-users applies to the single-lookback graph modes only.")
+        if not args.test_input.is_file():
+            parser.error(f"--test-input does not exist: {args.test_input}")
+        if args.eligibility_days is None:
+            args.eligibility_days = ALL_USERS
     if args.temporal_model == "relgt_db":
         if args.user_embedding:
             parser.error("--user-embedding is not supported by relgt_db.")

@@ -8,7 +8,7 @@ window, recency weights, anomaly masking, refitting, seeds, thresholds or a
 simulated push ingestion lag) and is scored twice:
 
 * validation: fit on the training weeks, score the calibration weeks;
-* holdout: score the last 15% of weeks with the variant's fitting scheme.
+* holdout: score the last week with the variant's fitting scheme.
 
 Variants are chosen on validation; holdout is reported for confirmation, both
 over all holdout weeks (official score) and as a "masked" score that drops,
@@ -605,7 +605,7 @@ def run_prediction(
     thresholds = DEFAULT_THRESHOLDS.copy()
     if variant.thresholds == "joint":
         cutoffs = sorted(data.loc[data["cutoff"] + WEEK <= cutoff, "cutoff"].unique())
-        validation_start, _ = chronological_splits([pd.Timestamp(c) for c in cutoffs])
+        validation_start, _ = chronological_splits([pd.Timestamp(c) for c in cutoffs], holdout=False)
         validation = data.loc[
             (data["cutoff"] >= validation_start) & (data["cutoff"] + WEEK <= cutoff)
         ].reset_index(drop=True)

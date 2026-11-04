@@ -468,6 +468,9 @@ model is run on the same population:
 ```bash
 python -m experiments.relgt.run backtest --eligibility-days 90
 python -m experiments.relgt.run backtest --temporal-model gnn --eligibility-days 90
+python -m experiments.relgt.run backtest --temporal-model gnn --eligibility-days 0   # every cohort user, no activity filter
+python -m experiments.relgt.run backtest --temporal-model gnn --test-users          # only test_input.csv users, every week
+python -m experiments.relgt.run backtest --temporal-model gnn --lookback-days 30     # 30 days of graph history (default 14)
 ```
 
 On that population (data release with pushes up to 2026-10-26) RelGT scores

@@ -3,6 +3,12 @@
 # LightGBM (fixed thresholds: 0.30 for all labels except push at 0.45)
 python experiments/lightgbm_baseline/run.py backtest
 
+# By default LightGBM / frequency NN train and test only on the users in
+# assignment2/evaluation/test_input.csv (--test-input to change the file).
+# Use --train-users cohort to train on every cohort user instead. Works for backtest and predict.
+python experiments/lightgbm_baseline/run.py backtest --train-users cohort
+python experiments/lightgbm_baseline/run.py predict --temporal-model frequency_nn --train-users cohort
+
 # Frequency neural network (six independent models)
 python experiments/lightgbm_baseline/run.py backtest --temporal-model frequency_nn
 
@@ -70,6 +76,35 @@ python -m experiments.relgt.run backtest
 # Standalone relational GNN experiment
 python -m experiments.relgt.run backtest --temporal-model gnn
 
+# Relational GNN trained without summer weeks (label window touching Jun-Aug).
+# Calibration/holdout are unchanged; --summer-months none is the unfiltered control.
+python -m experiments.gnn_no_summer.run backtest
+python -m experiments.gnn_no_summer.run backtest --summer-months 7,8
+python -m experiments.gnn_no_summer.run backtest --summer-months none
+python -m experiments.gnn_no_summer.run predict
+# Calibrate thresholds on chosen months (weeks whose cutoff is in them) instead of the last week
+python -m experiments.gnn_no_summer.run backtest --calibration-months 9
+python -m experiments.gnn_no_summer.run predict --calibration-months 9,10
+
+# Relational GNN trained only on September weeks (cutoff in September); calibration/holdout unchanged
+python -m experiments.gnn_september.run backtest
+python -m experiments.gnn_september.run backtest --train-months 9,10
+python -m experiments.gnn_september.run predict
+
+# Ensemble: GNN on all weeks + GNN on September only; weight w*p_all + (1-w)*p_sep picked on calibration
+python -m experiments.gnn_september_ensemble.run backtest
+python -m experiments.gnn_september_ensemble.run backtest --fusion-weight 0.5
+python -m experiments.gnn_september_ensemble.run predict
+
+# DM2026-Final sequence forecasters (LSTM / Informer / FEDformer) on 91-day daily activity;
+# blend weights and thresholds picked on calibration
+python -m experiments.sequence_forecasters.run backtest
+python -m experiments.sequence_forecasters.run backtest --epochs 1
+python -m experiments.sequence_forecasters.run backtest --fusion-weights lstm=0.4,informer=0.2,fedformer=0.4
+python -m experiments.sequence_forecasters.run backtest --models lstm,fedformer
+python -m experiments.sequence_forecasters.run predict
+python -m pytest experiments/sequence_forecasters -q
+
 # RelGT / GNN with a learned per-user embedding (users unseen in training get a zero vector).
 # The LightGBM/S2P2 branches of hybrid modes do not use it.
 python -m experiments.relgt.run backtest --temporal-model gnn --user-embedding
@@ -79,6 +114,21 @@ python -m experiments.relgt.run backtest --user-embedding
 # RelGT / GNN on the official test population (>= 5 events in 90 days instead of 14)
 python -m experiments.relgt.run backtest --eligibility-days 90
 python -m experiments.relgt.run backtest --temporal-model gnn --eligibility-days 90
+
+# GNN on every cohort user at every cutoff (no activity filter; inactive users have an empty graph
+# and are still trained on and scored). Prediction already scores every test user.
+python -m experiments.relgt.run backtest --temporal-model gnn --eligibility-days 0
+python -m experiments.relgt.run predict --temporal-model gnn --eligibility-days 0
+
+# GNN trained, calibrated and backtested only on the users in assignment2/evaluation/test_input.csv,
+# at every cutoff with no activity filter (the population that predict scores)
+python -m experiments.relgt.run backtest --temporal-model gnn --test-users
+python -m experiments.relgt.run predict --temporal-model gnn --test-users
+
+# GNN graph lookback (days of history per user; default 14). --eligibility-days, if given, must be >= it.
+python -m experiments.relgt.run backtest --temporal-model gnn --lookback-days 30
+python -m experiments.relgt.run backtest --temporal-model gnn --test-users --lookback-days 30
+python -m experiments.relgt.run predict --temporal-model gnn --test-users --lookback-days 30
 
 # Train on only a random fraction of the training examples (seeded by --seed); the unused rest
 # is added to calibration. Works for every relgt backtest/predict mode, including hybrids.
@@ -173,8 +223,20 @@ python -m experiments.relgt_db_relational.run backtest --epochs 10 --tables none
 python -m experiments.relgt_db_relational.run backtest --epochs 10 --tables Notifications --reserve 32
 python -m experiments.relgt_db_relational.run predict --epochs 10 --reserve 32
 
+# Relational Transformer (stanford-star/relational-transformer port): every cell is a token,
+# attention by column / row + foreign-key parents / referencing rows; target is a masked
+# UserWeeks task row, earlier closed weeks of the same user are labelled in-context rows
+python -m experiments.relational_transformer.run backtest
+python -m experiments.relational_transformer.run backtest --epochs 1 --max-steps-per-epoch 30 --start-cutoff "2026-07-01 16:00:00"  # smoke
+python -m experiments.relational_transformer.run backtest --attention col,feat,nbr,full
+python -m experiments.relational_transformer.run backtest --history-weeks 0   # ablation: no in-context labels
+python -m experiments.relational_transformer.run backtest --mtp-weight 0.1    # + masked-token objective
+python -m experiments.relational_transformer.run backtest --num-neighbors 128 --max-cells 1024 --batch-size 16
+python -m experiments.relational_transformer.run predict
+python -m pytest experiments/relational_transformer -q
+
 # Drift-robust LightGBM: all LightGBM improvements as named variants scored under one protocol
-# (validation = calibration weeks, holdout = last 15%); results in outputs/<run>/RESULTS.md
+# (validation = calibration weeks, holdout = last week); results in outputs/<run>/RESULTS.md
 python -m experiments.drift_lightgbm.run backtest
 python -m experiments.drift_lightgbm.run backtest --variants relational,mask,rolling_half_life_8
 python -m experiments.drift_lightgbm.run predict --variant relational

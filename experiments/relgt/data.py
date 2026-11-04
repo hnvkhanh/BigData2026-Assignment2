@@ -21,6 +21,9 @@ LABELS = (
 
 HORIZON_DAYS = 7
 LOOKBACK_DAYS = 14
+# ``eligibility_lookback_days`` value that keeps every cohort user at every
+# cutoff, including users with no recent actions (their graph is empty).
+ALL_USERS = 0
 MAX_OBJECTS_PER_RELATION = 4
 MAX_OBJECT_NEIGHBORS = len(LABELS) * MAX_OBJECTS_PER_RELATION
 MAX_REPOSITORY_NEIGHBORS = 24
@@ -445,15 +448,22 @@ def build_training_examples(
     vocabulary: EntityVocabulary,
     lookback_days: int = LOOKBACK_DAYS,
     eligibility_lookback_days: int | None = None,
+    user_ids: np.ndarray | None = None,
 ) -> TrainingExamples:
-    """Create weekly training samples with chronological labels."""
+    """Create weekly training samples with chronological labels.
+
+    ``eligibility_lookback_days=ALL_USERS`` keeps every cohort user at every
+    cutoff instead of only users with at least 5 recent actions.
+    ``user_ids`` (cohort ``Users`` rows) limits the samples to those users;
+    graph structure features still use every cohort user's actions.
+    """
     if lookback_days < 1:
         raise ValueError("lookback_days must be positive.")
     if eligibility_lookback_days is None:
         eligibility_lookback_days = lookback_days
-    if eligibility_lookback_days < lookback_days:
+    if ALL_USERS < eligibility_lookback_days < lookback_days or eligibility_lookback_days < 0:
         raise ValueError(
-            "eligibility_lookback_days must be at least lookback_days."
+            "eligibility_lookback_days must be ALL_USERS (0) or at least lookback_days."
         )
     users = pd.read_parquet(
         db_dir / "Users.parquet", columns=["user_id", "is_cohort"]
@@ -461,22 +471,40 @@ def build_training_examples(
     cohort_ids = users.loc[users["is_cohort"], "user_id"].astype(np.int32).to_numpy()
     events = load_events(db_dir, cohort_ids.tolist(), vocabulary)
     cutoffs = weekly_cutoffs(events, start_cutoff)
+    if user_ids is None:
+        example_ids = cohort_ids
+    else:
+        example_ids = np.asarray(user_ids, dtype=np.int32)
+        outside = np.setdiff1d(example_ids, cohort_ids)
+        if len(outside):
+            raise ValueError(f"{len(outside)} requested user(s) are not cohort users.")
 
     token_batches: list[GraphTokens] = []
     label_batches: list[np.ndarray] = []
     cutoff_batches: list[np.ndarray] = []
     for index, cutoff in enumerate(cutoffs, start=1):
-        eligible_tokens = snapshot_tokens(
-            events,
-            cutoff,
-            cohort_ids,
-            vocabulary,
-            eligible_only=True,
-            lookback_days=eligibility_lookback_days,
-        )
-        if lookback_days == eligibility_lookback_days:
-            tokens = eligible_tokens
+        if eligibility_lookback_days == ALL_USERS:
+            tokens = snapshot_tokens(
+                events, cutoff, example_ids, vocabulary, lookback_days=lookback_days
+            )
+        elif lookback_days == eligibility_lookback_days:
+            tokens = snapshot_tokens(
+                events,
+                cutoff,
+                example_ids,
+                vocabulary,
+                eligible_only=True,
+                lookback_days=lookback_days,
+            )
         else:
+            eligible_tokens = snapshot_tokens(
+                events,
+                cutoff,
+                example_ids,
+                vocabulary,
+                eligible_only=True,
+                lookback_days=eligibility_lookback_days,
+            )
             tokens = snapshot_tokens(
                 events,
                 cutoff,
@@ -496,7 +524,8 @@ def build_training_examples(
         )
         print(
             f"Built weekly graph {index}/{len(cutoffs)}: {cutoff} "
-            f"({len(tokens.user_ids):,} eligible users)"
+            f"({len(tokens.user_ids):,} "
+            f"{'cohort' if eligibility_lookback_days == ALL_USERS else 'eligible'} users)"
         )
 
     combined_tokens = GraphTokens(

@@ -318,7 +318,7 @@ def run_prediction(args: argparse.Namespace) -> None:
     examples, num_entities = augmented_examples(args, output_dir)
     root = _no_root_features(len(examples.labels))
     usable = prediction_example_indices(examples.cutoff_days, args.cutoff)
-    train_end, _ = chronological_splits(examples.cutoff_days[usable])
+    train_end, _ = chronological_splits(examples.cutoff_days[usable], holdout=False)
     train = usable[examples.cutoff_days[usable] < train_end]
     calibration = usable[examples.cutoff_days[usable] >= train_end]
     if not len(train) or not len(calibration):

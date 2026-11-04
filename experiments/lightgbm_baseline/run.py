@@ -337,20 +337,45 @@ def eligible_users_for_cutoff(
     return eligible_counts >= 5
 
 
+def load_test_user_ids(db_dir: Path, test_input: Path) -> tuple[pd.Series, list[int]]:
+    """Return the test file's GitHub UserIDs and their internal cohort user_ids."""
+    target_users = pd.read_csv(test_input, dtype={"UserID": "int64"})
+    if target_users["UserID"].duplicated().any():
+        raise ValueError(f"{test_input} contains duplicate UserIDs.")
+    cohort_users = pd.read_parquet(
+        db_dir / "Users.parquet",
+        columns=["user_id", "github_user_id", "is_cohort"],
+    )
+    cohort_users = cohort_users.loc[cohort_users["is_cohort"]]
+    user_lookup = cohort_users.set_index("github_user_id")["user_id"]
+    mapped_ids = target_users["UserID"].map(user_lookup)
+    if mapped_ids.isna().any():
+        raise ValueError(
+            f"{int(mapped_ids.isna().sum())} test UserID(s) are not in the cohort "
+            "for this data release."
+        )
+    return target_users["UserID"], mapped_ids.astype("int64").tolist()
+
+
 def build_training_data(
     db_dir: Path,
     start_cutoff: pd.Timestamp,
+    restrict_user_ids: list[int] | None = None,
 ) -> tuple[pd.DataFrame, dict[str, pd.DataFrame], list[int]]:
-    users = pd.read_parquet(
-        db_dir / "Users.parquet",
-        columns=[
-            "user_id",
-            "github_user_id",
-            "is_cohort",
-        ],
-    )
-    cohort = users.loc[users["is_cohort"]].copy()
-    user_ids = cohort["user_id"].astype(int).tolist()
+    """Build weekly panels for the cohort, or only ``restrict_user_ids`` if given."""
+    if restrict_user_ids is not None:
+        user_ids = list(restrict_user_ids)
+    else:
+        users = pd.read_parquet(
+            db_dir / "Users.parquet",
+            columns=[
+                "user_id",
+                "github_user_id",
+                "is_cohort",
+            ],
+        )
+        cohort = users.loc[users["is_cohort"]].copy()
+        user_ids = cohort["user_id"].astype(int).tolist()
     histories = load_histories(db_dir, user_ids)
 
     # All six labels need a fully observed seven-day target window.
@@ -628,13 +653,19 @@ def evaluate_predictions(
     }
 
 
-def chronological_splits(cutoffs: list[pd.Timestamp]) -> tuple[pd.Timestamp, pd.Timestamp]:
+def chronological_splits(
+    cutoffs: list[pd.Timestamp], holdout: bool = True
+) -> tuple[pd.Timestamp, pd.Timestamp]:
+    """Return ``(train_end, calibration_end)``: one calibration week, one holdout week.
+
+    The task predicts a single week, so the latest cutoff is the holdout and the
+    one before it is calibration; every earlier week trains. With ``holdout=False``
+    (prediction runs) the latest cutoff is the calibration week instead.
+    """
     if len(cutoffs) < 10:
         raise ValueError("At least 10 weekly cutoffs are needed for chronological splits.")
-    train_end = max(1, int(len(cutoffs) * 0.70))
-    calibration_end = max(train_end + 1, int(len(cutoffs) * 0.85))
-    if calibration_end >= len(cutoffs):
-        calibration_end = len(cutoffs) - 1
+    calibration_end = len(cutoffs) - 1
+    train_end = calibration_end - 1 if holdout else calibration_end
     return cutoffs[train_end], cutoffs[calibration_end]
 
 
@@ -711,8 +742,14 @@ def run_backtest(
     seed: int = 42,
     user_embedding: bool = False,
     discard_unused_train: bool = False,
+    test_input: Path = DEFAULT_TEST_INPUT,
+    train_users: str = "test",
 ) -> None:
-    data, _, _ = build_training_data(db_dir, start_cutoff)
+    restrict = None
+    if train_users == "test":
+        _, restrict = load_test_user_ids(db_dir, test_input)
+        print(f"Using the {len(restrict):,} users in {test_input.name} for train/holdout.")
+    data, _, _ = build_training_data(db_dir, start_cutoff, restrict)
     unique_cutoffs = sorted(data["cutoff"].unique())
     cutoffs = [pd.Timestamp(value) for value in unique_cutoffs]
     train_end, calibration_end = chronological_splits(cutoffs)
@@ -757,6 +794,7 @@ def run_backtest(
     results["temporal_model"] = temporal_model
     results["train_fraction"] = train_fraction
     results["user_embedding"] = user_embedding
+    results["train_users"] = train_users
     results["threshold_mode"] = "fixed_default"
     if temporal_model == "lightgbm":
         results["model_params"] = model_params
@@ -804,11 +842,20 @@ def run_prediction(
     seed: int = 42,
     user_embedding: bool = False,
     discard_unused_train: bool = False,
+    train_users: str = "test",
 ) -> None:
-    data, histories, cohort_user_ids = build_training_data(db_dir, start_cutoff)
+    target_users_ids, internal_ids = load_test_user_ids(db_dir, test_input)
+    restrict = internal_ids if train_users == "test" else None
+    data, histories, cohort_user_ids = build_training_data(
+        db_dir, start_cutoff, restrict
+    )
+    print(
+        f"Training on {len(cohort_user_ids):,} users "
+        f"({'test_input users' if restrict else 'all cohort users'})."
+    )
     data = training_data_before(data, cutoff)
     cutoffs = [pd.Timestamp(value) for value in sorted(data["cutoff"].unique())]
-    train_end, _ = chronological_splits(cutoffs)
+    train_end, _ = chronological_splits(cutoffs, holdout=False)
     feature_columns = [column for column in data.columns if column not in {"user_id", "cutoff", *LABELS}]
     if temporal_model == "frequency_nn":
         feature_columns = frequency_feature_columns(feature_columns)
@@ -829,26 +876,7 @@ def run_prediction(
     )
     thresholds = DEFAULT_THRESHOLDS.copy()
 
-    target_users = pd.read_csv(test_input, dtype={"UserID": "int64"})
-    if target_users["UserID"].duplicated().any():
-        raise ValueError(f"{test_input} contains duplicate UserIDs.")
-    cohort_users = pd.read_parquet(
-        db_dir / "Users.parquet",
-        columns=[
-            "user_id",
-            "github_user_id",
-            "is_cohort",
-        ],
-    )
-    cohort_users = cohort_users.loc[cohort_users["is_cohort"]]
-    user_lookup = cohort_users.set_index("github_user_id")["user_id"]
-    mapped_ids = target_users["UserID"].map(user_lookup)
-    if mapped_ids.isna().any():
-        raise ValueError(
-            f"{int(mapped_ids.isna().sum())} test UserID(s) are not in the cohort "
-            "for this data release."
-        )
-    internal_ids = mapped_ids.astype("int64").tolist()
+    target_users = pd.DataFrame({USER_COLUMN: target_users_ids})
 
     inference = row_for_cutoff(cutoff, histories, cohort_user_ids)
     inference = inference.set_index("user_id").loc[internal_ids].reset_index()
@@ -878,6 +906,7 @@ def run_prediction(
         "calibration_weeks": int(calibration["cutoff"].nunique()),
         "feature_columns": feature_columns,
         "user_embedding": user_embedding,
+        "train_users": train_users,
         "labels": list(LABELS),
     }
     if temporal_model == "lightgbm":
@@ -962,8 +991,17 @@ def parse_args() -> argparse.Namespace:
                 "users unseen in training get no user signal"
             ),
         )
+        subparser.add_argument("--test-input", type=Path, default=DEFAULT_TEST_INPUT)
+        subparser.add_argument(
+            "--train-users",
+            choices=("test", "cohort"),
+            default="test",
+            help=(
+                "which users to build training/holdout samples from: the users "
+                "in --test-input (default) or every cohort user"
+            ),
+        )
     predict_parser = subparsers.choices["predict"]
-    predict_parser.add_argument("--test-input", type=Path, default=DEFAULT_TEST_INPUT)
     predict_parser.add_argument(
         "--cutoff",
         type=pd.Timestamp,
@@ -1006,6 +1044,8 @@ def main() -> None:
             args.seed,
             args.user_embedding,
             args.discard_unused_train,
+            args.test_input,
+            args.train_users,
         )
     else:
         run_prediction(
@@ -1021,6 +1061,7 @@ def main() -> None:
             args.seed,
             args.user_embedding,
             args.discard_unused_train,
+            args.train_users,
         )
 
 

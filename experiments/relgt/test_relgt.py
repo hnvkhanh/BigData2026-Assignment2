@@ -11,7 +11,9 @@ import pandas as pd
 import torch
 
 from experiments.relgt.data import (
+    ALL_USERS,
     LABELS,
+    build_training_examples,
     REPO_MEMBERSHIP_RELATION,
     EntityVocabulary,
     labels_for_cutoff,
@@ -26,6 +28,8 @@ from experiments.relgt.run import (
     calculate_metrics,
     choose_thresholds,
     create_run_output_dir,
+    example_user_ids,
+    load_test_user_ids,
     fuse_probabilities,
     fuse_three_probabilities,
     lightgbm_examples_for_graph,
@@ -104,6 +108,115 @@ class TemporalSnapshotTests(unittest.TestCase):
         self.assertFalse(np.any(tokens.entity_ids[0, 25:] == 10))
         self.assertEqual(int(tokens.entity_ids[0, 20]), 9)
         self.assertEqual(int(tokens.entity_ids[0, 21]), 0)
+
+    def test_all_users_mode_keeps_inactive_cohort_users(self) -> None:
+        with TemporaryDirectory() as directory:
+            db_dir = Path(directory)
+            pd.DataFrame(
+                {"user_id": [10, 11, 12, 13], "is_cohort": [True, True, True, False]}
+            ).to_parquet(db_dir / "Users.parquet", index=False)
+            with patch("experiments.relgt.data.load_events", return_value=self.events), patch(
+                "experiments.relgt.data.weekly_cutoffs",
+                return_value=pd.DatetimeIndex([self.cutoff]),
+            ):
+                everyone = build_training_examples(
+                    db_dir, self.cutoff, self.vocabulary, eligibility_lookback_days=ALL_USERS
+                )
+                eligible = build_training_examples(db_dir, self.cutoff, self.vocabulary)
+        self.assertEqual(everyone.tokens.user_ids.tolist(), [10, 11, 12])
+        self.assertEqual(eligible.tokens.user_ids.tolist(), [10])
+        # Inactive users get an empty graph; their labels are still observed.
+        self.assertFalse(everyone.tokens.entity_ids[2].any())
+        self.assertFalse(everyone.labels[1:].any())
+        self.assertEqual(everyone.labels[0, LABELS.index("push")], 1)
+        np.testing.assert_array_equal(everyone.labels[:1], eligible.labels)
+        np.testing.assert_array_equal(everyone.tokens.entity_ids[0], eligible.tokens.entity_ids[0])
+
+    def test_selected_users_limit_examples_at_every_cutoff(self) -> None:
+        with TemporaryDirectory() as directory:
+            db_dir = Path(directory)
+            pd.DataFrame(
+                {"user_id": [10, 11, 12, 13], "is_cohort": [True, True, True, False]}
+            ).to_parquet(db_dir / "Users.parquet", index=False)
+            with patch("experiments.relgt.data.load_events", return_value=self.events), patch(
+                "experiments.relgt.data.weekly_cutoffs",
+                return_value=pd.DatetimeIndex([self.cutoff]),
+            ):
+                selected = build_training_examples(
+                    db_dir,
+                    self.cutoff,
+                    self.vocabulary,
+                    eligibility_lookback_days=ALL_USERS,
+                    user_ids=np.array([12, 10]),
+                )
+                with self.assertRaisesRegex(ValueError, "not cohort users"):
+                    build_training_examples(
+                        db_dir, self.cutoff, self.vocabulary, user_ids=np.array([13])
+                    )
+        self.assertEqual(selected.tokens.user_ids.tolist(), [12, 10])
+        self.assertEqual(selected.labels[1, LABELS.index("push")], 1)
+        self.assertFalse(selected.labels[0].any())
+
+    def test_test_users_flag_maps_test_input_and_drops_the_activity_filter(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            pd.DataFrame(
+                {
+                    "user_id": [0, 1, 2],
+                    "github_user_id": [500, 501, 502],
+                    "is_cohort": [True, True, False],
+                }
+            ).to_parquet(root / "Users.parquet", index=False)
+            test_input = root / "test_input.csv"
+            pd.DataFrame({"UserID": [501, 500]}).to_csv(test_input, index=False)
+            argv = ["run.py", "backtest", "--temporal-model", "gnn", "--test-users",
+                    "--test-input", str(test_input), "--db-dir", str(root)]
+            with patch("sys.argv", argv):
+                args = parse_args()
+            self.assertEqual(args.eligibility_days, ALL_USERS)
+            self.assertEqual(example_user_ids(args).tolist(), [1, 0])
+            pd.DataFrame({"UserID": [502]}).to_csv(test_input, index=False)
+            with self.assertRaisesRegex(ValueError, "not in the cohort"):
+                load_test_user_ids(root, test_input)
+            with patch("sys.argv", ["run.py", "backtest", "--temporal-model", "gnn"]):
+                self.assertIsNone(example_user_ids(parse_args()))
+            with patch("sys.argv", [*argv, "--eligibility-days", "90"]):
+                self.assertEqual(parse_args().eligibility_days, 90)
+            with patch("sys.argv", [*argv[:3], "gnn_ensemble", *argv[4:]]), self.assertRaises(
+                SystemExit
+            ):
+                parse_args()
+
+    def test_lookback_days_is_configurable_for_single_lookback_modes(self) -> None:
+        base = ["run.py", "backtest", "--temporal-model", "gnn"]
+        with patch("sys.argv", base):
+            self.assertEqual(parse_args().lookback_days, 14)
+        with patch("sys.argv", [*base, "--lookback-days", "30", "--eligibility-days", "90"]):
+            args = parse_args()
+        self.assertEqual((args.lookback_days, args.eligibility_days), (30, 90))
+        with patch("sys.argv", ["run.py", "predict", "--temporal-model", "gnn", "--lookback-days", "7"]):
+            self.assertEqual(parse_args().lookback_days, 7)
+        for extra in (
+            ["--lookback-days", "0"],
+            ["--lookback-days", "30", "--eligibility-days", "14"],
+        ):
+            with self.subTest(extra=extra), patch("sys.argv", [*base, *extra]), self.assertRaises(
+                SystemExit
+            ):
+                parse_args()
+        with patch(
+            "sys.argv", ["run.py", "backtest", "--temporal-model", "gnn_ensemble", "--lookback-days", "30"]
+        ), self.assertRaises(SystemExit):
+            parse_args()
+
+    def test_eligibility_days_accepts_all_users_and_rejects_short_windows(self) -> None:
+        with patch("sys.argv", ["run.py", "backtest", "--temporal-model", "gnn", "--eligibility-days", "0"]):
+            self.assertEqual(parse_args().eligibility_days, ALL_USERS)
+        for value in ("7", "-1"):
+            with self.subTest(value=value), patch(
+                "sys.argv", ["run.py", "backtest", "--temporal-model", "gnn", "--eligibility-days", value]
+            ), self.assertRaises(SystemExit):
+                parse_args()
 
     def test_labels_use_the_seven_day_action_window(self) -> None:
         labels = labels_for_cutoff(self.events, self.cutoff, np.array([10]))
@@ -194,7 +307,7 @@ class HybridFusionTests(unittest.TestCase):
         self.assertEqual(parse_ensemble_lookbacks("90, 14"), (90, 14))
 
     def test_rejects_invalid_lookback_pairs(self) -> None:
-        for value in ("30", "30,30", "30,7", "30,14,90"):
+        for value in ("30", "30,30", "30,60", "30,14,90"):
             with self.subTest(value=value), self.assertRaises(
                 argparse.ArgumentTypeError
             ):

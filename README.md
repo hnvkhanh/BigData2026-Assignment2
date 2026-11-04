@@ -29,6 +29,10 @@ features.
   assignment-specific **RelGT-inspired** graph model. It is not a drop-in
   execution of Stanford's RelGT/RelBench implementation.
   - Its optional **hybrid** mode combines RelGT and S2P2 probabilities.
+- [`experiments/relational_transformer/`](./experiments/relational_transformer/README.md)
+  ports Stanford's **Relational Transformer** (cell-level tokens with column,
+  feature and neighbor attention) to the database, trained from scratch, with
+  earlier closed weeks of the same user as labelled in-context task rows.
 - [`experiments/gru_relational_ple/`](./experiments/gru_relational_ple/README.md)
   contains an experimental **GRU + relational attention + PLE** model that
   combines daily activity sequences and graph neighborhoods for six-label

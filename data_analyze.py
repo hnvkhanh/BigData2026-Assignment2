@@ -6,12 +6,16 @@ Install:
 Run from the repository root:
     python data_analyze.py            # then open http://127.0.0.1:8052
     python data_analyze.py --port 8060
+    python data_analyze.py --results-tag full    # only that one tag, instead of every tag
 
 Inputs:
 - the Parquet database in ``assignment2/data/db`` (daily volumes, eligibility, test list),
 - the weekly examples cached by ``experiments/drift_lightgbm`` (labels, flags, features),
-- the drift_lightgbm backtest outputs (variant scores and holdout probabilities).
-Build the last two once with ``python -m experiments.drift_lightgbm.run backtest``.
+- every ``backtest_metrics.json`` under ``experiments/results/*/runs/*/`` (score, per-label F1,
+  holdout probabilities where available) -- every tag and every run folder found there, not only
+  experiments currently registered in ``run_all_experiments.py``.
+Build the first with ``python -m experiments.drift_lightgbm.run backtest`` (examples cache) and
+the second with ``python run_all_experiments.py`` (one or more times; each tag is picked up).
 
 Tabs: Findings (written analysis computed from the data), Data quality, Weekly labels,
 Population & test list, Habits, Feature explorer, Model results, Thresholds & errors.
@@ -21,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -46,6 +51,9 @@ from experiments.lightgbm_baseline.run import (
 )
 
 ROOT = Path(__file__).resolve().parent
+sys.path.insert(0, str(ROOT))
+import run_all_experiments as rae  # noqa: E402  (registry + results of every experiment)
+
 DB_DIR = ROOT / "assignment2" / "data" / "db"
 TEST_INPUT = ROOT / "assignment2" / "evaluation" / "test_input.csv"
 DRIFT_DIR = ROOT / "experiments" / "drift_lightgbm"
@@ -148,33 +156,74 @@ def _naive_row(ex: pd.DataFrame) -> dict:
     }
 
 
-def load_results(ex: pd.DataFrame) -> pd.DataFrame:
-    rows: dict[str, dict] = {}
-    paths = sorted(DRIFT_DIR.glob("outputs/*/backtest_metrics.json"), key=lambda p: p.stat().st_mtime)
-    for path in paths:  # newer runs overwrite older ones with the same variant name
+def _discover_metrics(results_tag: str | None) -> list[tuple[str, str, Path]]:
+    """Every (experiment run-folder name, tag, backtest_metrics.json) under experiments/results/
+    -- every tag subfolder found there, or just one with ``results_tag``. Nothing is deduplicated:
+    the same experiment name under two different tags is kept as two separate rows."""
+    if results_tag:
+        tag_dirs = [rae.RESULTS_ROOT / results_tag]
+    elif rae.RESULTS_ROOT.is_dir():
+        tag_dirs = sorted(p for p in rae.RESULTS_ROOT.iterdir() if p.is_dir())
+    else:
+        tag_dirs = []
+    return [
+        (path.parent.name, tag_dir.name, path)
+        for tag_dir in tag_dirs
+        for path in sorted(tag_dir.glob("runs/*/backtest_metrics.json"))
+    ]
+
+
+def _branch_csv(run_dir: Path, branch: str) -> Path | None:
+    """Holdout-probabilities CSV for one experiment/branch: drift_lightgbm keeps one per
+    branch under variants/, every other experiment keeps every branch's columns in one file."""
+    candidates = [run_dir / "variants" / f"{branch}_holdout.csv"] if branch else []
+    candidates.append(run_dir / "holdout_probabilities.csv")
+    return next((path for path in candidates if path.is_file()), None)
+
+
+def load_results(ex: pd.DataFrame, results_tag: str | None) -> pd.DataFrame:
+    """Every experiment with a finished backtest anywhere under experiments/results/ -- not only
+    the ones currently registered in run_all_experiments.py's EXPERIMENTS list, and not deduplicated
+    across tags: the experiment is named after its results/<tag>/runs/<name> run folder, qualified
+    with its tag so the same name under two tags stays two distinct rows. Reuses
+    run_all_experiments.py's own headline/branch flattening (``_metric_blocks``), so this stays in
+    sync with that script."""
+    found = _discover_metrics(results_tag)
+    if not found:
+        where = rae.RESULTS_ROOT / results_tag if results_tag else rae.RESULTS_ROOT
+        raise SystemExit(f"No backtest_metrics.json under {where}. Run: python run_all_experiments.py")
+    registry = {experiment.name: experiment for experiment in rae.EXPERIMENTS}
+    rows = []
+    for name, tag, path in found:
         metrics = json.loads(path.read_text())
-        entries = {metrics["variant"]["name"]: metrics, **metrics.get("branch_metrics", {})}
-        for name, entry in entries.items():
-            if "masked_score" not in entry:  # outputs from before the masked-score protocol
+        run_dir = path.parent
+        registered = registry.get(name)
+        group = registered.group if registered else "other"
+        qualified = f"{name} ({tag})"
+        for branch, block in rae._metric_blocks(metrics):
+            if "score" not in block:
                 continue
-            csv = path.parent / "variants" / f"{name}_holdout.csv"
-            rows[name] = {
-                "variant": name,
-                "description": entry["variant"]["description"],
-                "holdout": entry["score"],
-                "validation": entry["validation"]["score"],
-                "holdout_map": entry["mean_average_precision"],
-                "validation_map": entry["validation"]["mean_average_precision"],
-                "per_week": entry["per_week"],
-                **{f"f1_{label}": entry["per_action_f1"][label] for label in L},
-                "thresholds": entry["thresholds"],
-                "csv": str(csv) if csv.is_file() else None,
-            }
-    rows[NAIVE] = _naive_row(ex)
-    return pd.DataFrame(rows.values()).sort_values("holdout", ascending=False).reset_index(drop=True)
+            description = registered.description if registered else ""
+            if branch:
+                description = f"{description} — branch: {branch}" if description else f"branch: {branch}"
+            # The headline branch ("") has no name of its own in the shared schema, but
+            # drift_lightgbm still keys its per-variant CSV by the underlying variant name.
+            file_branch = branch or metrics.get("headline_variant", "")
+            csv = _branch_csv(run_dir, file_branch)
+            rows.append({
+                "variant": f"{qualified}/{branch}" if branch else qualified,
+                "experiment": name, "tag": tag, "branch": branch, "group": group,
+                "description": description, "holdout": block["score"],
+                "per_week": block.get("per_week", []),
+                **{f"f1_{label}": block.get("per_action_f1", {}).get(label) for label in L},
+                "thresholds": block.get("thresholds"),
+                "csv": str(csv) if csv else None,
+            })
+    rows.append({**_naive_row(ex), "experiment": NAIVE, "branch": "", "group": "naive"})
+    return pd.DataFrame(rows).sort_values("holdout", ascending=False).reset_index(drop=True)
 
 
-def load_data() -> Data:
+def load_data(results_tag: str | None = None) -> Data:
     print("Loading histories ...", flush=True)
     users = pd.read_parquet(DB_DIR / "Users.parquet", columns=["user_id", "github_user_id", "is_cohort", "first_seen_at"])
     cohort = users.loc[users["is_cohort"]]
@@ -256,17 +305,26 @@ def load_data() -> Data:
         pools[f"active_30d_{label}"] = ex[f"{label}_count_30d"].to_numpy() > 0
     groups = pd.concat([test, pools], ignore_index=True)
 
-    print("Loading backtest results ...", flush=True)
-    results = load_results(ex)
+    where = rae.RESULTS_ROOT / results_tag if results_tag else f"{rae.RESULTS_ROOT} (every tag)"
+    print(f"Loading backtest results from {where} ...", flush=True)
+    results = load_results(ex, results_tag)
     return Data(daily, actors, _baseline_ratio(daily), outage, burst, table_end, ex, weekly,
                 (pd.Timestamp(validation_start), pd.Timestamp(holdout_start)), overlap, groups,
                 results, feature_sets, cohort["first_seen_at"].max())
 
 
-@lru_cache(maxsize=8)
-def holdout_frame(csv: str) -> pd.DataFrame:
+@lru_cache(maxsize=16)
+def holdout_frame(csv: str, branch: str = "") -> pd.DataFrame:
+    """Holdout predictions with the active branch's probability columns renamed to p_<label>."""
     frame = pd.read_csv(csv, parse_dates=["cutoff"])
-    return frame.rename(columns={f"drift_lightgbm_{label}": f"p_{label}" for label in L})
+    for label in L:
+        actual = f"actual_{label}"
+        prefixes = sorted({c[: -len(f"_{label}")] for c in frame.columns
+                           if c.endswith(f"_{label}") and c != actual})
+        prefix = branch if branch in prefixes else next(iter(prefixes), None)
+        if prefix:
+            frame = frame.rename(columns={f"{prefix}_{label}": f"p_{label}"})
+    return frame
 
 
 # ---------------------------------------------------------------- figure helpers
@@ -369,12 +427,13 @@ def findings_markdown(data: Data) -> str:
         for label in L
     )
     best = results.drop(index=NAIVE)["holdout"].idxmax()
-    model_lines = [f"| `{name}` | {100 * results.loc[name, 'validation']:.2f} | {100 * results.loc[name, 'holdout']:.2f} |"
-                   for name in ("relational", "base", best, NAIVE) if name in results.index]
+    reference = next((n for n in results.index if n != NAIVE and "relational" in n.lower()), best)
+    model_lines = [f"| `{name}` | {results.loc[name, 'group']} | {100 * results.loc[name, 'holdout']:.2f} |"
+                   for name in dict.fromkeys((reference, best, NAIVE)) if name in results.index]
 
     threshold_lines, volume_lines, segment_text = [], [], ""
-    if "relational" in results.index and results.loc["relational", "csv"]:
-        frame = holdout_frame(results.loc["relational", "csv"])
+    if reference in results.index and results.loc[reference, "csv"]:
+        frame = holdout_frame(results.loc[reference, "csv"], results.loc[reference, "branch"])
         grid = np.round(np.arange(0.05, 0.86, 0.025), 3)
         for label in L:
             sweep = threshold_sweep(frame, label, grid)
@@ -473,20 +532,18 @@ Holdout weeks, eligible users:
   week; these are the hard cases and the main source of false negatives.
 * `pr_review` and `pr_review_comment` co-occur strongly (see *Habits*), the other labels much less.
 
-| Model | Validation | Holdout |
+| Model | Group | Holdout |
 |---|---|---|
 {chr(10).join(model_lines)}
 
 The no-model rule "positive iff they did it in the last 7 days" is
-{100 * (results.loc['relational', 'holdout'] - results.loc[NAIVE, 'holdout']):.1f} points behind relational LightGBM on
-the holdout, and {'ahead of' if results.loc[NAIVE, 'validation'] > results.loc['relational', 'validation'] else 'behind'}
-it on validation ({100 * results.loc[NAIVE, 'validation']:.1f} vs {100 * results.loc['relational', 'validation']:.1f}):
-in the September jump, plain recency transfers better than a model trained on spring and summer.
-LightGBM's gain comes from ranking the users in between, not from a new signal.
+{100 * (results.loc[reference, 'holdout'] - results.loc[NAIVE, 'holdout']):.1f} points behind `{reference}` on the
+holdout. Its gain comes from ranking the users in between, not from a new signal — see *Model results* for every
+registered experiment (`python run_all_experiments.py --list`), ranked by the same holdout score.
 
 ### 5. Thresholds: the best threshold moves every week
 
-Relational LightGBM, holdout weeks:
+`{reference}`, holdout weeks:
 
 | Label | Fixed threshold | Best threshold per week | F1 gain if each week's best were known |
 |---|---|---|---|
@@ -508,7 +565,7 @@ Predicted positives / actual positives at the fixed thresholds (1.00 = right vol
 
 ### 6. Where the model fails
 
-Official score by how many of the last 4 weeks the user was active at all (relational, holdout):
+Official score by how many of the last 4 weeks the user was active at all ({reference}, holdout):
 {segment_text}.
 Users with no activity in the last 4 weeks score 0: none of the few who come back is caught. Quality rises
 steadily with recent activity, so the score of a week depends heavily on its mix of quiet and regular users.
@@ -544,8 +601,9 @@ def build_app(data: Data) -> Dash:
     app = Dash(__name__, title="Activity data analysis")
     app.index_string = app.index_string.replace("</head>", f"<style>{CSS}</style></head>")
     results = data.results
-    with_csv = results.loc[results["csv"].notna(), "variant"].tolist()
-    default_variant = "relational" if "relational" in with_csv else (with_csv[0] if with_csv else None)
+    scored = results.loc[results["csv"].notna()].sort_values("holdout", ascending=False)
+    with_csv = scored["variant"].tolist()
+    default_variant = with_csv[0] if with_csv else None
     feature_options = [
         {"label": f"{column}  [{name}]", "value": column}
         for name, columns in data.feature_sets.items() for column in columns
@@ -627,19 +685,20 @@ def build_app(data: Data) -> Dash:
                  note="ROC AUC of the raw feature (|AUC - 0.5| ranked), on a 40k-row sample per period."),
         ]),
         dcc.Tab(label="Model results", children=[
-            card("Validation vs holdout for every backtest variant", dcc.Graph(figure=variant_scatter(data)),
-                 note="Validation = Aug 12 - Sep 9 (trough + September jump), holdout = Sep 16 - Oct 14. "
+            card("Holdout score of every finished experiment", dcc.Graph(figure=variant_scatter(data)),
+                 note="Every backtest_metrics.json found under experiments/results/*/runs/*/, scored the same "
+                      "way: mean over holdout weeks of evaluate.py's Score. Multi-model experiments (chunks, "
+                      "drift, relgt fusion) contribute one bar per branch. "
                       f"`{NAIVE}` is the no-model rule 'did it in the last 7 days'."),
             card("Per-week holdout score",
-                 dcc.Dropdown(results["variant"].tolist(), [v for v in ("relational", "base", "seeds_5", NAIVE)
-                                                            if v in set(results["variant"])],
+                 dcc.Dropdown(results["variant"].tolist(),
+                              [v for v in results.sort_values("holdout", ascending=False)["variant"].head(3)] + [NAIVE],
                               id="mr-variants", multi=True),
                  dcc.Graph(id="mr-weeks")),
             card("Per-label holdout F1", dcc.Graph(figure=variant_heatmap(data))),
             card("All variants", dash_table.DataTable(
-                data=results.assign(**{c: (100 * results[c]).round(2) for c in
-                                       ["holdout", "validation", "holdout_map", "validation_map"]})[
-                    ["variant", "description", "validation", "holdout", "validation_map", "holdout_map"]
+                data=results.assign(holdout=(100 * results["holdout"]).round(2))[
+                    ["variant", "group", "holdout", "description"]
                 ].to_dict("records"),
                 sort_action="native", style_cell={"textAlign": "left", "fontSize": 13, "whiteSpace": "normal"},
                 style_table={"overflowX": "auto"})),
@@ -730,15 +789,17 @@ def groups_active_figure(data: Data) -> go.Figure:
 
 
 def variant_scatter(data: Data) -> go.Figure:
-    results = data.results
-    colors = np.where(results["variant"] == NAIVE, "#E45756",
-                      np.where(results["variant"].str.startswith("rel"), "#54A24B", "#4C78A8"))
-    fig = go.Figure(go.Scatter(
-        x=100 * results["validation"], y=100 * results["holdout"], mode="markers+text", text=results["variant"],
-        textposition="top center", marker={"size": 10, "color": colors}, customdata=results["description"],
-        hovertemplate="%{text}<br>%{customdata}<br>validation %{x:.2f}, holdout %{y:.2f}<extra></extra>"))
-    fig.update_layout(template=TEMPLATE, height=520, xaxis_title="validation score (%)",
-                      yaxis_title="holdout score (%)", margin={"t": 20})
+    results = data.results.sort_values("holdout")
+    groups = sorted(results["group"].unique())
+    palette = ["#4C78A8", "#F58518", "#54A24B", "#B279A2", "#E45756", "#72B7B2", "#9D755D", "#BAB0AC"]
+    group_color = dict(zip(groups, palette * (len(groups) // len(palette) + 1)))
+    colors = [("#E45756" if v == NAIVE else group_color[g]) for v, g in zip(results["variant"], results["group"])]
+    fig = go.Figure(go.Bar(
+        x=100 * results["holdout"], y=results["variant"], orientation="h", marker_color=colors,
+        customdata=np.column_stack([results["group"], results["description"]]),
+        hovertemplate="%{y}<br>group: %{customdata[0]}<br>%{customdata[1]}<br>holdout %{x:.2f}<extra></extra>"))
+    fig.update_layout(template=TEMPLATE, height=max(420, 22 * len(results)), xaxis_title="holdout score (%)",
+                      margin={"t": 20, "l": 160})
     return fig
 
 
@@ -895,7 +956,7 @@ def register_callbacks(app: Dash, data: Data) -> None:
     def thresholds(variant, label):
         if not variant or not results.loc[variant, "csv"]:
             return empty("no holdout predictions"), empty(""), empty("")
-        frame = holdout_frame(results.loc[variant, "csv"])
+        frame = holdout_frame(results.loc[variant, "csv"], results.loc[variant, "branch"])
         used = results.loc[variant, "thresholds"] or DEFAULT_THRESHOLDS
         grid = np.round(np.arange(0.02, 0.91, 0.02), 3)
         sweep = threshold_sweep(frame, label, grid)
@@ -943,7 +1004,7 @@ def register_callbacks(app: Dash, data: Data) -> None:
     def error_segments(variant, segment):
         if not variant or not results.loc[variant, "csv"]:
             return empty("no holdout predictions"), empty("")
-        frame = holdout_frame(results.loc[variant, "csv"])
+        frame = holdout_frame(results.loc[variant, "csv"], results.loc[variant, "branch"])
         used = results.loc[variant, "thresholds"] or DEFAULT_THRESHOLDS
         columns = sorted({c for c in ex.columns if c.endswith("_active_weeks_4w")} |
                          {"any_active_days_7d", "total_actions_count_7d", f"events_{ELIGIBILITY_WINDOW_DAYS}d",
@@ -980,8 +1041,11 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--port", type=int, default=8052)
     parser.add_argument("--debug", action="store_true")
+    parser.add_argument("--results-tag", default=None,
+                        help="restrict to this one experiments/results/<tag> written by "
+                             "run_all_experiments.py (default: every tag found there)")
     args = parser.parse_args()
-    app = build_app(load_data())
+    app = build_app(load_data(args.results_tag))
     print(f"Open http://127.0.0.1:{args.port}", flush=True)
     app.run(debug=args.debug, port=args.port)
 

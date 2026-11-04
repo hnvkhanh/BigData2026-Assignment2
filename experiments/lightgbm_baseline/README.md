@@ -62,8 +62,8 @@ label is the whole 7-day week. Backtest metrics follow
 submission (macro-F1 and micro-F1 over users, averaged into the Score) and the
 reported numbers are the mean over weeks, with the per-week scores in
 `per_week`. It trains on the
-oldest 70% of weeks, reserves the next 15% for calibration, and reports the
-untouched final 15% holdout. Decisions use fixed thresholds:
+all but the last two weeks, reserves the second-to-last week for calibration, and
+reports the untouched final week as the holdout (the task predicts one week). Decisions use fixed thresholds:
 `0.30` for all labels except `push`, which uses `0.45`. (Per-label F1
 calibration was removed: the calibration weeks fall in the September activity
 surge, so it picked thresholds of 0.05-0.10 and scored 43.4 vs 53.4.) Metrics

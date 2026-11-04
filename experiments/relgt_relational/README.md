@@ -58,7 +58,7 @@ groups. Copying a previous run's `cache/` into a new `--output-dir` skips
 rebuilding them. A stale cache is detected and rebuilt.
 
 `predict` trains on the weeks whose label window ends by `--cutoff`. It
-calibrates thresholds on the last 30% of those weeks, builds the 14-day snapshot
+calibrates thresholds on the latest of those weeks, builds the 14-day snapshot
 and root features at `--cutoff` for the users in `test_input.csv`, and writes
 `predictions.csv`, `probabilities.csv`, `metadata.json` and the weights.
 

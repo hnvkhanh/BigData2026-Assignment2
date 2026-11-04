@@ -147,7 +147,7 @@ Push ingestion lag (6 days, as in this release):
 1. Download the final release (11/11) and run
    `python -m experiments.drift_lightgbm.run predict` (variant `relational`). It
    trains on **every** week whose label window has ended (the
-   `relational_lightgbm` predict command trains only on the first 70% of weeks)
+   `relational_lightgbm` predict command holds back the latest week for calibration)
    and uses the fixed thresholds.
 2. Read the printed line `Push data ends ... other tables end ...`. If pushes
    lag by more than a day, predict with a lag-matched variant instead, e.g.

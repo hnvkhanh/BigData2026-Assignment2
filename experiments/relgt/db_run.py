@@ -476,7 +476,7 @@ def run_db_prediction(args: argparse.Namespace, context: DatabaseContext | None 
     examples = load_or_build_db_examples(args, context)
     usable_indices = prediction_example_indices(examples.cutoff_days, args.cutoff)
     usable_cutoffs = examples.cutoff_days[usable_indices]
-    train_end, _ = chronological_splits(usable_cutoffs)
+    train_end, _ = chronological_splits(usable_cutoffs, holdout=False)
     train_indices = usable_indices[usable_cutoffs < train_end]
     train_indices, unused_train_indices = subsample_train_indices(train_indices, args)
     calibration_indices = np.union1d(

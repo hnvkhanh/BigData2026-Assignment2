@@ -41,7 +41,7 @@ or holdout examples.
 
 - Inputs: 14-day graph snapshots, shared with the other RelGT experiments
   (`load_or_build_examples`).
-- Split: oldest 70% of cutoffs train, next 15% calibration, latest 15% holdout.
+- Split: latest week holdout, the week before it calibration, all earlier weeks train.
 - Each chunk model trains on its chunk's training rows only. Its probability
   thresholds are chosen on its own chunk's calibration rows only.
 - `global` (skip with `--no-global-baseline`) trains on all training rows and

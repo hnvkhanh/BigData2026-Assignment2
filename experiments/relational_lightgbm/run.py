@@ -187,7 +187,7 @@ def run_prediction(
     data, histories, cohort_user_ids, tables = build_examples(db_dir, start_cutoff, groups)
     data = training_data_before(data, cutoff)
     cutoffs = [pd.Timestamp(value) for value in sorted(data["cutoff"].unique())]
-    train_end, _ = chronological_splits(cutoffs)
+    train_end, _ = chronological_splits(cutoffs, holdout=False)
     feature_columns = feature_columns_for(data)
     train = data.loc[data["cutoff"] < train_end]
     calibration = data.loc[data["cutoff"] >= train_end]
