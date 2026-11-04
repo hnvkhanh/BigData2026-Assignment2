@@ -3,3 +3,5 @@ pyarrow
 numpy
 lightgbm>=4.0
 scikit-learn
+plotly
+dash
