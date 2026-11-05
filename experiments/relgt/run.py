@@ -44,9 +44,66 @@ Using that pr_review_comment ~ subset of pr_review (see experiments/gnn_review),
 Every run also tunes the thresholds jointly on the score over the validation weeks and keeps
 them if they beat the per-label F1 thresholds.
 
+--history (off by default) adds the baseline's per-user history features (counts over 7 / 14 /
+30 / 90 days and overall, days since the last event, active days, repositories, open PRs and
+issues; experiments/baseline/run.py build_week) to the seed token the same way as --habit. Each
+source uses its own staleness cutoff, the same rule as the graph's visibility.
+
+--path-budget path (off by default) replaces the uniform token sample by per-path budgets. A
+path is the table of a 1-hop node, or the tables of (1-hop node, 2-hop node), e.g. User ->
+Pushes or User -> PRReviews -> PullRequests. The K-1 tokens are split evenly over the paths the
+seed has, a path with fewer candidates passing its spare tokens to the others, so a frequent
+path (pushes) no longer crowds out a rare one (reviews). --path-order recent fills each path
+with its latest rows instead of random ones.
+
+Relation-aware extensions, each off by default:
+  * --path-token: the token's path (above; the seed and the random fallback have their own ids)
+    is embedded as a sixth token element. Type and hop alone cannot tell a repository reached
+    through pushes from one reached through comments.
+  * --rel-pe: the GIN positional encoding passes GINE messages ReLU(x_src + e_rel), e_rel a
+    learned embedding of the edge's FK relation (e.g. PRReviews.pr_id) and direction.
+  * --attn-bias: a learned per-head bias on the local attention logits, one term for the hop
+    pair of the two tokens and one for the relation of each FK edge between them (as in
+    Graphormer's spatial / edge encodings); zero-initialised.
+  * --action-edges sequence|repo|both: the FK graph links a user's actions only through the user
+    or a shared PR / issue / repository node, which is rarely sampled with them. This adds token
+    edges between a seed's sampled activity rows of the same actor, each to the next one in time
+    (sequence) or the next one in the same repository (repo), as new relations for the GIN, and
+    for --rel-pe / --attn-bias. Built among the visible tokens only, so they leak nothing.
+
+--graph-structure chain (default fk) changes the graph itself: each activity row is linked to its
+actor's previous and next row of the same table, and keeps its other FKs (repo, PR, issue, review,
+reply) but not its actor FK. For each example the user is linked instead to the latest visible row
+of each of its chains, and any other user's row among the tokens to that user, who joins the tokens
+with it (sample_walk, subgraph_edges). Tokens come from a breadth-first walk from the user (nearest
+hops first, at most --max-hops), so the newest actions are nearest and the walk goes back in time.
+--chain-seed latest makes the user's latest visible action token 0 instead of the user: the walk
+starts there and at the latest action of each other type, the user is a hop 1 token,
+and the readout is taken from that action. Its time is kept (a user seed has time 0), so the
+seed token carries how long ago the user was last active. --num-seeds N makes the N latest actions
+the seeds (all hop 0, part of the K tokens, fewer if the user has fewer): the walk starts from all of
+them, the readout and the codebook query use the mean of the seed tokens, the other tokens are
+attention-weighted on that mean, and --history / --habit features join every seed token.
+--recency-attn (off by default) makes the model attend more to recent actions without changing the
+tokens: the attention weight of an action D days older than the example's newest action token is
+multiplied by (1 + D / --recency-days) ^ -decay, in the local attention and in the readout. Decay is
+learned, starts at 1 and is at least 0, one per head and one for the readout; Users and Repositories
+are not actions and keep their weight. The learned values are saved in metrics.json.
+
+--exclude-push hides every Pushes row from the graph, so tokens are never pushes and a repository
+reached only through pushes is not reached. The 6 labels (push included), the eligibility rule and
+the --history features do not change. A user with only pushes has no neighbours left and gets the
+random fallback tokens.
+
+--lookback-days N (default: all history) hides activity rows older than N days before their
+table's cutoff, so the tokens come from recent activity only; Users and Repositories stay visible.
+The --history / --habit seed features keep their own windows.
+
 Run from the repo root (needs PyTorch, a GPU is used if available):
     python experiments/relgt/run.py
     python experiments/relgt/run.py --habit --review-aux --name habit_aux
+    python experiments/relgt/run.py --history --name history
+    python experiments/relgt/run.py --test-pre-june --history --name test_pre_june_history
 """
 import argparse
 import hashlib
@@ -109,6 +166,17 @@ FILE_EXTENSIONS = ["py", "ts", "md", "rs", "go", "java", "tsx", "cpp", "yml", "c
                    "yaml", "json", "kt"]
 USER_SETS = ["all", "test", "exclude-test"]
 MAX_HOP = 3  # 1- and 2-hop neighbours, 3 = random fallback node
+RELATIONS = [(t, col) for t in TABLES for col, _ in FKEYS.get(t, [])]  # edge types, x2 for direction
+N_REL = len(RELATIONS)
+# Who performed each activity row; --action-edges chains a user's actions through it.
+ACTOR_COL = {"PullRequests": "author_id", "Issues": "author_id", "IssueComments": "author_id",
+             "PRReviews": "reviewer_id", "PRReviewComments": "author_id", "Pushes": "user_id"}
+# --action-edges: which chains to add, as (relation offset, chain within a repository only).
+ACTION_CHAINS = {"none": [], "sequence": [(0, False)], "repo": [(1, True)], "both": [(0, False), (1, True)]}
+N_ACTION_REL = 2  # next action, next action in the same repository
+# --graph-structure chain: "next action of the same type by the same actor", then its reverse.
+CHAIN_REL = 2 * N_REL + 2 * N_ACTION_REL
+N_ALL_REL = CHAIN_REL + 2  # relation ids with every option on
 
 
 # --- Relational entity graph -----------------------------------------------------------------
@@ -177,11 +245,18 @@ def csr(src, dst, n):
 
 
 class Graph:
-    """All rows of all tables as one node set: type, row time, features and FK adjacency."""
+    """All rows of all tables as one node set: type, row time, features and FK adjacency.
 
-    def __init__(self):
+    structure="fk": every FK is an edge. "chain": the actor FK of an activity row (ACTOR_COL)
+    is replaced by edges to the actor's previous and next row of the same table (CHAIN_REL). All
+    other FKs stay. A table's rows become visible in row-time order, so the visible part of a chain
+    is a prefix and a chain edge never points at a row after the cutoff. Which row is a user's
+    latest depends on the cutoff, so user links are made per example (subgraph_edges)."""
+
+    def __init__(self, structure="fk"):
+        self.structure = structure
         t0 = time.time()
-        sizes, times, self.feats, self.later, fsrc, fdst = [], [], [], [], [], []
+        sizes, times, self.feats, self.later, fsrc, fdst, frel = [], [], [], [], [], [], []
         frames = {}
         for name in TABLES:
             cols = [TIME_COL[name]] + [c for c, _ in FKEYS.get(name, [])] + COLUMNS[name]
@@ -190,22 +265,49 @@ class Graph:
         self.offset = np.concatenate([[0], np.cumsum(sizes)])
         self.n = int(self.offset[-1])
         self.ntype = np.repeat(np.arange(len(TABLES), dtype=np.int64), sizes)
+        self.actor = np.full(self.n, -1, np.int64)  # user node of an activity row, -1 otherwise
+        self.repo = np.full(self.n, -1, np.int64)  # repository node of a row, -1 if none
+        self.next_row = np.full(self.n, -1, np.int64)  # chain: the actor's next row of the table
+        self.actor_rel = np.full(len(TABLES), -1, np.int64)  # per table, the relation of its actor FK
         for t, name in enumerate(TABLES):
             d = frames.pop(name)
             times.append(days(d[TIME_COL[name]]))
             for col, ref in FKEYS.get(name, []):
                 v = d[col].to_numpy(dtype="float64", na_value=np.nan)
                 m = ~np.isnan(v)
-                fsrc.append(self.offset[t] + np.flatnonzero(m))
-                fdst.append(self.offset[TABLES.index(ref)] + v[m].astype(np.int64))
+                src = self.offset[t] + np.flatnonzero(m)
+                dst = self.offset[TABLES.index(ref)] + v[m].astype(np.int64)
+                rel = np.full(m.sum(), RELATIONS.index((name, col)), np.int64)
+                if col == ACTOR_COL.get(name):
+                    self.actor[src] = dst
+                    self.actor_rel[t] = rel[0] if len(rel) else -1
+                    if structure == "chain":
+                        o = np.lexsort((src, times[-1][src - self.offset[t]], dst))  # by actor, then time
+                        src, dst = src[o], dst[o]
+                        same = dst[1:] == dst[:-1]
+                        fsrc.append(src[:-1][same])  # earlier row -> next row
+                        fdst.append(src[1:][same])
+                        frel.append(np.full(same.sum(), CHAIN_REL, np.int64))
+                        self.next_row[src[:-1][same]] = src[1:][same]
+                        continue
+                elif col == "repo_id":
+                    self.repo[src] = dst
+                fsrc.append(src)
+                fdst.append(dst)
+                frel.append(rel)
             x, lat = row_features(name, d)
             self.feats.append(x)
             self.later.append(lat)
         self.time = np.concatenate(times)
         fsrc, fdst = np.concatenate(fsrc), np.concatenate(fdst)
         self.fptr, self.fadj = csr(fsrc, fdst, self.n)  # forward FK edges, for subgraph adjacency
+        self.frel = csr(fsrc, np.concatenate(frel), self.n)[1]  # their relation, in the same order
         self.ptr, self.adj = csr(np.concatenate([fsrc, fdst]), np.concatenate([fdst, fsrc]), self.n)
-        print(f"graph: {self.n:,} nodes, {len(fsrc):,} FK edges ({time.time() - t0:.0f}s)")
+        # Each user's activity rows by table, then time: finds the latest visible row of a chain.
+        rows = np.flatnonzero(self.actor >= 0)
+        rows = rows[np.lexsort((self.time[rows], self.ntype[rows]))]
+        self.aptr, self.aadj = csr(self.actor[rows], rows, self.n)
+        print(f"graph ({structure}): {self.n:,} nodes, {len(fsrc):,} edges ({time.time() - t0:.0f}s)")
 
 
 # --- Tokenisation (utils.py: gather_1_and_2_hop_with_seed_time, _process_one_seed) -----------
@@ -217,37 +319,97 @@ def expand(ptr, adj, ids, nodes):
     return np.repeat(ids, cnt), adj[np.repeat(start, cnt) + within]
 
 
-def cap(group, value, k, rng):
-    """Keep at most k random values per group."""
+def cap(group, value, k, rng, time=None):
+    """Keep at most k values per group: random ones, or with time (row time per node) the newest."""
     if not len(group) or np.bincount(group).max() <= k:
         return group, value
-    order = np.lexsort((rng.random(len(group)), group))
+    tie = rng.random(len(group))
+    order = np.lexsort((tie, group) if time is None else (tie, -time[value], group))
     group, value = group[order], value[order]
     first = np.r_[0, np.flatnonzero(np.diff(group)) + 1]
     rank = np.arange(len(group)) - np.repeat(first, np.diff(np.r_[first, len(group)]))
     return group[rank < k], value[rank < k]
 
 
-def sample_tokens(G, seeds, cutoff, K, rng, cap1=5000, cap2=1000):
-    """K tokens (node, hop) per seed from its 1- and 2-hop neighbours visible before the cutoff."""
+N_PATHS = len(TABLES) * (len(TABLES) + 1)  # 1-hop: table of the node; 2-hop: (1-hop table, table)
+
+
+def path_budget(c, k, rng):
+    """Tokens per (seed, path) from candidate counts c [seeds, paths], k per seed (water-filling).
+
+    Every path gets min(count, level) with the level as high as k allows; the few tokens left
+    go to random paths that still have unused candidates.
+    """
+    lo, hi = np.zeros(len(c), np.int64), np.full(len(c), k, np.int64)
+    while (lo < hi).any():
+        mid = (lo + hi + 1) // 2
+        ok = np.minimum(c, mid[:, None]).sum(1) <= k
+        lo, hi = np.where(ok, mid, lo), np.where(ok, hi, mid - 1)
+    alloc = np.minimum(c, lo[:, None])
+    rem = k - alloc.sum(1)
+    room = c > alloc
+    rank = np.argsort(np.argsort(-np.where(room, rng.random(c.shape), -1.0), 1), 1)
+    return alloc + (room & (rank < rem[:, None]))
+
+
+def visible_nodes(G, cutoff, lookback=None, exclude_push=False):
+    """Rows before their table's cutoff; with lookback (days), activity rows older than
+    cutoff - lookback are hidden too (Users and Repositories stay visible). exclude_push hides
+    every Pushes row."""
     visible = G.time < cutoff[G.ntype]
+    if exclude_push:
+        visible &= G.ntype != TABLES.index("Pushes")
+    if lookback:
+        activity = np.array([t in LAG_KEY for t in TABLES])[G.ntype]
+        visible &= ~activity | (G.time >= cutoff[G.ntype] - lookback)
+    return visible
+
+
+def sample_tokens(G, seeds, cutoff, K, rng, cap1=5000, cap2=1000, budget="uniform", order="random",
+                  lookback=None, exclude_push=False, fk_order="random"):
+    """K tokens (node, hop) per seed from its 1- and 2-hop neighbours visible before the cutoff.
+
+    fk_order="recent" prefers newer rows: the caps keep the newest neighbours and the K-1 tokens
+    are the newest of the union (random otherwise).
+
+    budget="uniform" samples the union of both hops uniformly; "path" splits the K-1 tokens
+    evenly over the seed's paths (path_budget), taking a random subset (order="random") or the
+    latest rows (order="recent") of each path. lookback and exclude_push limit the visible rows
+    (visible_nodes).
+    """
+    visible = visible_nodes(G, cutoff, lookback, exclude_push)
+    recent = G.time if fk_order == "recent" else None
     b1, v1 = expand(G.ptr, G.adj, np.arange(len(seeds)), seeds)
     m = visible[v1]
-    b1, v1 = cap(b1[m], v1[m], cap1, rng)
+    b1, v1 = cap(b1[m], v1[m], cap1, rng, recent)
     i2, v2 = expand(G.ptr, G.adj, np.arange(len(v1)), v1)
     m = visible[v2] & (v2 != seeds[b1[i2]])
-    i2, v2 = cap(i2[m], v2[m], cap2, rng)
+    i2, v2 = cap(i2[m], v2[m], cap2, rng, recent)
 
     # Union of both hops, each node once at its smallest hop, in random order per seed.
     b = np.concatenate([b1, b1[i2]])
     v = np.concatenate([v1, v2])
     hop = np.concatenate([np.ones(len(v1), np.int8), np.full(len(v2), 2, np.int8)])
+    path = np.concatenate([G.ntype[v1], len(TABLES) * (1 + G.ntype[v1[i2]]) + G.ntype[v2]])
     key = b * G.n + v
-    order = np.lexsort((hop, key))
-    first = np.r_[True, key[order][1:] != key[order][:-1]]
-    b, v, hop = b[order][first], v[order][first], hop[order][first]
-    order = np.lexsort((rng.random(len(b)), b))
-    v, hop = v[order], hop[order]
+    order_ = np.lexsort((hop, key))
+    first = np.r_[True, key[order_][1:] != key[order_][:-1]]
+    b, v, hop, path = b[order_][first], v[order_][first], hop[order_][first], path[order_][first]
+
+    if budget == "path":  # keep each (seed, path)'s budget, the rest of the code then picks them all
+        c = np.bincount(b * N_PATHS + path, minlength=len(seeds) * N_PATHS).reshape(len(seeds), N_PATHS)
+        alloc = path_budget(c, K - 1, rng)
+        prio = -G.time[v] if order == "recent" else np.zeros(len(b))
+        o = np.lexsort((rng.random(len(b)), prio, path, b))
+        b, v, hop, path = b[o], v[o], hop[o], path[o]
+        g = b * N_PATHS + path
+        start = np.r_[0, np.flatnonzero(np.diff(g)) + 1]
+        rank = np.arange(len(g)) - np.repeat(start, np.diff(np.r_[start, len(g)]))
+        keep = rank < alloc.ravel()[g]
+        b, v, hop, path = b[keep], v[keep], hop[keep], path[keep]
+    tie = rng.random(len(b))
+    order = np.lexsort((tie, b) if recent is None else (tie, -recent[v], b))
+    v, hop, path = v[order], hop[order], path[order]
 
     cnt = np.bincount(b, minlength=len(seeds))
     start = np.cumsum(cnt) - cnt
@@ -255,28 +417,214 @@ def sample_tokens(G, seeds, cutoff, K, rng, cap1=5000, cap2=1000):
                     (rng.random((len(seeds), K - 1)) * cnt[:, None]).astype(np.int64))
     nodes = np.empty((len(seeds), K), np.int64)
     hops = np.zeros((len(seeds), K), np.int8)
+    paths = np.full((len(seeds), K), N_PATHS, np.int8)  # N_PATHS = seed, N_PATHS + 1 = fallback
     nodes[:, 0] = seeds
     has = cnt > 0
     pos = (start[:, None] + pick)[has]
-    nodes[has, 1:], hops[has, 1:] = v[pos], hop[pos]
+    nodes[has, 1:], hops[has, 1:], paths[has, 1:] = v[pos], hop[pos], path[pos]
     if (~has).any():
         nodes[~has, 1:] = rng.choice(np.flatnonzero(visible), size=((~has).sum(), K - 1))
         hops[~has, 1:] = MAX_HOP
-    return nodes, hops
+        paths[~has, 1:] = N_PATHS + 1
+    return nodes, hops, paths
 
 
-def subgraph_edges(G, nodes):
-    """Edges among each seed's K tokens: (seed row, token i, token j), both directions."""
+def sample_walk(G, seeds, cutoff, K, rng, max_hops, cap1=1000, lookback=None, start="user", exclude_push=False,
+                num_seeds=1, fk_order="random"):
+    """--graph-structure chain: K tokens per example by a breadth-first walk over the visible graph,
+    nearest hops first, up to max_hops; a hop with more new nodes than the example's remaining budget
+    gives a random subset. Every node reached is a token once; if they do not fill K the rest repeat
+    random ones. An example with nothing reachable gets random rows, hop max_hops + 1.
+
+    start="user": token 0 is the user. start="latest": token 0 is the user's latest visible action
+    (the user if it has none), with num_seeds > 1 the first tokens, hop 0, are the num_seeds latest
+    (fewer if it has fewer), newest first, and the user is a hop 1 token. Either way the first hop
+    holds the latest visible row of each of the user's chains that is not a seed.
+
+    An activity row of another user brings that user in as a token, one hop further, so a sampled
+    row always shows whose it is (subgraph_edges links them); the two share the budget. The walk does
+    not go on from another user: their other rows are reached only through chains and shared nodes.
+
+    fk_order="recent": where nodes compete (the cap on a node's neighbours, the budget of a hop, the
+    final tokens), the newer rows win instead of random ones."""
+    visible = visible_nodes(G, cutoff, lookback, exclude_push)
+    recent = G.time if fk_order == "recent" else None
+    B = len(seeds)
+    users = TABLES.index("Users")
+
+    def owner(v):
+        """The visible actor of each node, -1 if it has none."""
+        a = G.actor[v]
+        return np.where((a >= 0) & visible[a], a, -1)
+
+    b_, a_ = expand(G.aptr, G.aadj, np.arange(B), seeds)  # own rows by seed, table, then time
+    m = visible[a_]
+    b_, a_ = b_[m], a_[m]
+    last = np.r_[(b_[1:] != b_[:-1]) | (G.ntype[a_[1:]] != G.ntype[a_[:-1]]), True][:len(a_)]  # per chain
+    anchor_b, anchor_v = b_[last], a_[last]
+    roots = seeds.copy()
+    seed_b, seed_v, seed_r = np.arange(B), seeds, np.zeros(B, np.int64)  # example, node, rank (0 = newest)
+    if start == "latest" and len(anchor_b):
+        o = np.lexsort((a_, G.time[a_], b_))[::-1]  # per example, newest first
+        sb, sv = b_[o], a_[o]
+        group = np.r_[0, np.flatnonzero(np.diff(sb)) + 1]
+        rank = np.arange(len(sb)) - np.repeat(group, np.diff(np.r_[group, len(sb)]))
+        pick_seed = rank < num_seeds
+        none = np.setdiff1d(np.arange(B), sb)  # no visible action: the user stays the seed
+        seed_b = np.r_[sb[pick_seed], none]
+        seed_v = np.r_[sv[pick_seed], seeds[none]]
+        seed_r = np.r_[rank[pick_seed], np.zeros(len(none), np.int64)]
+        o = np.lexsort((seed_r, seed_b))
+        seed_b, seed_v, seed_r = seed_b[o], seed_v[o], seed_r[o]
+        roots = seed_v[seed_r == 0]
+    keep = ~np.isin(anchor_b * G.n + anchor_v, seed_b * G.n + seed_v)
+    anchor_b, anchor_v = anchor_b[keep], anchor_v[keep]
+    n_seed = np.bincount(seed_b, minlength=B)
+
+    seen = np.sort(seed_b * G.n + seed_v)
+    count = np.zeros(B, np.int64)
+    fb, fv = seed_b, seed_v  # frontier: example and node
+    out_b, out_v, out_h, out_p = [], [], [], []
+    own = np.flatnonzero((roots != seeds) & visible[seeds] & (n_seed < K))  # action seeds: the user is a token
+    if len(own):
+        seen = np.union1d(seen, own * G.n + seeds[own])
+        count[own] += 1
+        fb, fv = np.r_[fb, own], np.r_[fv, seeds[own]]
+        out_b.append(own)
+        out_v.append(seeds[own])
+        out_h.append(np.ones(len(own), np.int8))
+        out_p.append(G.ntype[seeds[own]])
+    for hop in range(1, max_hops + 1):
+        i, v = expand(G.ptr, G.adj, np.arange(len(fb)), fv)
+        m = visible[v]
+        i, v = cap(i[m], v[m], cap1, rng, recent)
+        b, par = fb[i], fv[i]
+        if hop == 1:
+            b, v, par = np.r_[b, anchor_b], np.r_[v, anchor_v], np.r_[par, roots[anchor_b]]
+        key = b * G.n + v
+        key, idx = np.unique(key, return_index=True)
+        b, v, par = b[idx], v[idx], par[idx]
+        new = ~np.isin(key, seen, assume_unique=True)
+        b, v, par, key = b[new], v[new], par[new], key[new]
+        tie = rng.random(len(b))
+        o = np.lexsort((tie, b) if recent is None else (tie, -recent[v], b))
+        b, v, par, key = b[o], v[o], par[o], key[o]
+        # In this random order a row costs 1, or 2 if it is the first to bring in a new owner.
+        a = owner(v)
+        with_owner = np.flatnonzero(a >= 0)
+        owner_key = b[with_owner] * G.n + a[with_owner]
+        first_of = with_owner[np.unique(owner_key, return_index=True)[1]]
+        cost = np.ones(len(b), np.int64)
+        cost[first_of[~np.isin(b[first_of] * G.n + a[first_of], seen)]] = 2
+        group = np.r_[0, np.flatnonzero(np.diff(b)) + 1]
+        spent = np.cumsum(cost) - np.repeat(np.r_[0, np.cumsum(cost)[group[1:] - 1]], np.diff(np.r_[group, len(b)]))
+        take = spent <= (K - n_seed - count)[b]
+        b, v, par, key, a = b[take], v[take], par[take], key[take], a[take]
+        if not len(b):
+            break
+        out_b.append(b)
+        out_v.append(v)
+        out_h.append(np.full(len(b), hop, np.int8))
+        out_p.append(G.ntype[v] if hop == 1 else len(TABLES) * (1 + G.ntype[par]) + G.ntype[v])
+        count += np.bincount(b, minlength=B)
+        seen = np.union1d(seen, key)
+        # The owners of the rows just taken, unless already tokens.
+        w = np.flatnonzero(a >= 0)
+        okey, idx = np.unique(b[w] * G.n + a[w], return_index=True)
+        new = ~np.isin(okey, seen, assume_unique=True)
+        w = w[idx[new]]
+        if len(w):
+            out_b.append(b[w])
+            out_v.append(a[w])
+            out_h.append(np.full(len(w), min(hop + 1, max_hops), np.int8))
+            out_p.append(len(TABLES) * (1 + G.ntype[v[w]]) + G.ntype[a[w]])
+            count += np.bincount(b[w], minlength=B)
+            seen = np.union1d(seen, okey[new])
+        go_on = G.ntype[v] != users  # the walk stops at other users
+        fb, fv = b[go_on], v[go_on]
+    b = np.concatenate(out_b) if out_b else np.zeros(0, np.int64)
+    v, hop, path = (np.concatenate(x) if out_b else np.zeros(0, np.int64) for x in (out_v, out_h, out_p))
+    tie = rng.random(len(b))
+    order = np.lexsort((tie, b) if recent is None else (tie, -recent[v], b))
+    v, hop, path = v[order], hop[order], path[order]
+
+    cnt = np.bincount(b, minlength=B)
+    start_ = np.cumsum(cnt) - cnt
+    col = np.arange(K - 1)[None, :]
+    pick = np.where(col < cnt[:, None], col, (rng.random((B, K - 1)) * cnt[:, None]).astype(np.int64))
+    # Columns after the seeds of each example read pick from its start; the seeds overwrite the rest.
+    pick = np.take_along_axis(pick, np.maximum(np.arange(1, K)[None, :] - n_seed[:, None], 0), axis=1)
+    nodes = np.empty((B, K), np.int64)
+    hops = np.zeros((B, K), np.int8)
+    paths = np.full((B, K), N_PATHS, np.int8)
+    has = cnt > 0
+    pos = (start_[:, None] + pick)[has]
+    nodes[has, 1:], hops[has, 1:], paths[has, 1:] = v[pos], hop[pos], path[pos]
+    if (~has).any():
+        nodes[~has, 1:] = rng.choice(np.flatnonzero(visible), size=((~has).sum(), K - 1))
+        hops[~has, 1:] = max_hops + 1
+        paths[~has, 1:] = N_PATHS + 1
+    nodes[seed_b, seed_r], hops[seed_b, seed_r], paths[seed_b, seed_r] = seed_v, 0, N_PATHS
+    return nodes, hops, paths
+
+
+def action_chain(G, nodes, by_repo):
+    """(seed row, token i, token j) linking each seed's activity tokens of the same actor (and
+    repository if by_repo) in row-time order, i the earlier one. Only sampled, visible tokens
+    are chained, so an edge never reveals a row the example cannot see."""
+    K = nodes.shape[1]
+    flat = nodes.ravel()
+    group = G.repo[flat] if by_repo else np.zeros(len(flat), np.int64)
+    pos = np.flatnonzero((G.actor[flat] >= 0) & (group >= 0))
+    row, actor, group = pos // K, G.actor[flat[pos]], group[pos]
+    o = np.lexsort((G.time[flat[pos]], group, actor, row))
+    pos, row, actor, group = pos[o], row[o], actor[o], group[o]
+    nxt = ((row[1:] == row[:-1]) & (actor[1:] == actor[:-1]) & (group[1:] == group[:-1])
+           & (flat[pos[1:]] != flat[pos[:-1]]))
+    a, b = pos[:-1][nxt], pos[1:][nxt]
+    return a // K, a % K, b % K
+
+
+def subgraph_edges(G, nodes, action_edges="none", users=None, visible=None):
+    """Edges among each seed's K tokens: (seed row, token i, token j, relation), both directions.
+
+    The relation of the edge from the referencing row to the referenced one is its FK index, the
+    reverse edge has N_REL added. Action chains (--action-edges) come after them: 2 * N_REL +
+    offset from the earlier action to the later one, plus N_ACTION_REL for the reverse.
+
+    With users (the example's user node) and visible, on the chain graph: the actor FK edges that
+    graph leaves out, per example. A row of another user links to that user; a row of the example's
+    user only if it is the latest visible row of its chain."""
     B, K = nodes.shape
     flat = nodes.ravel()
     p, f = expand(G.fptr, G.fadj, np.arange(B * K), flat)
+    rel = expand(G.fptr, G.frel, np.arange(B * K), flat)[1]
     row = p // K
     keys = np.repeat(np.arange(B), K) * G.n + flat
     order = np.argsort(keys)
     q = np.minimum(np.searchsorted(keys[order], row * G.n + f), len(keys) - 1)
     hit = keys[order][q] == row * G.n + f
-    i, j, r = p[hit] % K, order[q[hit]] % K, row[hit]
-    return np.concatenate([r, r]), np.concatenate([i, j]), np.concatenate([j, i])
+    i, j, r, rel = p[hit] % K, order[q[hit]] % K, row[hit], rel[hit]
+    if users is not None and G.structure == "chain":
+        row_all = np.repeat(np.arange(B), K)
+        actor, nxt = G.actor[flat], G.next_row[flat]
+        pos = np.flatnonzero((actor >= 0) & ((actor != users[row_all]) | (nxt < 0) | ~visible[nxt]))
+        target = row_all[pos] * G.n + actor[pos]
+        q = np.minimum(np.searchsorted(keys[order], target), len(keys) - 1)
+        hit = keys[order][q] == target
+        i = np.r_[i, pos[hit] % K]
+        j = np.r_[j, order[q[hit]] % K]
+        r = np.r_[r, row_all[pos[hit]]]
+        rel = np.r_[rel, G.actor_rel[G.ntype[flat[pos[hit]]]]]
+    rs, is_, js, rels = [r, r], [i, j], [j, i], [rel, np.where(rel < N_REL, rel + N_REL, rel + 1)]
+    for offset, by_repo in ACTION_CHAINS[action_edges]:
+        r, i, j = action_chain(G, nodes, by_repo)
+        fwd = np.full(len(r), 2 * N_REL + offset, np.int64)
+        rs += [r, r]
+        is_ += [i, j]
+        js += [j, i]
+        rels += [fwd, fwd + N_ACTION_REL]
+    return np.concatenate(rs), np.concatenate(is_), np.concatenate(js), np.concatenate(rels)
 
 
 # --- Model (model.py, local_module.py, codebook.py, encoders.py) -----------------------------
@@ -367,16 +715,22 @@ class RowEncoder(nn.Module):
 
     def rel_time(self, nodes, week):
         t = self.week_day[week][:, None] - self.node_time[nodes]
-        t[:, 0] = 0.0  # the seed token has time 0, as in utils.py
+        user = self.ntype[nodes[:, 0]] == TABLES.index("Users")  # chain --chain-seed latest: an action
+        t[:, 0] = torch.where(user, torch.zeros_like(t[:, 0]), t[:, 0])  # a user seed has time 0, as in utils.py
         return t
 
 
 class GNNPEEncoder(nn.Module):
-    """GIN over each sampled subgraph with random scalar inputs (encoders.py, pe_dim=0)."""
+    """GIN over each sampled subgraph with random scalar inputs (encoders.py, pe_dim=0).
 
-    def __init__(self, d, layers=4):
+    relational=True makes it relation-aware as in GINE: each message is ReLU(x_src + e_rel), with
+    a learned embedding per layer of the FK relation and direction of the edge."""
+
+    def __init__(self, d, layers=4, relational=False, n_rel=2 * N_REL):
         super().__init__()
         h = d // 4
+        self.rel = (nn.ModuleList([nn.Embedding(n_rel, h) for _ in range(layers)])
+                    if relational else None)
         self.input_proj = nn.Linear(1, h)
         self.mlps = nn.ModuleList([nn.Sequential(nn.Linear(h, 2 * h), nn.BatchNorm1d(2 * h), nn.ReLU(),
                                                  nn.Linear(2 * h, h)) for _ in range(layers)])
@@ -387,13 +741,58 @@ class GNNPEEncoder(nn.Module):
             nn.init.xavier_uniform_(lin.weight)
             nn.init.zeros_(lin.bias)
 
-    def forward(self, edge_index, B, K):
+    def forward(self, edge_index, edge_type, B, K):
         x = self.input_proj(torch.randn(B * K, 1, device=edge_index.device))
         src, dst = edge_index
         for i, mlp in enumerate(self.mlps):
-            agg = torch.zeros_like(x).index_add_(0, dst, x[src])
+            msg = x[src] if self.rel is None else F.relu(x[src] + self.rel[i](edge_type))
+            agg = torch.zeros_like(x).index_add_(0, dst, msg)
             x = x + F.relu(self.bns[i](mlp((1 + self.eps[i]) * x + agg)))
         return self.final_transform(x).view(B, K, -1)
+
+
+class AttentionBias(nn.Module):
+    """Per-head bias of the local attention logits (Graphormer-style spatial and edge encoding):
+    one term for the hop pair of the two tokens, plus one for the FK relation and direction of
+    every edge between them. Zero at the start, so training starts from plain attention."""
+
+    def __init__(self, heads, n_rel=2 * N_REL, max_hop=MAX_HOP):
+        super().__init__()
+        self.max_hop = max_hop
+        self.hop = nn.Embedding((max_hop + 1) ** 2, heads)
+        self.rel = nn.Embedding(n_rel, heads)
+        nn.init.zeros_(self.hop.weight)
+        nn.init.zeros_(self.rel.weight)
+
+    def forward(self, hops, edge_index, edge_type):
+        K = hops.shape[1]
+        bias = self.hop(hops[:, :, None] * (self.max_hop + 1) + hops[:, None, :])  # [B, K, K, heads]
+        src, dst = edge_index
+        bias = bias.index_put((src // K, src % K, dst % K), self.rel(edge_type), accumulate=True)
+        return bias.permute(0, 3, 1, 2)  # [B, heads, K, K]
+
+
+class RecencyBias(nn.Module):
+    """--recency-attn: logit bias -decay * log(1 + D / days) on attending to an action D days older than
+    the example's newest action token, so its weight is multiplied by (1 + D / days) ^ -decay. Tokens
+    that are not actions get no bias. Decay starts at 1, one per head and one for the readout."""
+
+    def __init__(self, heads, days):
+        super().__init__()
+        self.days = days
+        self.raw_decay = nn.Parameter(torch.full((heads + 1,), math.log(math.e - 1)))  # softplus gives 1
+        self.register_buffer("is_action", torch.tensor([t in LAG_KEY for t in TABLES]), persistent=False)
+
+    def decay(self):
+        return F.softplus(self.raw_decay)
+
+    def forward(self, age, types):
+        action = self.is_action[types]
+        newest = age.masked_fill(~action, math.inf).amin(1, keepdim=True)
+        older = ((age - newest).clamp(min=0) / self.days).log1p().masked_fill(~action, 0)
+        decay = self.decay()
+        attn = -decay[:-1].view(1, -1, 1, 1) * older[:, None, None, :]  # [B, heads, 1, K]: towards each token
+        return attn, -decay[-1] * older.unsqueeze(-1)  # readout: [B, K, 1]
 
 
 class FeedForwardNetwork(nn.Module):
@@ -424,18 +823,20 @@ class EncoderLayer(nn.Module):
         self.ffn_norm = nn.LayerNorm(d)
         self.ffn = FeedForwardNetwork(d, ffn, dropout)
 
-    def forward(self, x):
+    def forward(self, x, bias=None):
         B, L, D = x.shape
         h = self.self_attention_norm(x)
         q, k, v = (p(h).view(B, L, self.heads, D // self.heads).transpose(1, 2)
                    for p in [self.q_proj, self.k_proj, self.v_proj])
-        a = F.scaled_dot_product_attention(q, k, v, dropout_p=self.attn_dropout if self.training else 0.0)
+        a = F.scaled_dot_product_attention(q, k, v, attn_mask=bias,
+                                           dropout_p=self.attn_dropout if self.training else 0.0)
         x = x + self.self_attention_dropout(self.out_proj(a.transpose(1, 2).reshape(B, L, D)))
         return x + self.ffn(self.ffn_norm(x))
 
 
 class LocalModule(nn.Module):
-    """Transformer over the K tokens; readout = seed token + attention-weighted neighbours."""
+    """Transformer over the K tokens; readout = seed token + attention-weighted neighbours.
+    With seed_mask (--num-seeds > 1) the seed token is the mean of the masked tokens."""
 
     def __init__(self, d, layers, heads, dropout, attn_dropout):
         super().__init__()
@@ -445,13 +846,24 @@ class LocalModule(nn.Module):
         self.final_ln = nn.LayerNorm(d)
         self.attn_layer = nn.Linear(2 * d, 1)
 
-    def forward(self, x_set):
+    def forward(self, x_set, bias=None, seed_mask=None, readout_bias=None):
         x = self.att_embeddings_nope(x_set)
         for layer in self.layers:
-            x = layer(x)
+            x = layer(x, bias)
         x = self.final_ln(x)
+        if seed_mask is not None:
+            m = seed_mask.unsqueeze(-1)
+            node = (x * m).sum(1, keepdim=True) / m.sum(1, keepdim=True)
+            logits = self.attn_layer(torch.cat([node.expand_as(x), x], 2))
+            if readout_bias is not None:
+                logits = logits + readout_bias
+            logits = logits.masked_fill(m, -math.inf)
+            return (node + (x * F.softmax(logits, dim=1)).sum(1, keepdim=True)).squeeze(1)
         node, nbr = x[:, :1], x[:, 1:]
-        w = F.softmax(self.attn_layer(torch.cat([node.expand_as(nbr), nbr], 2)), dim=1)
+        logits = self.attn_layer(torch.cat([node.expand_as(nbr), nbr], 2))
+        if readout_bias is not None:
+            logits = logits + readout_bias[:, 1:]
+        w = F.softmax(logits, dim=1)
         return (node + (nbr * w).sum(1, keepdim=True)).squeeze(1)
 
 
@@ -518,31 +930,38 @@ class RelGTLayer(nn.Module):
             self.c_idx[seed_idx] = self.vq.update(q_x.detach())
         return out
 
-    def forward(self, x_set, x, seed_idx):
+    def forward(self, x_set, x, seed_idx, bias=None, seed_mask=None, readout_bias=None):
         out = []
         if self.conv_type != "global":
-            out.append(self.layer_norm_local(self.local_module(x_set)))
+            out.append(self.layer_norm_local(self.local_module(x_set, bias, seed_mask, readout_bias)))
         if self.conv_type != "local":
             out.append(self.layer_norm_global(self.global_forward(x, seed_idx)))
         return torch.cat(out, 1)
 
 
 class RelGT(nn.Module):
-    ELEMENTS = ["type", "hop", "time", "tfs", "gnn"]
+    ELEMENTS = ["type", "hop", "time", "tfs", "gnn", "path"]
 
     def __init__(self, G, cutoffs, week_day, num_seeds, n_out, channels=128, local_layers=1, heads=4,
-                 dropout=0.3, num_centroids=1024, conv_type="full", ablate="none", n_seed_feats=0):
+                 dropout=0.3, num_centroids=1024, conv_type="full", ablate="none", n_seed_feats=0,
+                 path_token=False, rel_pe=False, attn_bias=False, action_edges=False, chain=False,
+                 max_hop=MAX_HOP, multi_seed=False, recency_days=None):
         super().__init__()
         c = channels
+        self.multi_seed = multi_seed  # several hop-0 tokens per example (--num-seeds > 1)
+        n_rel = N_ALL_REL if chain else 2 * N_REL + (2 * N_ACTION_REL if action_edges else 0)
         self.rows = RowEncoder(G, cutoffs, week_day, c, dropout)
         self.seed_encoder = (nn.Sequential(nn.Linear(n_seed_feats, c), nn.ReLU(), nn.Linear(c, c))
                              if n_seed_feats else None)
         self.type_encoder = nn.Embedding(len(TABLES) + 1, c)
-        self.hop_encoder = nn.Embedding(MAX_HOP + 2, c)
+        self.hop_encoder = nn.Embedding(max_hop + 2, c)  # hops + 1: seed, ..., fallback
         self.time_encoder = TimeEncoder(c)
-        self.pe_encoder = GNNPEEncoder(c)
-        self.norms = nn.ModuleDict({f"{k}_norm": nn.LayerNorm(c) for k in self.ELEMENTS})
-        self.elements = [k for k in self.ELEMENTS if k != ablate]
+        self.pe_encoder = GNNPEEncoder(c, relational=rel_pe, n_rel=n_rel)
+        self.path_encoder = nn.Embedding(N_PATHS + 2, c) if path_token else None
+        self.attn_bias = AttentionBias(heads, n_rel, max_hop) if attn_bias and conv_type != "global" else None
+        self.recency = RecencyBias(heads, recency_days) if recency_days and conv_type != "global" else None
+        self.elements = [k for k in self.ELEMENTS if k != ablate and (k != "path" or path_token)]
+        self.norms = nn.ModuleDict({f"{k}_norm": nn.LayerNorm(c) for k in self.elements})
         self.in_mixture = nn.Sequential(nn.Linear(len(self.elements) * c, 2 * c), nn.ReLU(), nn.Linear(2 * c, c))
         self.conv = RelGTLayer(c, c // 2, local_layers, heads, dropout, dropout, conv_type, num_centroids,
                                num_seeds)
@@ -552,20 +971,36 @@ class RelGT(nn.Module):
         # torch_geometric MLP(num_layers=2): Linear, BatchNorm, ReLU, Linear
         self.head = nn.Sequential(nn.Linear(c, c), nn.BatchNorm1d(c), nn.ReLU(), nn.Linear(c, n_out))
 
-    def forward(self, nodes, hops, week, seed_idx, edge_index, seed_x=None):
+    def forward(self, nodes, hops, paths, week, seed_idx, edge_index, edge_type, seed_x=None):
         B, K = nodes.shape
         tfs, types = self.rows(nodes, week)
+        age = self.rows.rel_time(nodes, week)
         parts = {
             "type": self.type_encoder(types),
             "hop": self.hop_encoder(hops + 1),
-            "time": self.time_encoder(self.rows.rel_time(nodes, week)),
+            "time": self.time_encoder(age),
             "tfs": tfs,
-            "gnn": self.pe_encoder(edge_index, B, K),
+            "gnn": self.pe_encoder(edge_index, edge_type, B, K),
         }
+        if self.path_encoder is not None:
+            parts["path"] = self.path_encoder(paths)
         x_set = self.in_mixture(torch.cat([self.norms[f"{k}_norm"](parts[k]) for k in self.elements], -1))
+        seed_mask = hops == 0 if self.multi_seed else None
         if self.seed_encoder is not None:  # per-user summary features join the seed token
-            x_set = torch.cat([x_set[:, :1] + self.seed_encoder(seed_x).unsqueeze(1), x_set[:, 1:]], 1)
-        out = self.ff(self.conv(x_set, x_set[:, 0], seed_idx))
+            if seed_mask is not None:
+                x_set = x_set + seed_mask.unsqueeze(-1) * self.seed_encoder(seed_x).unsqueeze(1)
+            else:
+                x_set = torch.cat([x_set[:, :1] + self.seed_encoder(seed_x).unsqueeze(1), x_set[:, 1:]], 1)
+        bias = None if self.attn_bias is None else self.attn_bias(hops, edge_index, edge_type)
+        readout_bias = None
+        if self.recency is not None:
+            recent, readout_bias = self.recency(age, types)
+            bias = recent if bias is None else bias + recent
+        query = x_set[:, 0]  # to the global codebook
+        if seed_mask is not None:
+            m = seed_mask.unsqueeze(-1)
+            query = (x_set * m).sum(1) / m.sum(1)
+        out = self.ff(self.conv(x_set, query, seed_idx, bias, seed_mask, readout_bias))
         return self.head(out)
 
 
@@ -574,17 +1009,18 @@ class RelGT(nn.Module):
 class Samples:
     """Tokens, labels and subgraph edges of every (user, week) example, on the device."""
 
-    def __init__(self, nodes, hops, week, cidx, y, edges, device, seed_x=None):
+    def __init__(self, nodes, hops, paths, week, cidx, y, edges, device, seed_x=None):
         self.n, self.K = nodes.shape
         self.seed_x = None if seed_x is None else torch.tensor(seed_x, dtype=torch.float32, device=device)
         self.nodes = torch.tensor(nodes, dtype=torch.int32, device=device)
         self.hops = torch.tensor(hops, device=device)
+        self.paths = torch.tensor(paths, device=device)
         self.week = torch.tensor(week, device=device)
         self.cidx = torch.tensor(cidx, device=device)
         self.y = torch.tensor(y, dtype=torch.float32, device=device)
-        r, i, j = edges
+        r, i, j, rel = edges
         order = np.argsort(r, kind="stable")
-        self.esrc, self.edst = i[order], j[order]  # int16 token positions
+        self.esrc, self.edst, self.erel = i[order], j[order], rel[order]  # int16 token positions, int8
         self.eptr = np.zeros(self.n + 1, np.int64)
         self.eptr[1:] = np.cumsum(np.bincount(r, minlength=self.n))
         self.device = device
@@ -595,9 +1031,11 @@ class Samples:
         shift = np.repeat(np.arange(len(ids)) * self.K, cnt)
         edge_index = torch.tensor(np.stack([self.esrc[pos] + shift, self.edst[pos] + shift]),  # int64
                                   device=self.device)
+        edge_type = torch.tensor(self.erel[pos], dtype=torch.long, device=self.device)
         t = torch.tensor(ids, device=self.device)
         seed_x = None if self.seed_x is None else self.seed_x[t]
-        return (self.nodes[t].long(), self.hops[t].long(), self.week[t], self.cidx[t], edge_index, seed_x), self.y[t]
+        return (self.nodes[t].long(), self.hops[t].long(), self.paths[t].long(), self.week[t], self.cidx[t],
+                edge_index, edge_type, seed_x), self.y[t]
 
 
 def masked_bce(logits, y):
@@ -658,30 +1096,49 @@ def fit(make_model, S, train_ids, args, epochs, val_ids=None):
     return model, best_epoch, history
 
 
-def tokenize(G, groups, cutoffs, K, seed):
-    """Tokens of every example, cached on disk (sampling is the slow part)."""
-    key = hashlib.md5(repr((K, seed, cutoffs.tolist(), [g.tolist() for g in groups], G.n)).encode()).hexdigest()
-    path = CACHE_DIR / f"tokens_K{K}_{key[:12]}.npz"
+def tokenize(G, groups, cutoffs, K, seed, budget="uniform", order="random", action_edges="none", lookback=None,
+             max_hops=None, chain_seed="user", exclude_push=False, num_seeds=1, fk_order="random"):
+    """Tokens of every example, cached on disk (sampling is the slow part). max_hops is used by
+    the chain structure (sample_walk)."""
+    mode = () if budget == "uniform" else (budget, order)
+    mode += () if G.structure == "fk" else (("structure", G.structure, "latest-owner", max_hops),)
+    mode += () if chain_seed == "user" else (("chain_seed", chain_seed),)
+    mode += () if not exclude_push else (("exclude_push",),)
+    mode += () if num_seeds == 1 else (("num_seeds", num_seeds),)
+    mode += () if fk_order == "random" else (("fk_order", fk_order),)
+    mode += () if action_edges == "none" else (("action_edges", action_edges),)
+    mode += () if not lookback else (("lookback", lookback),)
+    key = hashlib.md5(repr((K, seed, cutoffs.tolist(), [g.tolist() for g in groups], G.n) + mode)
+                      .encode()).hexdigest()
+    path = CACHE_DIR / f"tokens2_K{K}_{key[:12]}.npz"  # 2: with token paths and edge relations
     if path.exists():
         z = np.load(path)
         print(f"tokens from {path.name}")
-        return z["nodes"], z["hops"], (z["er"], z["ei"], z["ej"])
+        return z["nodes"], z["hops"], z["paths"], (z["er"], z["ei"], z["ej"], z["erel"])
     t0 = time.time()
     rng = np.random.default_rng(seed)
-    nodes, hops, er, ei, ej, n = [], [], [], [], [], 0
+    nodes, hops, paths, er, ei, ej, erel, n = [], [], [], [], [], [], [], 0
     for w, seeds in enumerate(groups):
-        nd, hp = sample_tokens(G, seeds, cutoffs[w], K, rng)
-        r, i, j = subgraph_edges(G, nd)
+        if G.structure == "chain":
+            nd, hp, pt = sample_walk(G, seeds, cutoffs[w], K, rng, max_hops, lookback=lookback, start=chain_seed,
+                                     exclude_push=exclude_push, num_seeds=num_seeds, fk_order=fk_order)
+        else:
+            nd, hp, pt = sample_tokens(G, seeds, cutoffs[w], K, rng, budget=budget, order=order, lookback=lookback,
+                                       exclude_push=exclude_push, fk_order=fk_order)
+        r, i, j, rel = subgraph_edges(G, nd, action_edges, seeds, visible_nodes(G, cutoffs[w], lookback, exclude_push))
         nodes.append(nd.astype(np.int32))
         hops.append(hp)
+        paths.append(pt)
         er.append((r + n).astype(np.int32))
         ei.append(i.astype(np.int16))
         ej.append(j.astype(np.int16))
+        erel.append(rel.astype(np.int8))
         n += len(seeds)
-    out = np.concatenate(nodes), np.concatenate(hops), (np.concatenate(er), np.concatenate(ei), np.concatenate(ej))
+    edges = tuple(np.concatenate(a) for a in (er, ei, ej, erel))
+    out = np.concatenate(nodes), np.concatenate(hops), np.concatenate(paths), edges
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    np.savez(path, nodes=out[0], hops=out[1], er=out[2][0], ei=out[2][1], ej=out[2][2])
-    print(f"sampled {n:,} examples x {K} tokens, {len(out[2][0]):,} subgraph edges ({time.time() - t0:.0f}s)")
+    np.savez(path, nodes=out[0], hops=out[1], paths=out[2], er=edges[0], ei=edges[1], ej=edges[2], erel=edges[3])
+    print(f"sampled {n:,} examples x {K} tokens, {len(edges[0]):,} subgraph edges ({time.time() - t0:.0f}s)")
     return out
 
 
@@ -689,6 +1146,46 @@ def main():
     ap = argparse.ArgumentParser(description="RelGT for the weekly activity labels")
     base.add_period_args(ap)
     ap.add_argument("--num-neighbors", type=int, default=100, help="K tokens per example (paper: 300)")
+    ap.add_argument("--path-budget", choices=["uniform", "path"], default="uniform",
+                    help="token sampling: uniform over all neighbours (paper) or an even budget per path")
+    ap.add_argument("--path-order", choices=["random", "recent"], default="random",
+                    help="with --path-budget path: which rows of a path fill its budget")
+    ap.add_argument("--fk-order", choices=["random", "recent"], default="random",
+                    help="which FK/PK neighbours are kept when over budget: random ones, or the newest rows first")
+    ap.add_argument("--path-token", action="store_true",
+                    help="add the token's relation path (as in --path-budget) as a token element")
+    ap.add_argument("--rel-pe", action="store_true",
+                    help="relation-aware subgraph positional encoding (GINE messages with FK relation)")
+    ap.add_argument("--attn-bias", action="store_true",
+                    help="local attention bias from the hop pair and the FK relation between tokens")
+    ap.add_argument("--action-edges", choices=list(ACTION_CHAINS), default="none",
+                    help="extra token edges between actions of the same user in time order: sequence = "
+                         "each action to the user's next one, repo = next one in the same repository, both")
+    ap.add_argument("--lookback-days", type=float, default=None,
+                    help="only activity rows from the last N days before each table's cutoff are visible "
+                         "to the graph (Users and Repositories always are); default: all history")
+    ap.add_argument("--exclude-push", action="store_true",
+                    help="hide all Pushes rows from the graph; push is still predicted and --history still "
+                         "has its push features")
+    ap.add_argument("--graph-structure", choices=["fk", "chain"], default="fk",
+                    help="fk: every foreign key is an edge (every action links to its user). chain: a user "
+                         "links only to its latest visible action of each type, each action to the previous "
+                         "/ next one of the same type; other foreign keys stay; tokens by breadth-first walk, "
+                         "another user's action brings that user in")
+    ap.add_argument("--max-hops", type=int, default=50,
+                    help="with --graph-structure chain: how far the walk may go from the user")
+    ap.add_argument("--chain-seed", choices=["user", "latest"], default="user",
+                    help="with --graph-structure chain: token 0 (where the walk starts and the readout is "
+                         "taken) is the user, or the user's latest visible action")
+    ap.add_argument("--num-seeds", type=int, default=1,
+                    help="with --graph-structure chain --chain-seed latest: use the user's N latest visible "
+                         "actions as seeds (fewer if the user has fewer); counts towards --num-neighbors")
+    ap.add_argument("--recency-attn", action="store_true",
+                    help="with --graph-structure chain: attend more to recent actions, in the local attention "
+                         "and the readout, with a learned decay; the tokens do not change")
+    ap.add_argument("--recency-days", type=float, default=7,
+                    help="with --recency-attn: an action this many days older than the newest action token "
+                         "starts at half the attention weight")
     ap.add_argument("--channels", type=int, default=128, help="paper: 512")
     ap.add_argument("--num-layers", type=int, default=1, help="local transformer layers (paper: 1-8)")
     ap.add_argument("--num-heads", type=int, default=4)
@@ -705,14 +1202,41 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--habit", action="store_true",
                     help="add the review-commenting habit features to the seed token")
+    ap.add_argument("--holdout-weeks", type=int, default=1,
+                    help="the newest N labelled weeks are held out of training, validation and the final fit "
+                         "and scored at the end (0: no holdout, the final model uses every labelled week)")
+    ap.add_argument("--exclude-push-label", action="store_true",
+                    help="do not predict push: its label is left out of the loss, validation thresholds and "
+                         "AP, and the output has push = 0 for every user (the other 5 labels are unchanged)")
+    ap.add_argument("--history", action="store_true",
+                    help="add the baseline's per-user count / recency features to the seed token")
     ap.add_argument("--review-aux", action="store_true",
                     help="extra training output: pr_review or pr_review_comment")
     g = ap.add_argument_group("users (test users = those in test_input.csv)")
     for stage, what in [("train", "training"), ("val", "validation / thresholds"), ("final", "final fit")]:
         g.add_argument(f"--{stage}-users", choices=USER_SETS, default="all",
                        help=f"users whose examples are used for {what}")
+    g.add_argument("--test-pre-june", action="store_true",
+                   help="shortcut: test users only for every stage and --end 2026-06-01 (unless --end is given)")
     ap.add_argument("--name", default="default", help="output sub-directory")
     args = ap.parse_args()
+    if args.graph_structure == "chain" and args.path_budget != "uniform":
+        ap.error("--path-budget path works with --graph-structure fk only")
+    if args.chain_seed != "user" and args.graph_structure != "chain":
+        ap.error("--chain-seed latest needs --graph-structure chain")
+    if args.num_seeds != 1 and (args.graph_structure != "chain" or args.chain_seed != "latest"):
+        ap.error("--num-seeds needs --graph-structure chain --chain-seed latest")
+    if args.recency_attn and args.graph_structure != "chain":
+        ap.error("--recency-attn needs --graph-structure chain")
+    if args.recency_days <= 0:
+        ap.error("--recency-days must be positive")
+    if not 1 <= args.num_seeds < args.num_neighbors:
+        ap.error("--num-seeds must be in 1..num_neighbors - 1")
+    if not 1 <= args.max_hops <= 120:
+        ap.error("--max-hops must be in 1..120")
+    if args.test_pre_june:
+        args.train_users = args.val_users = args.final_users = "test"
+        args.end = args.end or "2026-06-01"
     device = "cuda" if torch.cuda.is_available() else "cpu"
     out_dir = OUT_DIR / args.name
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -721,7 +1245,12 @@ def main():
     n = len(cohort)
     lags = {k: base.TEST_START - v for k, v in data_end.items()}
     weeks, train_weeks, val_weeks, final_weeks = base.split_weeks(args, data_end)
-    print(f"device {device}, {len(train_weeks)} train weeks, validation {[str(w)[:10] for w in val_weeks]}")
+    holdout_weeks = weeks[len(weeks) - args.holdout_weeks:] if args.holdout_weeks else []
+    if holdout_weeks:  # the newest labelled weeks are kept out of training, validation and the final fit
+        inner = argparse.Namespace(**{**vars(args), "end": str(holdout_weeks[0])})
+        _, train_weeks, val_weeks, final_weeks = base.split_weeks(inner, data_end)
+    print(f"device {device}, {len(train_weeks)} train weeks, validation {[str(w)[:10] for w in val_weeks]}, "
+          f"holdout {[str(w)[:10] for w in holdout_weeks]}")
 
     tables = {w: base.build_week(w, ev, own, lags, data_end, n) for w in weeks}
     test = pd.read_csv(base.EVAL_DIR / "test_input.csv")
@@ -746,13 +1275,18 @@ def main():
     y.append(np.full((len(test_cidx), len(EVENT_COLS)), np.nan))
     sizes = np.cumsum([0] + [len(c) for c in cidx])
     y = np.concatenate(y)
+    IP = EVENT_COLS.index("push")
+    if args.exclude_push_label:  # unknown label: masked_bce and mean_ap skip it
+        y[:, IP] = np.nan
     if args.review_aux:  # 1 if either review label is 1, 0 if both are 0, unknown otherwise
         r, c = y[:, IR], y[:, IC]
         union = np.where((r == 1) | (c == 1), 1.0, np.where((r == 0) & (c == 0), 0.0, np.nan))
         y = np.concatenate([y, union[:, None]], 1)
-    G = Graph()
+    G = Graph(args.graph_structure)
     seeds = [G.offset[TABLES.index("Users")] + cohort.user_id.values[c] for c in cidx]
-    nodes, hops, edges = tokenize(G, seeds, cutoffs, args.num_neighbors, args.seed)
+    nodes, hops, paths, edges = tokenize(G, seeds, cutoffs, args.num_neighbors, args.seed, args.path_budget,
+                                         args.path_order, args.action_edges, args.lookback_days, args.max_hops,
+                                         args.chain_seed, args.exclude_push, args.num_seeds, args.fk_order)
     ids = {w: np.arange(sizes[i], sizes[i + 1]) for i, w in enumerate(all_weeks)}
     is_test = np.zeros(n, bool)
     is_test[test_cidx] = True
@@ -774,20 +1308,37 @@ def main():
         raise SystemExit("no examples for the chosen weeks and user sets")
     print(f"{len(train_ids):,} training examples, {len(val_ids):,} validation, {len(ids[base.TEST_START]):,} test")
 
-    seed_x = None
-    if args.habit:  # log1p, standardised on the training examples
+    # Per-user seed features: log1p, standardised on the training examples.
+    feats = []
+    if args.history:  # the test week is not in tables, so it is built here without labels
+        hist = {**tables, base.TEST_START: base.build_week(base.TEST_START, ev, own, lags, data_end, n,
+                                                           with_labels=False)}
+        cols = [c for c in hist[base.TEST_START].columns
+                if c not in ("eligible", "cidx", "week") and not c.startswith("y_")]
+        feats.append(np.log1p(np.concatenate([hist[w][cols].values[c] for w, c in zip(all_weeks, cidx)])
+                              .astype(np.float64).clip(0)))
+        print(f"{len(cols)} history features on the seed token")
+    if args.habit:
         R, C = review.load_review_detail(cohort)
-        seed_x = np.log1p(np.concatenate([review.habit_features(w, R, C, lags, n).values[c]
-                                          for w, c in zip(all_weeks, cidx)]))
+        feats.append(np.log1p(np.concatenate([review.habit_features(w, R, C, lags, n).values[c]
+                                              for w, c in zip(all_weeks, cidx)])))
+        print(f"{feats[-1].shape[1]} habit features on the seed token")
+    seed_x = None
+    if feats:
+        seed_x = np.concatenate(feats, 1)
         seed_x = (seed_x - seed_x[train_ids].mean(0)) / (seed_x[train_ids].std(0) + 1e-6)
-        print(f"{seed_x.shape[1]} habit features on the seed token")
-    S = Samples(nodes, hops, np.concatenate(week), np.concatenate(cidx), y, edges, device, seed_x)
+    S = Samples(nodes, hops, paths, np.concatenate(week), np.concatenate(cidx), y, edges, device, seed_x)
 
     def make_model():
         return RelGT(G, cutoffs, week_day, n, len(EVENT_COLS) + args.review_aux, channels=args.channels,
                      local_layers=args.num_layers, heads=args.num_heads, dropout=args.dropout,
                      num_centroids=args.num_centroids, conv_type=args.conv_type, ablate=args.ablate,
-                     n_seed_feats=0 if seed_x is None else seed_x.shape[1]).to(device)
+                     n_seed_feats=0 if seed_x is None else seed_x.shape[1], path_token=args.path_token,
+                     rel_pe=args.rel_pe, attn_bias=args.attn_bias,
+                     action_edges=args.action_edges != "none", chain=args.graph_structure == "chain",
+                     max_hop=args.max_hops + 1 if args.graph_structure == "chain" else MAX_HOP,
+                     multi_seed=args.num_seeds > 1,
+                     recency_days=args.recency_days if args.recency_attn else None).to(device)
 
     print(f"model parameters: {sum(p.numel() for p in make_model().parameters()):,}")
     model, best_epoch, history = fit(make_model, S, train_ids, args, args.epochs, val_ids=val_ids)
@@ -796,10 +1347,21 @@ def main():
     # Thresholds on the pooled validation weeks (same rule as the baseline).
     metrics = {"args": vars(args), "best_epoch": best_epoch, "history": history, "per_label": {},
                "validation": []}
+    if model.recency is not None:  # per head, then the readout
+        metrics["recency_decay"] = model.recency.decay().tolist()
+        print("learned recency decay: " + " ".join(f"{d:.2f}" for d in metrics["recency_decay"]))
     usel = pick(val_weeks, args.val_users)
     val_p = {w: predict(model, S, ids[w][usel[w]])[:, :len(EVENT_COLS)] for w in val_weeks}
+    if args.exclude_push_label:  # never predicted
+        for w in val_weeks:
+            val_p[w][:, IP] = -1.0
     rates, pooled, thr = {}, {}, np.zeros(len(EVENT_COLS))
     for j, k in enumerate(EVENT_COLS):
+        if args.exclude_push_label and j == IP:
+            thr[j], rates[k], pooled[k] = np.inf, 0.0, np.array([-1.0])
+            metrics["per_label"][k] = {"threshold": float("inf"), "val_f1": None, "val_pred_rate": 0.0, "val_ap": None}
+            print(f"{k:18s} not predicted")
+            continue
         yv = np.concatenate([tables[w][f"y_{k}"].values[tables[w].eligible.values][usel[w]]
                              for w in val_weeks])
         pv = np.concatenate([val_p[w][:, j] for w in val_weeks])
@@ -835,6 +1397,8 @@ def main():
     full = [w for w in val_weeks if not np.isnan(labels(w)).any()]
     joint, _ = review.joint_thresholds(np.concatenate([labels(w) for w in full]).astype(bool),
                                        np.concatenate([val_p[w] for w in full]), thr, False)
+    if args.exclude_push_label:
+        joint[IP] = np.inf
     metrics["variants"] = {}
     for v, t in [("per-label F1 thresholds", thr), ("joint thresholds", joint)]:
         ws = [review.score(labels(w).astype(bool), val_p[w] >= t) for w in full]
@@ -849,10 +1413,47 @@ def main():
     # predicted positives is the decision rule on the test week (as in the baseline).
     final, _, _ = fit(make_model, S, all_ids, args, best_epoch)
     p = predict(final, S, ids[base.TEST_START])
+    # Holdout weeks: never seen by either model or the thresholds. "final model" decides like the test
+    # week (the validation share of positives per label); "validation model" uses the chosen thresholds.
+    hsel = pick(holdout_weeks, args.val_users)
+    metrics["holdout"] = []
+    dump = {}
+    for w in holdout_weeks:
+        t = tables[w]
+        m = t.eligible.values
+        if t.loc[m, [f"y_{k}" for k in EVENT_COLS]].isna().any().any():
+            continue
+        hid = ids[w][hsel[w]]
+        gids = cohort.github_user_id.values[m][hsel[w]]
+        truth = base.to_output(gids, {k: t[f"y_{k}"].values[m][hsel[w]] for k in EVENT_COLS})
+        ph = {"final model": predict(final, S, hid)[:, :len(EVENT_COLS)],
+              "validation model": predict(model, S, hid)[:, :len(EVENT_COLS)]}
+        preds = {"final model": [np.zeros(len(hid), bool) if args.exclude_push_label and j == IP else
+                                 ph["final model"][:, j] >= np.quantile(ph["final model"][:, j], 1 - rates[k])
+                                 for j, k in enumerate(EVENT_COLS)],
+                 "validation model": [ph["validation model"][:, j] >= chosen[j] for j in range(len(EVENT_COLS))]}
+        r = {"week": str(w), "users": int(len(hid))}
+        for v, cols in preds.items():
+            r[v] = base.scores(base.to_output(gids, dict(zip(EVENT_COLS, cols))), truth)
+        metrics["holdout"].append(r)
+        dump[f"{str(w)[:10]}_gids"] = gids  # lets experiments/two_model combine models per label
+        dump[f"{str(w)[:10]}_truth"] = t[[f"y_{k}" for k in EVENT_COLS]].values[m][hsel[w]]
+        for v, cols in preds.items():
+            dump[f"{str(w)[:10]}_{v.split()[0]}"] = np.stack(cols, 1)
+        print(f"holdout {str(w)[:10]}: " + "  ".join(f"{v} {100 * r[v]['score']:.2f}" for v in preds))
+    if metrics["holdout"]:
+        metrics["holdout_score_mean"] = {v: float(np.mean([r[v]["score"] for r in metrics["holdout"]]))
+                                         for v in ("final model", "validation model")}
+        print("mean holdout score: " + "  ".join(f"{v} {100 * s:.2f}" for v, s in metrics["holdout_score_mean"].items()))
     out = pd.DataFrame({"UserID": test.UserID.values})
     for j, k in enumerate(EVENT_COLS):
+        if args.exclude_push_label and j == IP:
+            out[k] = 0
+            continue
         out[k] = (p[:, j] >= np.quantile(p[:, j], 1 - rates[k])).astype(int)
     out.to_csv(out_dir / "output.csv", index=False)
+    if dump:
+        np.savez(out_dir / "holdout.npz", **dump)
     (out_dir / "metrics.json").write_text(json.dumps(metrics, indent=2, default=str))
     print(f"wrote {out_dir / 'output.csv'}")
 
