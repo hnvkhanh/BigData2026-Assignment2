@@ -4,3 +4,4 @@ experiments/*/outputs/
 .pytest_cache/
 results/
 experiments/*/cache/
+old_experiments/*/outputs/
