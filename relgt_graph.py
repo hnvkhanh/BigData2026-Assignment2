@@ -174,12 +174,18 @@ def serve(args, G, lags, test, seeds, nodes, hops, example):
             return f"{t} row {v - G.offset[G.ntype[v]]}{by}"
         return f"{logins[v - user0]}" + (" (test user, click to select)" if int(v) in test_of else "")
 
+    action_tables = [t for t in TABLES if t in R.LAG_KEY]
+    default_tables = tuple(t for t in action_tables if not (args.exclude_push and t == "Pushes"))
+
     @lru_cache(maxsize=8)
-    def state_at(date):
-        """Cut-off moment, per-table cutoffs, its day number and the visible rows for a picked date."""
+    def state_at(date, tables):
+        """Cut-off moment, per-table cutoffs, its day number and the visible rows for a picked date.
+        An unticked action table gets a cutoff before all data, so it is hidden from the walk too."""
         s = pd.Timestamp(date).normalize() + (base.TEST_START - base.TEST_START.normalize())
         cutoff = table_cutoffs(s, lags)
-        return s, cutoff, (s - base.DATA_START) / base.DAY, R.visible_nodes(G, cutoff, args.lookback_days, args.exclude_push)
+        shown_cutoff = cutoff.copy()
+        cutoff = np.array([c if t not in action_tables or t in tables else -1e9 for t, c in zip(TABLES, cutoff)])
+        return s, cutoff, (s - base.DATA_START) / base.DAY, R.visible_nodes(G, cutoff, args.lookback_days, args.exclude_push), shown_cutoff
 
     def visible_until(cutoff):
         """Where each table's visible rows end, naming only the tables that differ from the most common day."""
@@ -196,9 +202,10 @@ def serve(args, G, lags, test, seeds, nodes, hops, example):
                                 fk_order=fk_order)
         return n[0], h[0]
 
-    def tokens_of(i, mode, k, roots, cutoff, s, visible, fk_order):
+    def tokens_of(i, mode, k, roots, cutoff, s, visible, fk_order, tables):
         """The K tokens, seeds first; the same ones as the static figure when it has this seed and date."""
-        if s == base.TEST_START and mode == cli_seed and k == args.num_seeds and fk_order == args.fk_order:
+        if (s == base.TEST_START and mode == cli_seed and k == args.num_seeds and fk_order == args.fk_order
+                and tables == default_tables):
             return nodes[i], hops[i]
         rng = np.random.default_rng(i)
         if chain:
@@ -212,10 +219,10 @@ def serve(args, G, lags, test, seeds, nodes, hops, example):
         return np.r_[roots, pool[pick]], np.r_[np.zeros(len(roots), np.int8), hop[pick]]
 
     @lru_cache(maxsize=32)
-    def user_view(date, i, view, mode, k, colour, fk_order):
-        s_time, cutoff, week_day, visible = state_at(date)
+    def user_view(date, i, view, mode, k, colour, fk_order, tables):
+        s_time, cutoff, week_day, visible, shown_cutoff = state_at(date, tables)
         roots = seed_set(G, seeds[i], visible, mode, k)
-        tok, hp = tokens_of(i, mode, k, roots, cutoff, s_time, visible, fk_order)
+        tok, hp = tokens_of(i, mode, k, roots, cutoff, s_time, visible, fk_order, tables)
         if view != "all":
             extra = tok, hp
         elif chain:  # the same walk with room for everything; drop the random rows of an empty walk
@@ -301,7 +308,7 @@ def serve(args, G, lags, test, seeds, nodes, hops, example):
         fig.update_xaxes(visible=False)
         fig.update_yaxes(visible=False, scaleanchor="x")
         fig.update_layout(template="plotly_white", margin=dict(l=8, r=8, t=8, b=56 if by_age else 8),
-                          uirevision=f"{date}-{i}-{view}-{mode}-{k}-{fk_order}",
+                          uirevision=f"{date}-{i}-{view}-{mode}-{k}-{fk_order}-{tables}",
                           legend=dict(font=dict(color=INK, size=12), itemsizing="constant"),
                           hoverlabel=dict(bgcolor="white", font=dict(color=INK)), dragmode="pan")
         if by_age:
@@ -315,7 +322,7 @@ def serve(args, G, lags, test, seeds, nodes, hops, example):
         o = own_rows(G, seeds[i], visible)
         table_age = cutoff[G.ntype[o]] - G.time[o]
         seen = np.isin(o, tok)
-        info = (f"Cut-off {s_time:%Y-%m-%d %H:%M}. {visible_until(cutoff)} "
+        info = (f"Cut-off {s_time:%Y-%m-%d %H:%M}. {visible_until(shown_cutoff)} "
                 f"{len(shown):,} nodes shown, {n_edges:,} edges; {len(roots)} seed{'s' * (len(roots) > 1)} and "
                 f"{int(sampled.sum())} sampled tokens. Own visible rows: {len(o):,}. Among the tokens, of each table's "
                 f"last 7 visible days: {int((seen & (table_age < 7)).sum())} of {int((table_age < 7).sum())}; last 30: "
@@ -352,6 +359,8 @@ def serve(args, G, lags, test, seeds, nodes, hops, example):
                 {"label": "All visible nodes", "value": "all"}, {"label": "Sampled tokens only", "value": "tokens"}]),
             dcc.RadioItems(id="fk-order", value=args.fk_order, inline=True, labelStyle={"marginRight": "16px"}, options=[
                 {"label": "FK sampling: random", "value": "random"}, {"label": "FK sampling: newest first", "value": "recent"}]),
+            html.Label(["Actions ", dcc.Checklist(id="tables", value=list(default_tables), inline=True,
+                                                  labelStyle={"marginRight": "12px"}, options=action_tables)]),
             dcc.RadioItems(id="seed-mode", value=cli_seed, inline=True, labelStyle={"marginRight": "16px"}, options=[
                 {"label": "Seed: user", "value": "user"}, {"label": "Seed: latest actions", "value": "latest"}]),
             html.Label(["Number of seeds (k) ", dcc.Input(id="seed-k", type="number", value=args.num_seeds, min=1, max=K - 1, step=1,
@@ -365,11 +374,12 @@ def serve(args, G, lags, test, seeds, nodes, hops, example):
 
     @app.callback(Output("graph", "figure"), Output("info", "children"), Input("user", "value"), Input("view", "value"),
                   Input("seed-mode", "value"), Input("seed-k", "value"), Input("cutoff", "date"), Input("colour", "value"),
-                  Input("fk-order", "value"))
-    def draw(i, view, mode, k, date, colour, fk_order):
+                  Input("fk-order", "value"), Input("tables", "value"))
+    def draw(i, view, mode, k, date, colour, fk_order, tables):
         if not date or (mode == "latest" and not k):  # k is None while out of range
             return no_update, no_update
-        return user_view(date, i, view, mode, 1 if mode == "user" else k, colour, fk_order)
+        return user_view(date, i, view, mode, 1 if mode == "user" else k, colour, fk_order,
+                         tuple(t for t in action_tables if t in (tables or ())))
 
     @app.callback(Output("seed-k-box", "style"), Input("seed-mode", "value"))
     def show_k(mode):
