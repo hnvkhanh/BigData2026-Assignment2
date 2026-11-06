@@ -110,6 +110,8 @@ Common settings: chain graph, `--chain-seed latest`, `--num-seeds 16`, K=100, 15
 | `two_model_rest` | 2026-06-01 | no | 50 | 0.3820 | 0.3642 |
 | `exp2_all_data` | all | yes | 50 | 0.5195 | 0.4769 |
 | `exp4_all_maxhop20` | all | no | 20 | 0.5086 | 0.4623 |
+| `fk_exp1` (plain FK graph) | 2026-06-01 | yes | 50 | 0.5846 | 0.5897 |
+| `fk_exp2_nopush` (plain FK graph) | 2026-06-01 | no | 50 | 0.5851 | 0.5908 |
 
 Notes:
 * `two_model_push` / `two_model_rest` split the labels: one model with pushes in the graph (for the
@@ -118,6 +120,12 @@ Notes:
 * Val mAP is the mean average precision over the labels; scores on the `end=2026-06-01` window and on
   the all-data window are not comparable (different weeks and different label rates).
 * Including pushes helps (0.62 vs 0.59) despite them being the most frequent row type.
+* `fk_*` runs use `--graph-structure fk` (single user seed, user linked directly to every row) with
+  otherwise the same settings and window as `exp1` / `exp2_nopush`, so they are the direct baseline
+  for the chain graph. Chain beats FK by +0.037 holdout with pushes (0.627 vs 0.590) and +0.010
+  without (0.600 vs 0.591). Under FK, pushes in the graph give no gain (0.590 vs 0.591): the push hub
+  swamps the 1-hop sample, which the chain graph avoids. The chain gain is on every label,
+  largest on push AP (val 0.92 vs 0.87) and open_pr AP (0.51 vs 0.44).
 
 ## 7. Decision log
 
@@ -138,6 +146,9 @@ python experiments/relgt/run.py --graph-structure chain --chain-seed latest --nu
     --epochs 15 --end 2026-06-01 --exclude-push --name exp2_nopush
 python experiments/relgt/run.py --graph-structure chain --chain-seed latest --num-seeds 16 \
     --epochs 15 --exclude-push --max-hops 20 --name exp4_all_maxhop20
+# plain FK graph baselines
+python experiments/relgt/run.py --graph-structure fk --epochs 15 --end 2026-06-01 --name fk_exp1
+python experiments/relgt/run.py --graph-structure fk --epochs 15 --end 2026-06-01     --exclude-push --name fk_exp2_nopush
 ```
 
 Each run writes `output.csv`, `metrics.json` (all args are stored in it) and `holdout.npz` to

@@ -14,7 +14,8 @@ options as in experiments/relgt/run.py; chain and action edges are drawn dark, F
 the search box (or click a test user's node) to see every visible node around them, with the K
 sampled tokens highlighted. "Every node" is the whole 1+2-hop neighbourhood for the FK graph; on the
 chain graph the walk stops at --max-hops or --max-nodes, and the page says when the limit cut it.
-The page also picks the seed: the user, or the user's k latest visible actions. The seeds count
+The page also picks the graph structure (FK or chain; --graph-structure is only the starting choice, and
+the other graph is built the first time it is picked) and the seed: the user, or the user's k latest visible actions. The seeds count
 towards the K tokens. experiments/relgt/run.py trains on the user or, on the chain graph, on the k
 latest actions (--chain-seed latest --num-seeds k); latest-action seeds on the FK graph are a preview.
 On the chain graph a user links to their latest row of each table, and another user's sampled row
@@ -161,31 +162,38 @@ def serve(args, G, lags, test, seeds, nodes, hops, example):
     logins = pd.read_parquet(base.DB / "Users.parquet", columns=["login"]).login.values
     user0 = G.offset[TABLES.index("Users")]
     test_of = {int(sd): i for i, sd in enumerate(seeds)}
-    chain = args.graph_structure == "chain"
-    cli_seed = args.chain_seed if chain else "user"  # what the precomputed nodes and hops start from
+    cli_seed = args.chain_seed if args.graph_structure == "chain" else "user"  # what the precomputed nodes and hops start from
+    graphs = {args.graph_structure: G}  # the other structure is built when the page first asks for it
+    G0 = G  # node numbering, types, times and actors are the same in both structures
     options = sorted(({"label": f"{logins[sd - user0]} ({uid})", "value": i}
                       for i, (sd, uid) in enumerate(zip(seeds, test.UserID.values))),
                      key=lambda o: o["label"].lower())
 
+    def graph_of(structure):
+        if structure not in graphs:
+            graphs[structure] = R.Graph(structure)
+        return graphs[structure]
+
     def node_label(v):
-        t = TABLES[G.ntype[v]]
+        t = TABLES[G0.ntype[v]]
         if t != "Users":
-            by = f", by {logins[G.actor[v] - user0]}" if G.actor[v] >= 0 else ""
-            return f"{t} row {v - G.offset[G.ntype[v]]}{by}"
+            by = f", by {logins[G0.actor[v] - user0]}" if G0.actor[v] >= 0 else ""
+            return f"{t} row {v - G0.offset[G0.ntype[v]]}{by}"
         return f"{logins[v - user0]}" + (" (test user, click to select)" if int(v) in test_of else "")
 
     action_tables = [t for t in TABLES if t in R.LAG_KEY]
     default_tables = tuple(t for t in action_tables if not (args.exclude_push and t == "Pushes"))
 
     @lru_cache(maxsize=8)
-    def state_at(date, tables):
+    def state_at(date, tables, structure):
         """Cut-off moment, per-table cutoffs, its day number and the visible rows for a picked date.
         An unticked action table gets a cutoff before all data, so it is hidden from the walk too."""
         s = pd.Timestamp(date).normalize() + (base.TEST_START - base.TEST_START.normalize())
         cutoff = table_cutoffs(s, lags)
         shown_cutoff = cutoff.copy()
         cutoff = np.array([c if t not in action_tables or t in tables else -1e9 for t, c in zip(TABLES, cutoff)])
-        return s, cutoff, (s - base.DATA_START) / base.DAY, R.visible_nodes(G, cutoff, args.lookback_days, args.exclude_push), shown_cutoff
+        visible = R.visible_nodes(graph_of(structure), cutoff, args.lookback_days, args.exclude_push)
+        return s, cutoff, (s - base.DATA_START) / base.DAY, visible, shown_cutoff
 
     def visible_until(cutoff):
         """Where each table's visible rows end, naming only the tables that differ from the most common day."""
@@ -195,21 +203,21 @@ def serve(args, G, lags, test, seeds, nodes, hops, example):
         rest = [f"{', '.join(groups[d])} until {d}" for d in groups.index if d != main_day]
         return f"Rows visible until {main_day}" + (f" ({'; '.join(rest)})." if rest else ".")
 
-    def walk_of(i, mode, k, cutoff, size, cap1, rng, fk_order):
+    def walk_of(G, i, mode, k, cutoff, size, cap1, rng, fk_order):
         """R.sample_walk for one test user: size tokens, seeds first."""
         n, h, _ = R.sample_walk(G, seeds[i:i + 1], cutoff, size, rng, args.max_hops, cap1=cap1,
                                 lookback=args.lookback_days, start=mode, exclude_push=args.exclude_push, num_seeds=k,
                                 fk_order=fk_order)
         return n[0], h[0]
 
-    def tokens_of(i, mode, k, roots, cutoff, s, visible, fk_order, tables):
+    def tokens_of(G, i, mode, k, roots, cutoff, s, visible, fk_order, tables):
         """The K tokens, seeds first; the same ones as the static figure when it has this seed and date."""
-        if (s == base.TEST_START and mode == cli_seed and k == args.num_seeds and fk_order == args.fk_order
-                and tables == default_tables):
+        if (s == base.TEST_START and G.structure == args.graph_structure and mode == cli_seed
+                and k == args.num_seeds and fk_order == args.fk_order and tables == default_tables):
             return nodes[i], hops[i]
         rng = np.random.default_rng(i)
-        if chain:
-            return walk_of(i, mode, k, cutoff, K, 1000, rng, fk_order)
+        if G.structure == "chain":
+            return walk_of(G, i, mode, k, cutoff, K, 1000, rng, fk_order)
         n1, n2 = neighbourhood(G, roots, visible)
         pool, hop = np.r_[n1, n2], np.r_[np.ones(len(n1), np.int8), np.full(len(n2), 2, np.int8)]
         perm = rng.permutation(len(pool))
@@ -219,14 +227,16 @@ def serve(args, G, lags, test, seeds, nodes, hops, example):
         return np.r_[roots, pool[pick]], np.r_[np.zeros(len(roots), np.int8), hop[pick]]
 
     @lru_cache(maxsize=32)
-    def user_view(date, i, view, mode, k, colour, fk_order, tables):
-        s_time, cutoff, week_day, visible, shown_cutoff = state_at(date, tables)
+    def user_view(date, i, view, mode, k, colour, fk_order, tables, structure):
+        G = graph_of(structure)
+        chain = structure == "chain"
+        s_time, cutoff, week_day, visible, shown_cutoff = state_at(date, tables, structure)
         roots = seed_set(G, seeds[i], visible, mode, k)
-        tok, hp = tokens_of(i, mode, k, roots, cutoff, s_time, visible, fk_order, tables)
+        tok, hp = tokens_of(G, i, mode, k, roots, cutoff, s_time, visible, fk_order, tables)
         if view != "all":
             extra = tok, hp
         elif chain:  # the same walk with room for everything; drop the random rows of an empty walk
-            n, h = walk_of(i, mode, k, cutoff, args.max_nodes, args.max_nodes, np.random.default_rng(0), fk_order)
+            n, h = walk_of(G, i, mode, k, cutoff, args.max_nodes, args.max_nodes, np.random.default_rng(0), fk_order)
             extra = n[h <= args.max_hops], h[h <= args.max_hops]
         else:
             extra = all_nodes(G, roots, visible)
@@ -308,7 +318,7 @@ def serve(args, G, lags, test, seeds, nodes, hops, example):
         fig.update_xaxes(visible=False)
         fig.update_yaxes(visible=False, scaleanchor="x")
         fig.update_layout(template="plotly_white", margin=dict(l=8, r=8, t=8, b=56 if by_age else 8),
-                          uirevision=f"{date}-{i}-{view}-{mode}-{k}-{fk_order}-{tables}",
+                          uirevision=f"{date}-{i}-{view}-{mode}-{k}-{fk_order}-{tables}-{structure}",
                           legend=dict(font=dict(color=INK, size=12), itemsizing="constant"),
                           hoverlabel=dict(bgcolor="white", font=dict(color=INK)), dragmode="pan")
         if by_age:
@@ -337,7 +347,7 @@ def serve(args, G, lags, test, seeds, nodes, hops, example):
         return fig, info
 
     app = Dash(__name__, title="RelGT token graph")
-    opts = f"graph: {args.graph_structure}, action edges: {args.action_edges}" + (
+    opts = f"action edges: {args.action_edges}" + (
         f", lookback {args.lookback_days:g} days" if args.lookback_days else "") + (
         ", no pushes" if args.exclude_push else "")
     app.layout = html.Div([
@@ -353,6 +363,8 @@ def serve(args, G, lags, test, seeds, nodes, hops, example):
             html.Label(["Cut-off date ", dcc.DatePickerSingle(
                 id="cutoff", date=base.TEST_START.date(), min_date_allowed=base.DATA_START.date(),
                 max_date_allowed=base.TEST_START.date(), display_format="YYYY-MM-DD")]),
+            dcc.RadioItems(id="structure", value=args.graph_structure, inline=True, labelStyle={"marginRight": "16px"}, options=[
+                {"label": "Graph: foreign keys", "value": "fk"}, {"label": "Graph: chain", "value": "chain"}]),
             dcc.RadioItems(id="colour", value="age", inline=True, labelStyle={"marginRight": "16px"}, options=[
                 {"label": "Colour: action age", "value": "age"}, {"label": "Colour: table", "value": "table"}]),
             dcc.RadioItems(id="view", value="all", inline=True, labelStyle={"marginRight": "16px"}, options=[
@@ -374,12 +386,12 @@ def serve(args, G, lags, test, seeds, nodes, hops, example):
 
     @app.callback(Output("graph", "figure"), Output("info", "children"), Input("user", "value"), Input("view", "value"),
                   Input("seed-mode", "value"), Input("seed-k", "value"), Input("cutoff", "date"), Input("colour", "value"),
-                  Input("fk-order", "value"), Input("tables", "value"))
-    def draw(i, view, mode, k, date, colour, fk_order, tables):
+                  Input("fk-order", "value"), Input("tables", "value"), Input("structure", "value"))
+    def draw(i, view, mode, k, date, colour, fk_order, tables, structure):
         if not date or (mode == "latest" and not k):  # k is None while out of range
             return no_update, no_update
         return user_view(date, i, view, mode, 1 if mode == "user" else k, colour, fk_order,
-                         tuple(t for t in action_tables if t in (tables or ())))
+                         tuple(t for t in action_tables if t in (tables or ())), structure)
 
     @app.callback(Output("seed-k-box", "style"), Input("seed-mode", "value"))
     def show_k(mode):
