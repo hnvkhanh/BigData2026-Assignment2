@@ -7,3 +7,4 @@ torch
 dash>=2.17
 plotly>=5.0
 graphviz
+tqdm

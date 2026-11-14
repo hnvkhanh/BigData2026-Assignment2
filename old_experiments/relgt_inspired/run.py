@@ -36,11 +36,11 @@ from .gnn_model import RelationalGNN
 
 
 ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_DB_DIR = ROOT / "assignment2" / "data" / "db"
-DEFAULT_TEST_INPUT = ROOT / "assignment2" / "evaluation" / "test_input.csv"
+DEFAULT_DB_DIR = ROOT / "data" / "db"
+DEFAULT_TEST_INPUT = ROOT / "assignment2" / "submission" / "test_input.csv"
 DEFAULT_OUTPUT_ROOT = Path(__file__).resolve().parent / "outputs"
 DEFAULT_START_CUTOFF = "2026-03-01 00:00:00"
-DEFAULT_PREDICTION_CUTOFF = "2026-11-11 16:00:00"
+DEFAULT_PREDICTION_CUTOFF = "2026-11-21 16:00:00"
 CACHE_VERSION = 3
 ENSEMBLE_LOOKBACK_OPTIONS = (7, 14, 21, 30, 90)
 

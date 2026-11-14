@@ -407,7 +407,7 @@ def main():
     tables = {w: base.build_week(w, ev, own, lags, data_end, n) for w in weeks}
     tables[base.TEST_START] = base.build_week(base.TEST_START, ev, own, lags, data_end, n,
                                               with_labels=False)
-    test = pd.read_csv(base.EVAL_DIR / "test_input.csv")
+    test = pd.read_csv(base.TEST_INPUT)
     is_test = np.isin(cohort.github_user_id.values, test.UserID.values)
     keep = {"all": np.ones(n, bool), "test": is_test, "exclude_test": ~is_test}[args.users]
     print(f"users {args.users}: {keep.sum()} of {n} cohort users in train/validation")

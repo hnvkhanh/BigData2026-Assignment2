@@ -310,7 +310,7 @@ def main():
     # Final model on all labelled weeks; the validation share of predicted positives (before the
     # consistency rule) is reused as the decision rule, as in the baseline.
     final, _ = fit(graphs, final_weeks, chain, best_epoch, args.seed, device, lr=args.lr)
-    test = pd.read_csv(base.EVAL_DIR / "test_input.csv")
+    test = pd.read_csv(base.TEST_INPUT)
     tt = tables[base.TEST_START]
     cidx = pd.Series(np.arange(len(tt)), index=cohort.github_user_id.values[tt.cidx.values]).loc[test.UserID].values
     q = activity_probs(gnn.predict(final, graphs[base.TEST_START])[cidx], mode)

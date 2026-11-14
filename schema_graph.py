@@ -1,7 +1,7 @@
 """Question 1: schema graph of the 8 tables (Graphviz).
 
 Nodes are tables, edges are foreign keys (FK column -> referenced PK). Each node lists its PK and
-FK columns; the remaining columns are only counted. Keys follow assignment2/data/db/SCHEMA.md.
+FK columns; the remaining columns are only counted. Keys follow assignment2/SCHEMA.md.
 
 Run from the repo root (needs `pip install graphviz` and the Graphviz `dot` binary on PATH):
     python schema_graph.py               # writes figures/schema_graph.{dot,png,svg}
@@ -19,7 +19,7 @@ if shutil.which("dot") is None and (GRAPHVIZ_BIN / "dot.exe").exists():
     os.environ["PATH"] = f"{GRAPHVIZ_BIN}{os.pathsep}{os.environ['PATH']}"
 
 ROOT = Path(__file__).resolve().parent
-DB = ROOT / "assignment2" / "data" / "db"
+DB = ROOT / "data" / "db"
 OUT = ROOT / "figures" / "schema_graph"
 
 # table -> (primary key, {foreign key column: referenced table})

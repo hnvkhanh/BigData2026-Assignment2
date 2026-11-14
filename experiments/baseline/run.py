@@ -3,8 +3,8 @@
 One training sample = (cohort user, week start s). Labels are whether the user performs each
 activity in [s, s + 7d). Features use only rows that were available before a per-table cutoff
 s - lag, where lag is the distance between the official test week start and the end of that
-table's data. This reproduces at training time the same staleness the final prediction has
-(the data ends ~10 days before the test week, pushes ~16 days).
+table's data. This reproduces at training time the same staleness the final prediction has, so
+it follows the date the GH Archive files were downloaded.
 
 Run from the repo root:
     python experiments/baseline/run.py
@@ -19,32 +19,40 @@ import numpy as np
 import pandas as pd
 
 ROOT = Path(__file__).resolve().parents[2]
-DB = ROOT / "assignment2" / "data" / "db"
-EVAL_DIR = ROOT / "assignment2" / "evaluation"
+DB = ROOT / "data" / "db"  # written by assignment2/scripts/preprocess.py --out data
+EVAL_DIR = ROOT / "assignment2" / "scripts"
+TEST_INPUT = ROOT / "assignment2" / "submission" / "test_input.csv"
 OUT_DIR = Path(__file__).resolve().parent / "outputs"
 
 sys.path.insert(0, str(EVAL_DIR))
-from evaluate import EVENT_COLS, OUTPUT_COLUMNS, f1_per_event, scores  # noqa: E402
+from evaluate import EVENT_COLS, OUTPUT_COLUMNS, scores  # noqa: E402
 
-TEST_START = pd.Timestamp("2026-11-11 16:00")      # 2026-11-12 00:00 Taiwan time
-SELECTION_TIME = pd.Timestamp("2026-10-28 12:00")  # test users: >= 5 records in the 90 days before
+TEST_START = pd.Timestamp("2026-11-21 16:00")      # 2026-11-22 00:00 Taiwan time
+# Test users: >= 3 records (the 6 activities, by event time) in the 90 days before this moment.
+# Reproduces submission/test_input.csv exactly (4,465 users).
+SELECTION_TIME = pd.Timestamp("2026-11-04 12:00")
 DATA_START = pd.Timestamp("2025-12-01")
 WEEK = pd.Timedelta(days=7)
 DAY = pd.Timedelta(days=1)
 WINDOWS = [7, 14, 30, 90]
-MIN_RECORDS = 5
+MIN_RECORDS = 3
 
-# Collection outages, found by inspecting daily event counts of the cohort: non-push activity
+# Gaps in GH Archive, found by inspecting daily event counts of the cohort: non-push activity
 # drops to ~5-20% of its usual level from June to early September (ending in a backfill burst on
-# 9/4-9/6), and pushes are missing for several days in August-October. [start, end) in UTC.
+# 9/4-9/6), and pushes are (nearly) missing for several days in August-October. [start, end) UTC.
 GAPS = {
     "nonpush": [("2026-06-01", "2026-09-07")],
     "push": [("2026-08-18", "2026-09-10"), ("2026-10-07", "2026-10-08"),
              ("2026-10-15", "2026-10-19"), ("2026-10-23", "2026-10-24")],
 }
+# Since 10/27 GH Archive's PushEvents are ~1% of their usual volume (cohort: ~2,500 pushes a day
+# before, 0-260 after). Push data is treated as ending there, so the push lag (and with it the
+# staleness of push features at training time) matches what is really usable for the test week.
+# Re-check this date when the GH Archive files are downloaded again.
+FEED_END = {"push": pd.Timestamp("2026-10-27")}
 GAP_FEATURE_DAYS = 30     # feature window checked for outages
 GAP_FEATURE_SHARE = 0.25  # a feature window counts as corrupted above this share of outage days
-RECENT_START = pd.Timestamp("2026-09-09 16:00")  # first week start after the summer outage
+RECENT_START = pd.Timestamp("2026-09-12 16:00")  # first week start after the summer outage
 
 PARAMS = dict(objective="binary", learning_rate=0.05, num_leaves=31, min_child_samples=100,
               feature_fraction=0.8, bagging_fraction=0.8, bagging_freq=1, lambda_l2=1.0,
@@ -142,6 +150,8 @@ def load():
         "pr_review_comment": rcomments.created_at.max(),
         "push": pushes.created_at.max(),
     }
+    for k, end in FEED_END.items():
+        data_end[k] = min(data_end[k], end)
     data_end["received"] = min(data_end[k] for k in ["issue_comment", "pr_review", "pr_review_comment"])
     return cohort, ev, own, data_end
 
@@ -268,7 +278,7 @@ def add_period_args(ap):
     """Options choosing the data period, for all stages or for one stage (shared by all runners).
 
     A week (label window [s, s + 7d)) belongs to a period when it lies fully inside
-    [start, end]. Dates are UTC; weeks start Wednesday 16:00. A stage option overrides the
+    [start, end]. Dates are UTC; weeks start Saturday 16:00. A stage option overrides the
     global one for that stage only.
     """
     g = ap.add_argument_group("data period (UTC, e.g. 2026-03-01 or '2026-03-01 16:00')")
@@ -393,8 +403,7 @@ def main():
         recent_pred = to_output(gids, {k: data.loc[m, f"{k}_cnt_30d"].values > 0 for k in EVENT_COLS})
         for name, pred in [("lightgbm", model_pred), ("active_last_30d", recent_pred)]:
             r = scores(pred, truth)
-            r.update(week=str(w), method=name, users=int(m.sum()),
-                     f1=dict(zip(EVENT_COLS, f1_per_event(pred, truth))))
+            r.update(week=str(w), method=name, users=int(m.sum()), f1=r.pop("per_event"))
             weekly.append(r)
     metrics["validation"] = weekly
     for name in ["lightgbm", "active_last_30d"]:
@@ -406,7 +415,7 @@ def main():
     # Final models: all labelled weeks, same number of rounds. Retraining on the newer (less
     # active) weeks shifts the probability scale, so the validation threshold is carried over as
     # the share of users predicted positive rather than as a raw probability.
-    test = pd.read_csv(EVAL_DIR / "test_input.csv")
+    test = pd.read_csv(TEST_INPUT)
     cidx_of = pd.Series(np.arange(n), index=cohort.github_user_id.values)
     cidx = cidx_of.loc[test.UserID].values
     X_test = build_week(TEST_START, ev, own, lags, data_end, n, with_labels=False).iloc[cidx]

@@ -49,7 +49,7 @@ gnn_review = _load("gnn_review_run", HERE.parent / "gnn_review" / "run.py")
 
 EVENT_COLS, DAY, DB = base.EVENT_COLS, base.DAY, base.DB
 NONPUSH = [k for k in EVENT_COLS if k != "push"]
-DEFAULT_BRANCHES = ["main", "master"]
+DEFAULT_BRANCHES = ["aaaa", "aaaaaa"]  # main / master once masked; other 4- and 6-letter names look the same
 GROUPS = ["review_habit", "push_branch", "own_pr", "maintainer", "assigned", "demand", "comment_mix", "org"]
 OUT_DIR = HERE / "outputs"
 

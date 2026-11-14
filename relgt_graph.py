@@ -435,7 +435,7 @@ def main():
     G = R.Graph(args.graph_structure)
     visible = R.visible_nodes(G, cutoff, args.lookback_days, args.exclude_push)
 
-    test = pd.read_csv(base.EVAL_DIR / "test_input.csv")
+    test = pd.read_csv(base.TEST_INPUT)
     cidx = pd.Series(np.arange(len(cohort)), index=cohort.github_user_id.values).loc[test.UserID].values
     seeds = G.offset[TABLES.index("Users")] + cohort.user_id.values[cidx]
     rng = np.random.default_rng(0)

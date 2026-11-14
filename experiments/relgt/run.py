@@ -162,8 +162,10 @@ COLUMNS = {
     "PRReviewComments": ["file_extension", "subject_type", "position", "body"],
     "Pushes": ["branch", "is_new_ref"],
 }
-FILE_EXTENSIONS = ["py", "ts", "md", "rs", "go", "java", "tsx", "cpp", "yml", "cs", "js", "c", "h",
-                   "yaml", "json", "kt"]
+# The tables are anonymized: letters become "a", so main / master are aaaa / aaaaaa (other names of
+# those lengths look the same) and a file extension only keeps its length.
+DEFAULT_BRANCHES = ["aaaa", "aaaaaa"]
+FILE_EXTENSIONS = ["a", "aa", "aaa", "aaaa"]
 USER_SETS = ["all", "test", "exclude-test"]
 MAX_HOP = 3  # 1- and 2-hop neighbours, 3 = random fallback node
 RELATIONS = [(t, col) for t in TABLES for col, _ in FKEYS.get(t, [])]  # edge types, x2 for direction
@@ -207,7 +209,7 @@ def row_features(name, d):
         f = {"cross_repo": flag(d.is_cross_repo), "has_author": d.author_id.notna(),
              "opened_seen": d.created_at.notna(), "seen_lag": lag(d.first_seen_at, d.created_at),
              "number": np.log1p(d.number.astype(float).fillna(0)),
-             "default_base": d.base_ref.isin(["main", "master"])}
+             "default_base": d.base_ref.isin(DEFAULT_BRANCHES)}
         later = {"merged": d.merged_at, "closed": d.closed_at}
     elif name == "Issues":
         f = {"is_pr": d.is_pull_request, "pr_known": d.pull_request_id.notna(),
@@ -229,7 +231,7 @@ def row_features(name, d):
              "body_len": text_len(d.body)}
         f.update({f"ext_{e}": d.file_extension == e for e in FILE_EXTENSIONS})
     elif name == "Pushes":
-        f = {"new_ref": flag(d.is_new_ref), "default_branch": d.branch.isin(["main", "master"]),
+        f = {"new_ref": flag(d.is_new_ref), "default_branch": d.branch.isin(DEFAULT_BRANCHES),
              "branch_len": text_len(d.branch)}
     x = np.nan_to_num(pd.DataFrame(f).astype("float64").values).astype(np.float32)
     x = (x - x.mean(0)) / np.where(x.std(0) > 0, x.std(0), 1)
@@ -1253,7 +1255,7 @@ def main():
           f"holdout {[str(w)[:10] for w in holdout_weeks]}")
 
     tables = {w: base.build_week(w, ev, own, lags, data_end, n) for w in weeks}
-    test = pd.read_csv(base.EVAL_DIR / "test_input.csv")
+    test = pd.read_csv(base.TEST_INPUT)
     test_cidx = pd.Series(np.arange(n), index=cohort.github_user_id.values).loc[test.UserID].values
     all_weeks = weeks + [base.TEST_START]
 

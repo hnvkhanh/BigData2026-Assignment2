@@ -2,7 +2,7 @@
 
 Activities are defined exactly like the labels: one event per row of each table, at the time
 the activity happened (`created_at`, `submitted_at` for reviews), for the 9,000 cohort users.
-Weeks are aligned to the test week (Wednesday 16:00 UTC), as in experiments/baseline/run.py.
+Weeks are aligned to the test week (Saturday 16:00 UTC), as in experiments/baseline/run.py.
 
 Run from the repo root:
     python eda.py                    # then open http://127.0.0.1:8050
@@ -22,24 +22,26 @@ from dash import Dash, Input, Output, dash_table, dcc, html
 from plotly.subplots import make_subplots
 
 ROOT = Path(__file__).resolve().parent
-DB = ROOT / "assignment2" / "data" / "db"
-EVAL_DIR = ROOT / "assignment2" / "evaluation"
+DB = ROOT / "data" / "db"
+EVAL_DIR = ROOT / "assignment2" / "scripts"
+TEST_INPUT = ROOT / "assignment2" / "submission" / "test_input.csv"
 
 sys.path.insert(0, str(EVAL_DIR))
 from evaluate import EVENT_COLS  # noqa: E402
 
 # Same constants as experiments/baseline/run.py.
-TEST_START = pd.Timestamp("2026-11-11 16:00")      # 2026-11-12 00:00 Taiwan time
-SELECTION_TIME = pd.Timestamp("2026-10-28 12:00")  # test users: >= 5 records in the 90 days before
-DATA_START = pd.Timestamp("2025-12-01")
+TEST_START = pd.Timestamp("2026-11-21 16:00")      # 2026-11-22 00:00 Taiwan time
+SELECTION_TIME = pd.Timestamp("2026-11-04 12:00")  # test users: >= 3 records in the 90 days before
+DATA_START = pd.Timestamp("2025-12-01")  # placeholder; Data() resets it to the oldest event in the db
 WEEK = pd.Timedelta(days=7)
 DAY = pd.Timedelta(days=1)
-MIN_RECORDS = 5
+MIN_RECORDS = 3
 GAPS = {
     "nonpush": [("2026-06-01", "2026-09-07")],
     "push": [("2026-08-18", "2026-09-10"), ("2026-10-07", "2026-10-08"),
              ("2026-10-15", "2026-10-19"), ("2026-10-23", "2026-10-24")],
 }
+FEED_END = {"push": pd.Timestamp("2026-10-27")}  # GH Archive PushEvents ~1% of usual volume after
 
 TABLES = ["Users", "Repositories", "PullRequests", "Issues", "IssueComments", "PRReviews",
           "PRReviewComments", "Pushes"]
@@ -97,7 +99,7 @@ class Data:
         self.repos = pd.read_parquet(DB / "Repositories.parquet", columns=["repo_id", "name", "org_id"])
 
         cohort = users[users.is_cohort].reset_index(drop=True)
-        test_ids = set(pd.read_csv(EVAL_DIR / "test_input.csv").UserID)
+        test_ids = set(pd.read_csv(TEST_INPUT).UserID)
         cohort["is_test"] = cohort.github_user_id.isin(test_ids)
         self.cohort = cohort
         self.n = n = len(cohort)
@@ -119,14 +121,17 @@ class Data:
         }
         parts, self.data_end = [], {}
         for k, (actor, t, seen, repo) in sources.items():
-            self.data_end[k] = seen.max()
+            self.data_end[k] = min(seen.max(), FEED_END.get(k, pd.Timestamp.max))
             d = pd.DataFrame({"uid": actor.to_numpy("float64", na_value=np.nan), "t": t.values,
                               "seen": seen.values, "repo": repo.to_numpy("float64", na_value=np.nan)})
-            d = d[d.uid.notna() & d.t.notna() & (d.t >= DATA_START)]
+            d = d[d.uid.notna() & d.t.notna()]
             d["uid"] = to_cidx[d.uid.astype(np.int64).values]
             d = d[d.uid >= 0].assign(activity=k)
             parts.append(d)
         ev = pd.concat(parts, ignore_index=True).sort_values("t", ignore_index=True)
+        # The span starts at the oldest event in the db, not at a fixed date.
+        global DATA_START
+        DATA_START = ev.t.iloc[0].floor("D")
         ev["activity"] = pd.Categorical(ev.activity, categories=EVENT_COLS)
         ev["uid"] = ev.uid.astype(np.int32)
         ev["is_test"] = cohort.is_test.values[ev.uid.values]
@@ -149,8 +154,8 @@ class Data:
             self.counts[k] = flat.reshape(n, w).astype(np.int32)
             self.valid[k] = np.asarray(self.week_starts + WEEK <= self.data_end[k])
 
-        # Test selection rule shifted to every week (>= 5 records in the 90 days before
-        # s - 14d4h). Approximation: it ignores that some rows enter the data later.
+        # Test selection rule shifted to every week (>= 3 records in the 90 days before
+        # s - 17d4h). Approximation: it ignores that some rows enter the data later.
         tv, uv = ev.t.values, ev.uid.values
         self.eligible = np.zeros((n, w), bool)
         for j, s in enumerate(self.week_starts):

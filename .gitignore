@@ -5,3 +5,5 @@ experiments/*/outputs/
 results/
 experiments/*/cache/
 old_experiments/*/outputs/
+data/
+.venv/
