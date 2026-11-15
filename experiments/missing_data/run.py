@@ -23,13 +23,15 @@ Approaches (all run by default):
                        the baseline's --gap-mode options with GAPS re-measured on this data
   recent               only weeks from 09-19 on
   relative             counts divided by the cohort mean of the same week, plus cohort volumes
+  relative_no_volume   relative without the cohort volumes
+  relative_mask_burst  relative and mask_burst together
   rank                 counts replaced by their percentile rank within the week
   thin                 weeks before June rebuilt from events kept at random with probability p
                        (p = events per eligible user-week, recent weeks / spring weeks)
   thin_x3              three such random draws, weight 1/3 each
   thin_x3_mask_burst   thin_x3 and mask_burst together
 
-Run from the repo root (~15 min):
+Run from the repo root (~13 min with 8 LightGBM threads):
     python experiments/missing_data/run.py
     python experiments/missing_data/run.py --approaches baseline thin --seeds 0
 """
@@ -73,6 +75,8 @@ APPROACHES = {  # name: (thinned draws, feature view, week weighting)
     "gaps_downweight": (0, "base", "gaps:downweight"),
     "recent": (0, "base", "recent"),
     "relative": (0, "relative", None),
+    "relative_no_volume": (0, "relative_no_volume", None),
+    "relative_mask_burst": (0, "relative", "mask_burst"),
     "rank": (0, "rank", None),
     "thin": (1, "base", None),
     "thin_x3": (3, "base", None),
@@ -183,8 +187,8 @@ def score(gids, truth, pred, events):
     return {"score": r["score"], "macro_f1": r["macro_f1"], "micro_f1": r["micro_f1"], "f1": r["per_event"]}
 
 
-def run(name, data, feats, weights, train_weeks, seed, gids_of, extra=None):
-    params = {**B.PARAMS, "seed": seed}
+def run(name, data, feats, weights, train_weeks, seed, gids_of, threads, extra=None):
+    params = {**B.PARAMS, "seed": seed, "num_threads": threads}
     base = data.draw.values == -1
     tr = data.week.isin(train_weeks).values
     tune = base & (data.week == TUNE).values
@@ -215,16 +219,50 @@ def run(name, data, feats, weights, train_weeks, seed, gids_of, extra=None):
             p = model.predict(data.loc[m, feats], num_iteration=model.best_iteration)
             pred_thr[w][k] = p >= thr
             pred_share[w][k] = p >= thr if name == "rule_from_train" else top_share(p, share)
-    out = {"labels": info, "holdout": {}, "holdout_threshold": {}}
+    out = {"labels": info, "holdout": {}, "holdout_threshold": {}, "_pred": pred_share, "_truth": {}}
     for w, m in hold.items():
         gids = gids_of(data.cidx.values[m])
         truth = {k: data.loc[m, f"y_{k}"].values for k in NONPUSH}
+        out["_truth"][w] = truth
         out["holdout"][str(w)] = score(gids, truth, pred_share[w], NONPUSH)
         out["holdout_threshold"][str(w)] = score(gids, truth, pred_thr[w], NONPUSH)
     out["score"] = float(np.mean([r["score"] for r in out["holdout"].values()]))
     out["score_threshold"] = float(np.mean([r["score"] for r in out["holdout_threshold"].values()]))
     if extra is not None:
         out["push_scenario"] = push_scenario(models, info, feats, extra, gids_of)
+    return out
+
+
+def paired_bootstrap(preds, truth, ref, n_boot=2000, seed=0):
+    """Holdout score difference of each approach to `ref`, on users resampled with replacement
+    within each holdout week (the same draws for every approach), averaged over seeds.
+
+    preds: approach -> list (one per seed) of {week: {activity: bool array}}; truth: {week: {activity: array}}.
+    Returns approach -> mean difference, 95% interval and share of draws where it is above 0."""
+    rng = np.random.default_rng(seed)
+    counts = {w: rng.multinomial(len(t[NONPUSH[0]]), np.full(len(t[NONPUSH[0]]), 1 / len(t[NONPUSH[0]])),
+                                 size=n_boot) for w, t in truth.items()}
+
+    def draws(pred):  # (n_boot,) score of one seed's predictions, mean over the holdout weeks
+        per_week = []
+        for w, c in counts.items():
+            y = {k: truth[w][k] == 1 for k in NONPUSH}
+            tp = np.stack([c @ (pred[w][k] & y[k]) for k in NONPUSH], 1).astype(float)
+            fp = np.stack([c @ (pred[w][k] & ~y[k]) for k in NONPUSH], 1).astype(float)
+            fn = np.stack([c @ (~pred[w][k] & y[k]) for k in NONPUSH], 1).astype(float)
+            den = 2 * tp + fp + fn
+            f1 = np.where(den > 0, 2 * tp / np.maximum(den, 1), 1.0)
+            T, D = tp.sum(1), den.sum(1)
+            micro = np.where(D > 0, 2 * T / np.maximum(D, 1), 1.0)
+            per_week.append((f1.mean(1) + micro) / 2)
+        return np.mean(per_week, 0)
+
+    base = np.mean([draws(p) for p in preds[ref]], 0)
+    out = {}
+    for name, runs in preds.items():
+        d = 100 * (np.mean([draws(p) for p in runs], 0) - base)
+        out[name] = {"diff": float(d.mean()), "lo": float(np.quantile(d, 0.025)),
+                     "hi": float(np.quantile(d, 0.975)), "p_above_0": float((d > 0).mean())}
     return out
 
 
@@ -257,6 +295,8 @@ def main():
     ap.add_argument("--approaches", nargs="+", default=list(APPROACHES), choices=list(APPROACHES))
     ap.add_argument("--seeds", nargs="+", type=int, default=[0, 1, 2])
     ap.add_argument("--out", type=Path, default=HERE / "outputs")
+    ap.add_argument("--threads", type=int, default=8,
+                    help="LightGBM threads (all cores can be ~100x slower, e.g. under WSL)")
     args = ap.parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
     t0 = time.time()
@@ -278,6 +318,7 @@ def main():
     feat_sets = {"base": base_feats,
                  "relative": other + [f"rel_{c}" for c in count_feats]
                  + [c for c in base.columns if c.startswith("vol_")],
+                 "relative_no_volume": other + [f"rel_{c}" for c in count_feats],
                  "rank": other + [f"rank_{c}" for c in count_feats]}
     print(f"built {len(base):,} examples in {time.time() - t0:.0f}s")
 
@@ -310,7 +351,17 @@ def main():
                   f"({time.time() - t1:.0f}s)")
         return thinned[(seed, r)]
 
+    # Check: positive rates of the thinned spring weeks should be close to those of the recent weeks.
+    if any(APPROACHES[a][0] for a in args.approaches):
+        th = thinned_draw(args.seeds[0], 0)
+        rate = lambda d, wks, k: float(d.loc[d.week.isin(wks), f"y_{k}"].mean())  # noqa: E731
+        check = {k: {"spring": rate(base, spring_wks, k), "spring_thinned": rate(th, spring_wks, k),
+                     "recent": rate(base, ref_wks, k)} for k in NONPUSH}
+        print("positive rate (spring / thinned spring / recent):",
+              {k: " / ".join(f"{100 * v:.1f}" for v in c.values()) for k, c in check.items()})
+
     results = {"p": p, "approaches": {}}
+    preds, truth = {}, None
     for name in args.approaches:
         draws, view, rule = APPROACHES[name]
         runs = []
@@ -326,20 +377,28 @@ def main():
             if draws > 1:
                 for k in EVENT_COLS:
                     weights[k] = weights[k] * np.where(data.draw.values >= 0, 1 / draws, 1)
-            r = run(name, data, feat_sets[view], weights, train_weeks, seed, gids_of,
+            r = run(name, data, feat_sets[view], weights, train_weeks, seed, gids_of, args.threads,
                     extra=(x, rate_prev) if name == "baseline" else None)
             r["seed"] = seed
+            preds.setdefault(name, []).append(r.pop("_pred"))
+            truth = r.pop("_truth")
             runs.append(r)
             print(f"{name:20s} seed {seed}: holdout score {100 * r['score']:.2f} "
                   f"(threshold transfer {100 * r['score_threshold']:.2f})  {time.time() - t1:.0f}s")
         results["approaches"][name] = runs
         (args.out / "results.json").write_text(json.dumps(results, indent=2, default=str))
 
+    ref = "baseline" if "baseline" in preds else next(iter(preds))
+    boot = results["bootstrap_vs_" + ref] = paired_bootstrap(preds, truth, ref)
+    (args.out / "results.json").write_text(json.dumps(results, indent=2, default=str))
+
     rows = []
     for name, runs in results["approaches"].items():
         s = np.array([r["score"] for r in runs]) * 100
         row = {"approach": name, "score": s.mean(), "min": s.min(), "max": s.max(),
-               "score_threshold": 100 * np.mean([r["score_threshold"] for r in runs])}
+               "score_threshold": 100 * np.mean([r["score_threshold"] for r in runs]),
+               f"diff_vs_{ref}": boot[name]["diff"], "diff_lo": boot[name]["lo"],
+               "diff_hi": boot[name]["hi"], "p_above_0": boot[name]["p_above_0"]}
         for w in HOLDOUT:
             row[str(w)[:10]] = 100 * np.mean([r["holdout"][str(w)]["score"] for r in runs])
         for k in NONPUSH:

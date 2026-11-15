@@ -9,9 +9,14 @@ on LightGBM.
 
 ## 1. Setup
 
+> **Status:** the descriptive statistics and model scores below were computed on the earlier
+> setup (test week 11-12, validation weeks 10-07 / 10-14) and have not been recomputed.
+
 - **Unit:** (cohort user, week), weeks start Wednesday 16:00 UTC, aligned to the test week. A
   user-week counts only if the user passes the test selection rule shifted to that week
-  (≥ 5 records in the 90 days before), as in `experiments/baseline/run.py`.
+  (≥ 5 records in the 90 days before) as in `experiments/baseline/run.py` at the time of this
+  analysis. The baseline has since moved to the revised assignment (test week 2026-11-22 Taiwan
+  time, ≥ 3 records, 4,465 test users).
 - **No leakage:** every signal is computed from rows visible before `s − lag` of its own table
   (lag = test week start − end of that table's data, ~10 days, ~16 for pushes).
 - **Descriptive statistics (sections 2–4):** 15 weeks, 2026-02-11 … 05-20, i.e. weeks whose

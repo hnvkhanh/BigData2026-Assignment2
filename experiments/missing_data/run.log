@@ -1,0 +1,206 @@
+39 training weeks 2026-01-17 16:00:00 .. 2026-10-10 16:00:00, tune 2026-10-17 16:00:00, holdout ['2026-10-24 16:00:00', '2026-10-31 16:00:00']; 19 weeks thinned by the thin approaches
+built 276,313 examples in 9s
+capture p: {'open_pr': np.float64(0.184), 'open_issue': np.float64(0.405), 'issue_comment': np.float64(0.197), 'pr_review': np.float64(0.186), 'pr_review_comment': np.float64(0.182)}
+  thinned draw seed 0 #0: 99,136 examples (2s)
+positive rate (spring / thinned spring / recent): {'open_pr': '22.8 / 8.3 / 7.5', 'open_issue': '9.8 / 6.1 / 4.5', 'issue_comment': '17.5 / 7.0 / 5.3', 'pr_review': '16.2 / 6.4 / 5.3', 'pr_review_comment': '11.6 / 4.7 / 3.6'}
+baseline             seed 0: holdout score 37.39 (threshold transfer 36.80)  30s
+baseline             seed 1: holdout score 37.47 (threshold transfer 37.20)  22s
+baseline             seed 2: holdout score 38.40 (threshold transfer 38.06)  25s
+rule_from_train      seed 0: holdout score 36.31 (threshold transfer 36.31)  26s
+rule_from_train      seed 1: holdout score 37.55 (threshold transfer 37.55)  21s
+rule_from_train      seed 2: holdout score 36.53 (threshold transfer 36.53)  23s
+mask_burst           seed 0: holdout score 38.80 (threshold transfer 37.23)  15s
+mask_burst           seed 1: holdout score 38.73 (threshold transfer 37.14)  19s
+mask_burst           seed 2: holdout score 38.70 (threshold transfer 36.81)  16s
+gaps_mask            seed 0: holdout score 38.14 (threshold transfer 37.79)  14s
+gaps_mask            seed 1: holdout score 37.20 (threshold transfer 37.24)  13s
+gaps_mask            seed 2: holdout score 37.78 (threshold transfer 37.62)  13s
+gaps_drop            seed 0: holdout score 37.65 (threshold transfer 36.23)  6s
+gaps_drop            seed 1: holdout score 38.38 (threshold transfer 38.01)  6s
+gaps_drop            seed 2: holdout score 38.00 (threshold transfer 37.25)  5s
+gaps_downweight      seed 0: holdout score 38.19 (threshold transfer 38.89)  24s
+gaps_downweight      seed 1: holdout score 38.39 (threshold transfer 37.76)  24s
+gaps_downweight      seed 2: holdout score 39.54 (threshold transfer 39.35)  15s
+recent               seed 0: holdout score 35.89 (threshold transfer 35.42)  2s
+recent               seed 1: holdout score 36.48 (threshold transfer 36.31)  2s
+recent               seed 2: holdout score 36.16 (threshold transfer 35.82)  2s
+relative             seed 0: holdout score 38.72 (threshold transfer 37.95)  10s
+relative             seed 1: holdout score 39.39 (threshold transfer 38.76)  10s
+relative             seed 2: holdout score 39.62 (threshold transfer 39.69)  11s
+relative_no_volume   seed 0: holdout score 38.41 (threshold transfer 37.78)  18s
+relative_no_volume   seed 1: holdout score 38.91 (threshold transfer 39.22)  59s
+relative_no_volume   seed 2: holdout score 38.86 (threshold transfer 38.39)  57s
+relative_mask_burst  seed 0: holdout score 38.96 (threshold transfer 35.57)  52s
+relative_mask_burst  seed 1: holdout score 39.54 (threshold transfer 35.98)  42s
+relative_mask_burst  seed 2: holdout score 39.08 (threshold transfer 34.78)  11s
+rank                 seed 0: holdout score 36.86 (threshold transfer 37.06)  19s
+rank                 seed 1: holdout score 37.74 (threshold transfer 37.25)  18s
+rank                 seed 2: holdout score 37.81 (threshold transfer 37.18)  16s
+thin                 seed 0: holdout score 37.11 (threshold transfer 35.95)  7s
+  thinned draw seed 1 #0: 99,072 examples (2s)
+thin                 seed 1: holdout score 37.56 (threshold transfer 36.31)  11s
+  thinned draw seed 2 #0: 99,056 examples (2s)
+thin                 seed 2: holdout score 37.27 (threshold transfer 36.21)  9s
+  thinned draw seed 0 #1: 99,082 examples (1s)
+  thinned draw seed 0 #2: 98,983 examples (1s)
+thin_x3              seed 0: holdout score 37.42 (threshold transfer 35.20)  14s
+  thinned draw seed 1 #1: 99,047 examples (1s)
+  thinned draw seed 1 #2: 99,142 examples (1s)
+thin_x3              seed 1: holdout score 36.39 (threshold transfer 37.16)  15s
+  thinned draw seed 2 #1: 99,000 examples (1s)
+  thinned draw seed 2 #2: 99,069 examples (1s)
+thin_x3              seed 2: holdout score 37.48 (threshold transfer 36.27)  17s
+thin_x3_mask_burst   seed 0: holdout score 39.05 (threshold transfer 37.47)  13s
+thin_x3_mask_burst   seed 1: holdout score 38.23 (threshold transfer 36.00)  14s
+thin_x3_mask_burst   seed 2: holdout score 38.45 (threshold transfer 37.73)  15s
+                      score     min     max  score_threshold  diff_vs_baseline  diff_lo  diff_hi  p_above_0  2026-10-24  2026-10-31  open_pr  open_issue  issue_comment  pr_review  pr_review_comment
+approach                                                                                                                                                                                             
+relative             39.243  38.719  39.620           38.799             1.485    0.513    2.442      1.000      37.936      40.550    0.421       0.429          0.404      0.409              0.268
+relative_mask_burst  39.190  38.955  39.537           35.444             1.435    0.451    2.462      0.998      37.247      41.133    0.418       0.422          0.402      0.419              0.258
+mask_burst           38.742  38.701  38.796           37.058             0.989    0.264    1.755      0.997      36.501      40.982    0.418       0.434          0.386      0.404              0.269
+relative_no_volume   38.724  38.408  38.907           38.466             0.962   -0.234    2.081      0.950      37.608      39.839    0.403       0.429          0.386      0.414              0.271
+gaps_downweight      38.708  38.194  39.539           38.665             0.954    0.213    1.679      0.992      36.602      40.814    0.408       0.425          0.399      0.408              0.267
+thin_x3_mask_burst   38.575  38.227  39.048           37.068             0.818   -0.063    1.663      0.968      36.264      40.887    0.425       0.423          0.399      0.387              0.264
+gaps_drop            38.008  37.647  38.379           37.164             0.244   -0.753    1.204      0.680      36.450      39.567    0.420       0.411          0.391      0.379              0.270
+baseline             37.751  37.386  38.401           37.354             0.000    0.000    0.000      0.000      35.209      40.294    0.410       0.425          0.396      0.391              0.238
+gaps_mask            37.707  37.197  38.142           37.551            -0.053   -0.960    0.789      0.461      35.679      39.734    0.397       0.411          0.391      0.399              0.267
+rank                 37.469  36.857  37.811           37.162            -0.279   -1.397    0.802      0.310      35.863      39.074    0.401       0.426          0.368      0.395              0.255
+thin                 37.316  37.113  37.564           36.155            -0.445   -1.342    0.450      0.166      35.667      38.965    0.411       0.425          0.382      0.384              0.233
+thin_x3              37.098  36.394  37.475           36.210            -0.663   -1.469    0.146      0.055      35.336      38.860    0.408       0.419          0.380      0.382              0.238
+rule_from_train      36.799  36.314  37.547           36.799            -0.969   -2.140    0.094      0.040      35.329      38.269    0.393       0.424          0.380      0.351              0.250
+recent               36.178  35.891  36.480           35.849            -1.576   -2.632   -0.484      0.002      33.972      38.383    0.413       0.403          0.364      0.363              0.239
+push scenario: [
+ {
+  "push_pos_rate": 0.05246252676659529,
+  "prev_week_push_rate": 0.05470685383980182,
+  "nonpush_only": {
+   "score": 0.3465441852035072,
+   "macro_f1": 0.3435287969253269,
+   "micro_f1": 0.34955957348168754,
+   "f1": {
+    "open_pr": 0.34859675036927623,
+    "open_issue": 0.4265927977839335,
+    "issue_comment": 0.3458980044345898,
+    "pr_review": 0.35436893203883496,
+    "pr_review_comment": 0.2421875
+   }
+  },
+  "tune_share": {
+   "share": 0.39515972894482093,
+   "score": 0.29490695983823817,
+   "push_f1": 0.1912960306073649,
+   "micro_f1": 0.2716572504708098,
+   "macro_f1": 0.31815666920566654
+  },
+  "none": {
+   "share": 0.0,
+   "score": 0.3000895382692609,
+   "push_f1": 0.0,
+   "micro_f1": 0.3139050791007494,
+   "macro_f1": 0.28627399743777243
+  },
+  "prev_week_rate": {
+   "share": 0.05470685383980182,
+   "score": 0.3459375676337277,
+   "push_f1": 0.34331337325349304,
+   "micro_f1": 0.34838224228743414,
+   "macro_f1": 0.3434928929800212
+  },
+  "best_in_hindsight": {
+   "share": 0.0925,
+   "score": 0.34565342807932514,
+   "push_f1": 0.34268833087149186,
+   "micro_f1": 0.3479181369089626,
+   "macro_f1": 0.34338871924968767
+  }
+ },
+ {
+  "push_pos_rate": 0.05246252676659529,
+  "prev_week_push_rate": 0.05470685383980182,
+  "nonpush_only": {
+   "score": 0.3475920791988808,
+   "macro_f1": 0.3443868918829552,
+   "micro_f1": 0.35079726651480636,
+   "f1": {
+    "open_pr": 0.3697234352256186,
+    "open_issue": 0.4069767441860465,
+    "issue_comment": 0.3677581863979849,
+    "pr_review": 0.37327188940092165,
+    "pr_review_comment": 0.2042042042042042
+   }
+  },
+  "tune_share": {
+   "share": 0.46582768635043564,
+   "score": 0.28774142456090035,
+   "push_f1": 0.17603305785123968,
+   "micro_f1": 0.2591549295774648,
+   "macro_f1": 0.3163279195443359
+  },
+  "none": {
+   "share": 0.0,
+   "score": 0.3012814235304663,
+   "push_f1": 0.0,
+   "micro_f1": 0.3155737704918033,
+   "macro_f1": 0.2869890765691293
+  },
+  "prev_week_rate": {
+   "share": 0.05470685383980182,
+   "score": 0.34680725015064456,
+   "push_f1": 0.34331337325349304,
+   "micro_f1": 0.34940652818991097,
+   "macro_f1": 0.34420797211137816
+  },
+  "best_in_hindsight": {
+   "share": 0.04,
+   "score": 0.34753440561668547,
+   "push_f1": 0.3472222222222222,
+   "micro_f1": 0.35020936429387134,
+   "macro_f1": 0.34485944693949966
+  }
+ },
+ {
+  "push_pos_rate": 0.05246252676659529,
+  "prev_week_push_rate": 0.05470685383980182,
+  "nonpush_only": {
+   "score": 0.36289948217281853,
+   "macro_f1": 0.3580740966207693,
+   "micro_f1": 0.36772486772486773,
+   "f1": {
+    "open_pr": 0.36546762589928056,
+    "open_issue": 0.4343163538873995,
+    "issue_comment": 0.3656884875846501,
+    "pr_review": 0.3967611336032389,
+    "pr_review_comment": 0.22813688212927757
+   }
+  },
+  "tune_share": {
+   "share": 0.41955469506292353,
+   "score": 0.30408654783094347,
+   "push_f1": 0.1869328493647913,
+   "micro_f1": 0.27862254025044725,
+   "macro_f1": 0.3295505554114397
+  },
+  "none": {
+   "share": 0.0,
+   "score": 0.3151346671985663,
+   "push_f1": 0.0,
+   "micro_f1": 0.3318742538798249,
+   "macro_f1": 0.29839508051730773
+  },
+  "prev_week_rate": {
+   "share": 0.05470685383980182,
+   "score": 0.35946101475422754,
+   "push_f1": 0.34331337325349304,
+   "micro_f1": 0.3633080534488985,
+   "macro_f1": 0.35561397605955664
+  },
+  "best_in_hindsight": {
+   "share": 0.0475,
+   "score": 0.3601895582348448,
+   "push_f1": 0.3468950749464668,
+   "micro_f1": 0.36416819012797075,
+   "macro_f1": 0.35621092634171886
+  }
+ }
+]
+done in 778s, wrote /mnt/c/Users/khanh/Documents/big data/hw/hw2/Assignment-2-Predicting-GitHub-User-Activity/experiments/missing_data/outputs
