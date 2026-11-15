@@ -76,8 +76,8 @@ K = 100 tokens per example (`--num-neighbors`).
    actions (any table, newest first; fewer if the user has fewer), all hop 0. The user is a hop-1
    token. A user with no visible action keeps the user as seed. Their time is kept, so the model
    sees how long ago the user was last active.
-2. **Breadth-first walk** from all seeds, nearest hops first, up to `--max-hops` (50 in exp1/2/two_model,
-   20 in exp4). Hop 1 additionally contains the latest visible row of each of the user's chains. Each
+2. **Breadth-first walk** from all seeds, nearest hops first, up to `--max-hops` (50 in the exp2 and
+   fk runs, 20 in exp4). Hop 1 additionally contains the latest visible row of each of the user's chains. Each
    hop's candidates are capped at 1,000 neighbours per node (random).
 3. **Budget.** A hop with more new nodes than the remaining budget gives a random subset. A row
    costs 1, or 2 if it is the first to bring in a new owner user (that user also becomes a token, one
@@ -104,28 +104,19 @@ Common settings: chain graph, `--chain-seed latest`, `--num-seeds 16`, K=100, 15
 
 | Run (`outputs/`) | Data end | Pushes in graph | Max hops | Val mAP | Holdout (final model) |
 |---|---|---|---|---|---|
-| `exp1` | 2026-06-01 | yes | 50 | 0.6237 | 0.6268 |
 | `exp2_nopush` | 2026-06-01 | no | 50 | 0.5916 | 0.6004 |
-| `two_model_push` | 2026-06-01 | yes | 50 | 0.6232 | 0.6264 |
-| `two_model_rest` | 2026-06-01 | no | 50 | 0.3820 | 0.3642 |
 | `exp2_all_data` | all | yes | 50 | 0.5195 | 0.4769 |
 | `exp4_all_maxhop20` | all | no | 20 | 0.5086 | 0.4623 |
 | `fk_exp1` (plain FK graph) | 2026-06-01 | yes | 50 | 0.5846 | 0.5897 |
 | `fk_exp2_nopush` (plain FK graph) | 2026-06-01 | no | 50 | 0.5851 | 0.5908 |
 
 Notes:
-* `two_model_push` / `two_model_rest` split the labels: one model with pushes in the graph (for the
-  push label) and one without (for the other labels); the "rest" number is the mean over its labels
-  and is not comparable to the 6-label runs.
 * Val mAP is the mean average precision over the labels; scores on the `end=2026-06-01` window and on
   the all-data window are not comparable (different weeks and different label rates).
-* Including pushes helps (0.62 vs 0.59) despite them being the most frequent row type.
 * `fk_*` runs use `--graph-structure fk` (single user seed, user linked directly to every row) with
-  otherwise the same settings and window as `exp1` / `exp2_nopush`, so they are the direct baseline
-  for the chain graph. Chain beats FK by +0.037 holdout with pushes (0.627 vs 0.590) and +0.010
-  without (0.600 vs 0.591). Under FK, pushes in the graph give no gain (0.590 vs 0.591): the push hub
-  swamps the 1-hop sample, which the chain graph avoids. The chain gain is on every label,
-  largest on push AP (val 0.92 vs 0.87) and open_pr AP (0.51 vs 0.44).
+  otherwise the same settings and window as `exp2_nopush`, so they are the baseline for the chain
+  graph. Without pushes, chain beats FK by +0.010 holdout (0.600 vs 0.591). Under FK, pushes in the
+  graph give no gain (0.590 vs 0.591): the push hub swamps the 1-hop sample.
 
 ## 7. Decision log
 
@@ -140,8 +131,6 @@ Notes:
 ## 8. Reproduce
 
 ```bash
-python experiments/relgt/run.py --graph-structure chain --chain-seed latest --num-seeds 16 \
-    --epochs 15 --end 2026-06-01 --name exp1
 python experiments/relgt/run.py --graph-structure chain --chain-seed latest --num-seeds 16 \
     --epochs 15 --end 2026-06-01 --exclude-push --name exp2_nopush
 python experiments/relgt/run.py --graph-structure chain --chain-seed latest --num-seeds 16 \

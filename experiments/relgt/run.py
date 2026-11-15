@@ -1438,7 +1438,7 @@ def main():
         for v, cols in preds.items():
             r[v] = base.scores(base.to_output(gids, dict(zip(EVENT_COLS, cols))), truth)
         metrics["holdout"].append(r)
-        dump[f"{str(w)[:10]}_gids"] = gids  # lets experiments/two_model combine models per label
+        dump[f"{str(w)[:10]}_gids"] = gids  # lets holdout predictions of several runs be joined per user
         dump[f"{str(w)[:10]}_truth"] = t[[f"y_{k}" for k in EVENT_COLS]].values[m][hsel[w]]
         for v, cols in preds.items():
             dump[f"{str(w)[:10]}_{v.split()[0]}"] = np.stack(cols, 1)
