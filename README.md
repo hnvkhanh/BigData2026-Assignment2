@@ -413,7 +413,7 @@ inside the seed spread. `--active-min-events 5` (quiet = fewer than 5 events in 
 
 ```bash
 python experiments/gnn/run.py --holdout --user-features --seed 0   # -> outputs/all_ego_uf_ho/metrics.json
-bash script.sh   # all 5 configs below x seeds 0-2 on 2 GPUs, logs in outputs/logs/, prints the summary
+CONFIGS="all_ego all_ego_uf all_ego_seg all_ego_uf_seg user_repo" bash script.sh   # the 5 configs below x seeds 0-2 on 2 GPUs, logs in outputs/logs/, prints the summary
 ```
 
 The validation numbers above come from one week (10-17), which also sets early stopping and the
@@ -553,6 +553,118 @@ Seed 0, validation week 10-17, 14 days vs full history (`ref_default`, same seed
 0.344, pr_review 0.366 vs 0.371, pr_review_comment 0.341 vs 0.365, push 0.610 vs 0.625. Best
 epoch 7 in both. **Result: 14 days keep most of the signal. The score drops 1.3 points, below
 the lowest of the 5 full-history seeds (46.68), but this is one seed scored on one week.**
+
+## Experiment: temporal heterogeneous GNN (`experiments/gnn/run.py --graph-structure hetero`)
+
+The user–repo GNN reduces every user–repo pair to one edge of windowed counts, and its time
+encoding (first / last age of the pair) adds at most noise. This model keeps the events and the
+objects they act on, TGAT-style. One full graph per week, built only from rows visible before
+each table's cutoff (same weeks, lags, eligibility and split as the baseline):
+
+- *Nodes*: the 9,000 cohort users (the 60 baseline features), and the PRs, issues and
+  repositories reached by an edge (test week: 24k PRs, 17k issues, 22k repos). An object's
+  features are its visible cohort events per activity and its distinct cohort users, plus days
+  since first seen for a PR / issue and the organisation flag for a repo.
+- *Edges, one per event* (90-day window, `--history-days`):
+  - user → PR / issue / pushed repo per activity, keeping the latest 32 per user and activity
+    (`--het-max-events`);
+  - repo → user `received`;
+  - PR / issue → its repository.
+
+  Every relation also runs reversed with its own weights (~300k edges per week).
+- *Time embedding*: each edge's age (days before its cutoff; for object → repo, days since the
+  object was first seen) goes through a learned `cos(w·log(1+age) + b)` encoding
+  (`--het-time-dim 16`, one encoder each for events, received and membership).
+- *Model* (`TemporalHeteroGNN`), 2 layers, dim 64:
+  - message `W_r[h_src ‖ φ(age)]`;
+  - attention `a_r·LeakyReLU(Q h_dst + m)`, softmaxed over a node's incoming edges of each
+    relation;
+  - relations summed per node type, then residual + LayerNorm;
+  - head on the user nodes.
+
+  Training (AdamW lr 2e-3, early stopping, thresholds) is the same as for the user–repo GNN.
+- `--het-time none` feeds zeros in place of φ. The architecture stays the same, so the
+  comparison isolates the time embedding.
+
+```bash
+python experiments/gnn/run.py --graph-structure hetero --holdout                  # -> outputs/all_het_ho/
+python experiments/gnn/run.py --graph-structure hetero --het-time none --holdout  # -> outputs/all_het_notime_ho/
+bash script.sh   # het and het_notime x seeds 0-2 under --holdout -> outputs/het_ho_s*, het_notime_ho_s*
+```
+
+**Results** (holdout protocol above, 3 seeds, runs `het_ho_s0-2` and `het_notime_ho_s0-2`):
+
+| Model | Run | Holdout score, mean (min–max) | Best epoch |
+|---|---|---|---|
+| Temporal hetero GNN | `het` | **38.71** (37.98–39.59) | 11, 5, 12 |
+| Same, time embedding off | `het_notime` | 37.42 (36.90–37.78) | 11, 5, 12 |
+
+Mean holdout F1 per activity:
+
+| Activity | het | het_notime | Difference |
+|---|---|---|---|
+| open_pr | 0.380 | 0.371 | +0.009 |
+| open_issue | 0.432 | 0.418 | +0.014 |
+| issue_comment | 0.393 | 0.382 | +0.011 |
+| pr_review | 0.386 | 0.383 | +0.003 |
+| pr_review_comment | 0.335 | 0.303 | +0.032 |
+
+**Result: the time embedding is worth about 1.3 points, but the hetero GNN does not beat the
+earlier models.**
+- With the time embedding the score is 38.71, against 37.42 without it. It is higher on every
+  activity, mostly on pr_review_comment (+0.032); pr_review barely moves (+0.003). The seed
+  ranges do not overlap (37.98–39.59 against 36.90–37.78), but with 3 seeds and a seed spread
+  of ~1–2 points this is suggestive, not conclusive.
+- Against the models of the holdout table above, 38.71 is level with the user–repo GNN (38.92)
+  and the ego GNN with user features (38.80), within the seed spread. Keeping the individual
+  events and objects instead of one windowed edge per user–repo pair brings no measurable gain.
+- Without the time embedding the hetero GNN is about as good as the plain ego GNN (36.53)
+  and 1.5 points under the user–repo GNN.
+- Both variants have the same best epochs (11, 5, 12) per seed, and train for as long as the
+  user–repo GNN (5–12 epochs), unlike the ego models.
+- One holdout week, 3 seeds; tuning-week scores were not recorded here.
+
+### 14-day window (`--history-days 14`)
+
+The same two models when they only see the last 14 days before each cutoff:
+- event edges, received edges and object / repo counts come from the 14 days;
+- a PR's or issue's days since first seen are clipped at 14;
+- the user features are recomputed from the 14 days (39 instead of 60: the 30d / 90d / all-time
+  counts are dropped).
+
+Eligibility and labels are unchanged, so the runs are scored on the same users as above. The
+test-week graph shrinks to 2.2k PRs, 1.7k issues and 6.2k repos (~77k edges per week on average,
+against ~300k).
+
+```bash
+bash script_h14.sh   # het_h14 and het_notime_h14 x seeds 0-2 under --holdout; summary next to het / het_notime
+```
+
+**Results**: TODO.
+
+## Experiment: ego GNN with the hetero model's time encoding (`--ego-time func`)
+
+The ego GNN encodes time inside each token: a fixed sinusoidal encoding of the log age, mixed
+with the other token features by the MLP. `--ego-time func` moves time onto the edges, as in
+the temporal hetero GNN:
+- the token has no time part (5 parts instead of 6);
+- every token ↔ user edge carries `φ = cos(w·log(1+age) + b)`, learned, of the token's age
+  (`--ego-time-dim 16`);
+- message token → user `W_r[h_token ‖ φ]`, attention `a_r·LeakyReLU(Q h_user + m)`, softmaxed
+  over the tokens of each relation, relations summed;
+- message user → token `W[h_user ‖ φ]`. A token has one incoming edge from the user, so there is
+  no attention;
+- the push repo ↔ member link, the self transform, the head and the training stay as before.
+
+`--ego-time none` keeps that architecture with φ = 0, the ablation (like `--het-time none`).
+The default `--ego-time sin` is the original model.
+
+```bash
+python experiments/gnn/run.py --user-features --ego-time func --holdout   # -> outputs/all_ego_uf_ftime_ho/
+bash script_ego_time.sh   # ego_uf_ftime, ego_uf_notime x seeds 0-2 on one GPU (GPU=0); summary also lists all_ego_uf (sin)
+```
+
+**Results** (holdout protocol, 3 seeds): TODO.
 
 ## Experiment: Relational Graph Transformer (`experiments/relgt/run.py`)
 

@@ -12,7 +12,12 @@
 Message passing (--ego-layers rounds): token -> user with one weight per relation, user -> token, and
 push repository <-> member token of the same repo, mean-aggregated and added to a self transform. The
 head reads the user node and the mean of all nodes. Mini-batches, AdamW lr 1e-3, early stopping.
-Results go to outputs/<task>_ego[_uf][_seg]/.
+Results go to outputs/<task>_ego[_uf][_ftime|_notime][_seg]/.
+--ego-time func moves time to the edges as in --graph-structure hetero: the token has no time part;
+each token <-> user edge carries the learned cos(w log(1 + age) + b) encoding phi of the token's age
+(--ego-time-dim), the messages are W_r [h_token, phi] (token -> user) and W [h_user, phi] (user ->
+token), and token -> user is attention-weighted, a_r . LeakyReLU(Q h_user + m) softmaxed over the
+tokens of each relation, relations summed. --ego-time none is the same with phi = 0 (the ablation).
 
 --segment activity (ego) trains two models: one on the quiet examples (no ego token, i.e. no visible
 activity in the last --ego-lookback days before the cutoffs) and one on the active ones. Each is
@@ -39,6 +44,19 @@ Model: per-type GraphSAGE-style message passing user -> repo -> user (2 rounds),
 By default one shared model predicts the 6 activities (6 outputs, mean of the 6 BCE losses);
 --actions picks a subset (e.g. --actions push, or --actions push pull_request), everything else
 being the same so the runs can be compared. --users restricts the users of every stage.
+
+--graph-structure hetero is a temporal heterogeneous GNN, one full graph per week like user-repo, but
+with the objects and the events kept (TemporalHeteroGNN, TGAT-style):
+  * nodes: cohort users (the 60 history features), and the PRs, issues and repositories they act on
+    in the 90 days (--history-days) before the per-table cutoffs, with counts of visible events;
+  * edges, one per event: user -> PR / issue / pushed repo per activity (the latest --het-max-events
+    per user and activity), repo -> user "received", PR / issue -> its repository; every relation
+    also runs reversed with its own weights;
+  * every edge's age (days before its cutoff; for PR / issue -> repo, since first seen) goes through
+    a learned cos(w log(1 + age) + b) encoding (--het-time-dim), part of the message and of the
+    attention score; messages are softmax-attention weighted per relation and node.
+--het-time none feeds zeros instead (same architecture): the ablation of the time embedding.
+Results go to outputs/<task>_het[_notime]/.
 
 --graph-structure chain replaces that graph by the relational entity graph of experiments/relgt:
 every row a node, a user linked to its latest visible row of each table, a row to the previous and
@@ -71,6 +89,8 @@ Run from the repo root:
     python experiments/gnn/run.py --graph-structure user-repo --history-days 14
     python experiments/gnn/run.py --graph-structure user-repo --time-enc edge
     python experiments/gnn/run.py --graph-structure user-repo --actions push
+    python experiments/gnn/run.py --graph-structure hetero --holdout              # -> outputs/all_het_ho/
+    python experiments/gnn/run.py --graph-structure hetero --het-time none --holdout
     python experiments/gnn/run.py --graph-structure chain --chain-seed latest --num-seeds 16 --exclude-push
 """
 import argparse
@@ -231,13 +251,12 @@ def masked_bce(logits, y, mask):
     return per_task[m.any(0)].mean()
 
 
-def fit(graphs, weeks, n_out, epochs, seed, device, val_weeks=None, patience=5, lr=2e-3, time_dim=0):
-    """Train on the given weeks; with val_weeks, early-stop on validation loss."""
+def fit(graphs, weeks, make_model, epochs, seed, val_weeks=None, patience=5, lr=2e-3):
+    """Full-graph training, one week per step (user-repo and hetero): make_model() builds the model,
+    model(graph) gives the logits of the users. With val_weeks, early-stop on validation loss."""
     torch.manual_seed(seed)
     rng = np.random.default_rng(seed)
-    g0 = graphs[weeks[0]]
-    model = HeteroSAGE(g0["xu"].shape[1], g0["xr"].shape[1], g0["edges"][0][2].shape[1], n_out,
-                       time_dim=time_dim).to(device)
+    model = make_model()
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
     best, best_state, best_epoch, bad = np.inf, None, epochs, 0
     bar = tqdm(range(1, epochs + 1), desc="epochs", unit="ep", dynamic_ncols=True, **PROGRESS)
@@ -508,34 +527,44 @@ class EgoTokenEncoder(nn.Module):
     """Entity id, node type, relation, hop, row features and time, concatenated and mixed by an MLP
     (old model.py TokenEncoder)."""
 
-    def __init__(self, n_entities, d, dropout):
+    def __init__(self, n_entities, d, dropout, token_time=True):
         super().__init__()
         self.entity = nn.Embedding(n_entities, d, padding_idx=0)
         self.node_type = nn.Embedding(EGO_N_TYPES, d)
         self.rel = nn.Embedding(EGO_N_REL, d)
         self.hop = nn.Embedding(EGO_N_HOPS, d)
         self.feat = nn.Sequential(nn.Linear(EGO_N_FEATS, d), nn.GELU(), nn.Linear(d, d))
-        self.time = EgoTimeEncoder(d)
-        self.mix = nn.Sequential(nn.Linear(6 * d, d), nn.GELU(), nn.Dropout(dropout), nn.Linear(d, d),
-                                 nn.LayerNorm(d))
+        self.time = EgoTimeEncoder(d) if token_time else None  # None: time goes on the edges instead
+        self.mix = nn.Sequential(nn.Linear((6 if token_time else 5) * d, d), nn.GELU(), nn.Dropout(dropout),
+                                 nn.Linear(d, d), nn.LayerNorm(d))
 
     def forward(self, entity, types, rel, hop, feat, days):
-        return self.mix(torch.cat([self.entity(entity), self.node_type(types), self.rel(rel), self.hop(hop),
-                                   self.feat(feat), self.time(days)], -1))
+        parts = [self.entity(entity), self.node_type(types), self.rel(rel), self.hop(hop), self.feat(feat)]
+        if self.time is not None:
+            parts.append(self.time(days))
+        return self.mix(torch.cat(parts, -1))
 
 
 class EgoLayer(nn.Module):
     """One round of relation-aware message passing on the star graph (old gnn_model.py RelationalLayer):
     token -> user with one weight per relation, user -> token, and push repository <-> the repository
-    membership token of the same repo, each mean-aggregated and added to a self transform."""
+    membership token of the same repo, each mean-aggregated and added to a self transform.
 
-    def __init__(self, d, dropout):
+    With time_dim (--ego-time func / none), the token <-> user edges carry phi (B, N, time_dim; row 0,
+    the user, is zeros) as in TemporalHeteroLayer: messages W_r [h_token, phi] and W [h_user, phi], and
+    token -> user is attention-weighted per relation (a_r . LeakyReLU(Q h_user + m), softmax over the
+    tokens of relation r), relations summed. user -> token has one incoming edge, so no attention."""
+
+    def __init__(self, d, dropout, time_dim=0):
         super().__init__()
-        self.d = d
+        self.d, self.time_dim = d, time_dim
         self.self_loop = nn.Linear(d, d)
-        self.token_to_user = nn.Linear(d, (EGO_N_REL - 1) * d, bias=False)
-        self.user_to_token = nn.Linear(d, d, bias=False)
+        self.token_to_user = nn.Linear(d + time_dim, (EGO_N_REL - 1) * d, bias=False)
+        self.user_to_token = nn.Linear(d + time_dim, d, bias=False)
         self.same_entity = nn.Linear(d, d, bias=False)
+        if time_dim:
+            self.att = nn.Parameter(torch.randn(EGO_N_REL - 1, d) / np.sqrt(d))
+            self.q = nn.Linear(d, d, bias=False)
         self.norm = nn.LayerNorm(d)
         self.drop = nn.Dropout(dropout)
 
@@ -543,12 +572,26 @@ class EgoLayer(nn.Module):
     def _mean(adj, msg):
         return adj @ msg / adj.sum(-1, keepdim=True).clamp(min=1.0)
 
-    def forward(self, x, rel, to_user, to_token, same):
+    def forward(self, x, rel, to_user, to_token, same, phi=None):
         B, N, _ = x.shape
-        per_rel = self.token_to_user(x).view(B, N, EGO_N_REL - 1, self.d)
+        src = x if phi is None else torch.cat([x, phi], -1)
+        per_rel = self.token_to_user(src).view(B, N, EGO_N_REL - 1, self.d)
         picked = per_rel.gather(2, rel.view(B, N, 1, 1).expand(-1, -1, 1, self.d)).squeeze(2)
-        upd = (self.self_loop(x) + self._mean(to_user, picked) + self._mean(to_token, self.user_to_token(x))
-               + self._mean(same, self.same_entity(x)))
+        if phi is None:
+            upd = (self.self_loop(x) + self._mean(to_user, picked) + self._mean(to_token, self.user_to_token(x))
+                   + self._mean(same, self.same_entity(x)))
+            return self.norm(x + self.drop(torch.relu(upd)))
+        valid = to_user[:, 0] > 0                                         # (B, N): the user's in-edges
+        score = (self.att[rel] * nn.functional.leaky_relu(self.q(x[:, :1]) + picked, 0.2)).sum(-1)
+        group = nn.functional.one_hot(rel, EGO_N_REL - 1).bool() & valid.unsqueeze(-1)  # (B, N, R)
+        mx = score.detach().unsqueeze(-1).masked_fill(~group, -torch.inf).amax(1)       # (B, R)
+        mx = mx.masked_fill(torch.isinf(mx), 0.0)
+        ex = (score - mx.gather(1, rel)).exp() * valid.to(x.dtype)
+        den = (ex.unsqueeze(-1) * group.to(x.dtype)).sum(1)                             # (B, R)
+        a = ex / den.gather(1, rel).clamp(min=1e-16)
+        to_u = torch.cat([(a.unsqueeze(-1) * picked).sum(1, keepdim=True), x.new_zeros(B, N - 1, self.d)], 1)
+        to_t = self.user_to_token(torch.cat([x[:, :1].expand(-1, N, -1), phi], -1)) * to_token[:, :, :1]
+        upd = self.self_loop(x) + to_u + to_t + self._mean(same, self.same_entity(x))
         return self.norm(x + self.drop(torch.relu(upd)))
 
 
@@ -557,13 +600,16 @@ class EgoGNN(nn.Module):
     baseline user features) joined to its ego tokens, `layers` rounds of EgoLayer, then a head on the
     user node and the mean of all nodes."""
 
-    def __init__(self, n_entities, n_out, d=64, layers=2, dropout=0.1, n_seed_feats=0):
+    def __init__(self, n_entities, n_out, d=64, layers=2, dropout=0.1, n_seed_feats=0, time="sin", time_dim=16):
         super().__init__()
-        self.tokens = EgoTokenEncoder(n_entities, d, dropout)
+        self.edge_time = time != "sin"   # func / none: phi on the token <-> user edges (none: phi = 0)
+        self.tokens = EgoTokenEncoder(n_entities, d, dropout, token_time=not self.edge_time)
+        self.time = FuncTimeEncoder(time_dim) if time == "func" else None
+        self.time_dim = time_dim if self.edge_time else 0
         self.user_token = nn.Parameter(torch.randn(d) / np.sqrt(d))
         self.seed_encoder = (nn.Sequential(nn.Linear(n_seed_feats, d), nn.ReLU(), nn.Linear(d, d))
                              if n_seed_feats else None)
-        self.layers = nn.ModuleList(EgoLayer(d, dropout) for _ in range(layers))
+        self.layers = nn.ModuleList(EgoLayer(d, dropout, self.time_dim) for _ in range(layers))
         self.head = nn.Sequential(nn.Linear(2 * d, d), nn.GELU(), nn.Dropout(dropout), nn.Linear(d, n_out))
 
     def forward(self, entity, types, rel, hop, feat, days, seed_x=None):
@@ -586,8 +632,13 @@ class EgoGNN(nn.Module):
                 & (hop.unsqueeze(2) != hop.unsqueeze(1)))
         same = torch.zeros_like(to_user)
         same[:, 1:, 1:] = link.to(x.dtype)
+        phi = None
+        if self.edge_time:
+            phi = x.new_zeros(B, K + 1, self.time_dim)
+            if self.time is not None:
+                phi[:, 1:] = self.time(days) * vf.unsqueeze(-1)
         for layer in self.layers:
-            x = layer(x, rels, to_user, to_token, same)
+            x = layer(x, rels, to_user, to_token, same, phi)
         mask = torch.cat([valid.new_ones(B, 1), valid], 1).unsqueeze(-1).to(x.dtype)
         mean = (x * mask).sum(1) / mask.sum(1).clamp(min=1.0)
         return self.head(torch.cat([x[:, 0], mean], -1))
@@ -653,7 +704,7 @@ def ego_stages(args, tables, feats, weeks, train_weeks, cohort, lags, test, labe
 
     def make_model(n_seed_feats):
         return EgoGNN(n_entities, len(labels), d=args.ego_dim, layers=args.ego_layers, dropout=args.ego_dropout,
-                      n_seed_feats=n_seed_feats).to(device)
+                      n_seed_feats=n_seed_feats, time=args.ego_time, time_dim=args.ego_time_dim).to(device)
 
     def train(fit_weeks, epochs, val_weeks=None):
         """One model, or with --segment activity a {segment: model} dict and a {segment: best epoch}
@@ -691,6 +742,246 @@ def ego_stages(args, tables, feats, weeks, train_weeks, cohort, lags, test, labe
         return out
 
     return train, predict_week, seg_rows.__getitem__
+
+
+# ---------------------------------------------------------------------------------------------------
+# --graph-structure hetero: users, PRs, issues and repositories, one edge per event, with a functional
+# time encoding of its age and time-aware attention (TGAT-style), one full graph per week.
+
+HET_TYPES = ["user", "pr", "issue", "repo"]
+HET_OBJ_TYPE = {"open_pr": 1, "open_issue": 2, "issue_comment": 2, "pr_review": 1, "pr_review_comment": 1,
+                "push": 3}
+# (name, source type, destination type, time-encoder family); every relation also runs reversed.
+HET_RELS = ([(k, 0, HET_OBJ_TYPE[k], 0) for k in EVENT_COLS]
+            + [("received", 3, 0, 1), ("pr_in", 1, 3, 2), ("issue_in", 2, 3, 2)])
+HET_N_FAMILIES = 3  # user events, received events, object -> repo membership
+
+
+def hetero_graph(ent_ev, ev, s, lags, keep, window, max_events, repo_is_org, max_seen=None):
+    """Nodes, edges and edge ages of the --graph-structure hetero graph of week s.
+
+    Activity k is visible through its own cutoff c_k = s - lags[k]: a row is used if avail < c_k,
+    entity_avail < c_k and c_k - window <= t < c_k (as ego_tokens). Edges, one per event:
+      * user -> object of activity k (PR, issue, or the repository of a push), the latest max_events
+        per user and activity; age = c_k - t;
+      * repo -> user "received" (rows of ev["received"], cutoff of "received"), latest max_events per
+        user; age = c - t;
+      * PR / issue -> its repository; age = days since the PR / issue was first seen.
+    Nodes: the kept users (renumbered 0..keep.sum()-1 like week_graph), and the PRs, issues and
+    repositories reached by an edge. Object features count all visible events (before the cap):
+    PR / issue: log events per activity, log distinct cohort users, log days since first seen;
+    repo: log events per activity and received, log distinct cohort users, is it an organisation's.
+    With max_seen (--history-days), the days since first seen are clipped to it, so a PR / issue
+    older than the window reads as "at least max_seen days old" and nothing before it is visible.
+    Returns {"x": [None, x_pr, x_issue, x_repo], "ent": [None, pr ids, issue ids, repo ids],
+    "edges": [(src, dst, age) per HET_RELS]}; PR / issue ids are load_entity_events' entity ids.
+    """
+    new_id = np.cumsum(keep) - 1
+    win = np.timedelta64(int(window * 86400), "s")
+    one_day = np.timedelta64(1, "D")
+
+    def latest(d):
+        d = d.sort_values(["uid", "age"], kind="stable")
+        return d[d.groupby("uid", sort=False).cumcount().values < max_events]
+
+    vis = []
+    for rel, k in enumerate(EVENT_COLS):
+        c = np.datetime64(s - lags[k])
+        e = ent_ev[k]
+        m = ((e.avail.values < c) & (e.entity_avail.values < c) & (e.t.values < c) & (e.t.values >= c - win)
+             & keep[e.uid.values])
+        vis.append(pd.DataFrame({"uid": e.uid.values[m], "entity": e.entity.values[m], "repo": e.repo.values[m],
+                                 "age": (c - e.t.values[m]) / one_day,
+                                 "seen": (c - e.entity_avail.values[m]) / one_day, "rel": rel,
+                                 "otype": HET_OBJ_TYPE[k]}))
+    allv = pd.concat(vis, ignore_index=True)
+    used = pd.concat([latest(d) for d in vis], ignore_index=True)
+
+    c = np.datetime64(s - lags["received"])
+    e = ev["received"]
+    m = ((e.avail.values < c) & (e.t.values < c) & (e.t.values >= c - win) & ~np.isnan(e.repo.values)
+         & (e.uid.values >= 0))
+    m &= keep[e.uid.values.clip(0)]
+    rec_all = pd.DataFrame({"uid": e.uid.values[m], "repo": e.repo.values[m].astype(np.int64),
+                            "age": (c - e.t.values[m]) / one_day})
+    rec = latest(rec_all)
+
+    ids = [None, np.unique(used.entity.values[used.otype.values == 1]),
+           np.unique(used.entity.values[used.otype.values == 2]),
+           np.unique(np.concatenate([used.repo.values, rec.repo.values]).astype(np.int64))]
+    x = [None]
+    obj_repo, obj_seen = [None], [None]
+    nk = len(EVENT_COLS)
+    for t in (1, 2):
+        a = allv[(allv.otype.values == t) & np.isin(allv.entity.values, ids[t])]
+        idx, n_t = np.searchsorted(ids[t], a.entity.values), len(ids[t])
+        cnt = np.bincount(idx * nk + a.rel.values, minlength=n_t * nk).reshape(n_t, nk)
+        by = pd.DataFrame({"idx": idx, "uid": a.uid.values, "seen": a.seen.values, "repo": a.repo.values}
+                          ).groupby("idx")
+        users = by.uid.nunique().reindex(range(n_t), fill_value=0).values
+        seen = by.seen.max().reindex(range(n_t)).values
+        if max_seen is not None:
+            seen = np.minimum(seen, max_seen)
+        obj_repo.append(np.searchsorted(ids[3], by.repo.first().reindex(range(n_t)).values.astype(np.int64)))
+        obj_seen.append(seen)
+        x.append(np.concatenate([np.log1p(cnt), np.log1p(users)[:, None], np.log1p(seen)[:, None]], 1))
+    a = allv[np.isin(allv.repo.values, ids[3])]
+    r = rec_all[np.isin(rec_all.repo.values, ids[3])]
+    n_r = len(ids[3])
+    idx = np.concatenate([np.searchsorted(ids[3], a.repo.values), np.searchsorted(ids[3], r.repo.values)])
+    col = np.concatenate([a.rel.values, np.full(len(r), nk)])
+    cnt = np.bincount(idx * (nk + 1) + col, minlength=n_r * (nk + 1)).reshape(n_r, nk + 1)
+    users = (pd.Series(np.concatenate([a.uid.values, r.uid.values])).groupby(idx).nunique()
+             .reindex(range(n_r), fill_value=0).values)
+    x.append(np.concatenate([np.log1p(cnt), np.log1p(users)[:, None], repo_is_org[ids[3]][:, None]], 1))
+    x = [None] + [v.astype(np.float32) for v in x[1:]]
+
+    edges = []
+    for rel, k in enumerate(EVENT_COLS):
+        d = used[used.rel.values == rel]
+        t = HET_OBJ_TYPE[k]
+        dst = np.searchsorted(ids[t], d.repo.values if t == 3 else d.entity.values)
+        edges.append((new_id[d.uid.values], dst, d.age.values))
+    edges.append((np.searchsorted(ids[3], rec.repo.values), new_id[rec.uid.values], rec.age.values))
+    for t in (1, 2):
+        edges.append((np.arange(len(ids[t])), obj_repo[t], obj_seen[t]))
+    edges = [(src.astype(np.int64), dst.astype(np.int64), age.astype(np.float32)) for src, dst, age in edges]
+    assert all((age > 0).all() for _, _, age in edges), "a hetero edge is not strictly before its cutoff"
+    return {"x": x, "ent": ids, "edges": edges}
+
+
+class FuncTimeEncoder(nn.Module):
+    """Learned functional time encoding cos(w log(1 + days) + b) (TGAT's Bochner encoding, on the log
+    age); w starts at log-spaced frequencies as EgoTimeEncoder."""
+
+    def __init__(self, d):
+        super().__init__()
+        self.w = nn.Parameter(torch.logspace(-1, 1, d))
+        self.b = nn.Parameter(torch.zeros(d))
+
+    def forward(self, days):
+        return torch.cos(torch.log1p(days.clamp(min=0)).unsqueeze(-1) * self.w + self.b)
+
+
+def scatter_softmax(score, idx, n):
+    """Softmax of score over the entries sharing the same idx (torch_geometric.utils.softmax)."""
+    mx = torch.full((n,), -torch.inf, device=score.device, dtype=score.dtype)
+    mx = mx.scatter_reduce(0, idx, score, "amax", include_self=True)
+    ex = (score - mx[idx]).exp()
+    den = torch.zeros(n, device=score.device, dtype=score.dtype).index_add(0, idx, ex)
+    return ex / den[idx].clamp(min=1e-16)
+
+
+class TemporalHeteroLayer(nn.Module):
+    """One round over every directed relation r (src -> dst): message m = W_r [h_src, phi(age)],
+    attention a_r . LeakyReLU(Q_dst h_dst + m) softmaxed over the incoming edges of r of each node; the
+    relations are summed per node type, then h = LN(h + drop(relu(U [h, agg]))) per type."""
+
+    def __init__(self, d, time_dim, n_rel, dropout):
+        super().__init__()
+        nt = len(HET_TYPES)
+        self.msg = nn.ModuleList(nn.Linear(d + time_dim, d) for _ in range(n_rel))
+        self.att = nn.Parameter(torch.randn(n_rel, d) / np.sqrt(d))
+        self.q = nn.ModuleList(nn.Linear(d, d, bias=False) for _ in range(nt))
+        self.upd = nn.ModuleList(nn.Linear(2 * d, d) for _ in range(nt))
+        self.norm = nn.ModuleList(nn.LayerNorm(d) for _ in range(nt))
+        self.drop = nn.Dropout(dropout)
+
+    def forward(self, h, edges):
+        q = [lin(x) for lin, x in zip(self.q, h)]
+        agg = [torch.zeros_like(x) for x in h]
+        for r, (st, dt, src, dst, phi) in enumerate(edges):
+            if len(src) == 0:
+                continue
+            m = self.msg[r](torch.cat([h[st][src], phi], 1))
+            score = (self.att[r] * nn.functional.leaky_relu(q[dt][dst] + m, 0.2)).sum(-1)
+            a = scatter_softmax(score, dst, len(h[dt]))
+            agg[dt] = agg[dt].index_add(0, dst, a[:, None] * m)
+        return [norm(x + self.drop(torch.relu(upd(torch.cat([x, ag], 1)))))
+                for norm, upd, x, ag in zip(self.norm, self.upd, h, agg)]
+
+
+class TemporalHeteroGNN(nn.Module):
+    """--graph-structure hetero: an MLP encoder per node type (plus, with n_entities, a learned entity
+    embedding of PRs / issues / repos), `layers` rounds of TemporalHeteroLayer over HET_RELS in both
+    directions, then a head on the user nodes. use_time=False feeds zeros instead of the time encoding."""
+
+    def __init__(self, dims, n_out, d=64, layers=2, dropout=0.1, time_dim=16, use_time=True, n_entities=0):
+        super().__init__()
+
+        def enc(i):
+            return nn.Sequential(nn.Linear(i, d), nn.ReLU(), nn.Dropout(dropout), nn.Linear(d, d))
+
+        self.enc = nn.ModuleList(enc(i) for i in dims)
+        self.entity = nn.Embedding(n_entities, d) if n_entities else None
+        self.time = nn.ModuleList(FuncTimeEncoder(time_dim) for _ in range(HET_N_FAMILIES))
+        self.time_dim, self.use_time = time_dim, use_time
+        self.layers = nn.ModuleList(TemporalHeteroLayer(d, time_dim, 2 * len(HET_RELS), dropout)
+                                    for _ in range(layers))
+        self.head = nn.Sequential(nn.Linear(d, d), nn.ReLU(), nn.Dropout(dropout), nn.Linear(d, n_out))
+
+    def forward(self, g):
+        h = [enc(x) for enc, x in zip(self.enc, g["x"])]
+        if self.entity is not None:
+            h = [h[0]] + [x + self.entity(e) for x, e in zip(h[1:], g["ent"][1:])]
+        edges = []
+        for (_, st, dt, fam), (src, dst, age) in zip(HET_RELS, g["edges"]):
+            phi = self.time[fam](age) if self.use_time else age.new_zeros(len(age), self.time_dim)
+            edges += [(st, dt, src, dst, phi), (dt, st, dst, src, phi)]
+        for layer in self.layers:
+            h = layer(h, edges)
+        return self.head(h[0])
+
+
+def hetero_stages(args, tables, feats, train_weeks, cohort, ev, lags, sel, repo_is_org, labels, device):
+    """--graph-structure hetero: the graph of every week (hetero_graph), and the functions that train on
+    weeks (full-graph fit, as user-repo) and predict one week (one value per row of its table)."""
+    ent_ev, n_entities, repo_offset = load_entity_events(cohort)
+    window = args.history_days or 90
+    raw = {w: hetero_graph(ent_ev, ev, w, lags, sel[w], window, args.het_max_events, repo_is_org,
+                           max_seen=args.history_days)
+           for w in tqdm(list(tables), desc="hetero graphs", unit="week", dynamic_ncols=True, **PROGRESS)}
+    for w, t in tables.items():
+        raw[w]["x"][0] = np.log1p(t[feats].values).astype(np.float32)
+        raw[w]["ent"][3] = raw[w]["ent"][3] + repo_offset  # repo ids -> entity ids, for --het-entity-emb
+    # Standardise every node type with statistics of the training weeks only.
+    stats = []
+    for i in range(len(HET_TYPES)):
+        xt = np.concatenate([raw[w]["x"][i] for w in train_weeks])
+        stats.append((xt.mean(0), xt.std(0) + 1e-6))
+
+    graphs = {}
+    for w, t in tables.items():
+        g = raw[w]
+        y = (t[[f"y_{k}" for k in labels]].values if w != base.TEST_START
+             else np.full((len(t), len(labels)), np.nan))
+        graphs[w] = {
+            "x": [torch.tensor((x - mu) / sd, dtype=torch.float32, device=device) for x, (mu, sd) in zip(g["x"], stats)],
+            "ent": [None] + [torch.tensor(e, device=device) for e in g["ent"][1:]],
+            "edges": [tuple(torch.tensor(a, device=device) for a in e) for e in g["edges"]],
+            "y": torch.tensor(y, dtype=torch.float32, device=device),
+            "mask": torch.tensor(t.eligible.values, device=device),
+        }
+    gt = raw[base.TEST_START]
+    print(f"hetero graph of the test week ({window:g}-day window, <= {args.het_max_events} events per user "
+          f"and relation): " + ", ".join(f"{len(x):,} {name}" for name, x in zip(HET_TYPES, gt["x"])) + "; edges "
+          + ", ".join(f"{r[0]} {len(e[0]):,}" for r, e in zip(HET_RELS, gt["edges"])))
+    print(f"edges per week: mean {np.mean([sum(len(e[0]) for e in g['edges']) for g in raw.values()]):,.0f}"
+          + (f", GPU memory {torch.cuda.memory_allocated() / 2**30:.2f} GiB" if device == "cuda" else ""))
+    dims = [x.shape[1] for x in gt["x"]]
+
+    def make_model():
+        return TemporalHeteroGNN(dims, len(labels), d=args.het_dim, layers=args.het_layers, dropout=args.het_dropout,
+                                 time_dim=args.het_time_dim, use_time=args.het_time == "func",
+                                 n_entities=n_entities if args.het_entity_emb else 0).to(device)
+
+    def train(fit_weeks, epochs, val_weeks=None):
+        return fit(graphs, fit_weeks, make_model, epochs, args.seed, val_weeks=val_weeks, lr=args.lr)
+
+    def predict_week(model, w):
+        return predict(model, graphs[w])
+
+    return train, predict_week
 
 
 class RowGNN(nn.Module):
@@ -846,16 +1137,34 @@ def main():
                     help="the model only sees rows of the last N days before each cutoff (user features, "
                          "graph edges and repo features; with --graph-structure chain, the tokens), in "
                          "training, validation and test alike (default: all, edges 90 days)")
-    ap.add_argument("--graph-structure", choices=["ego", "user-repo", "chain"], default="ego",
+    ap.add_argument("--graph-structure", choices=["ego", "user-repo", "hetero", "chain"], default="ego",
                     help="ego: one star graph per example, the user and its recent PRs / issues / repos "
                          "(old_experiments/relgt_inspired GNN). user-repo: one user <-> repository graph "
-                         "per week (HeteroSAGE). chain: the row graph of experiments/relgt, one token "
-                         "subgraph per example")
+                         "per week (HeteroSAGE). hetero: one user / PR / issue / repo graph per week, one "
+                         "edge per event with a time encoding and time-aware attention. chain: the row "
+                         "graph of experiments/relgt, one token subgraph per example")
+    hg = ap.add_argument_group("--graph-structure hetero")
+    hg.add_argument("--het-dim", type=int, default=64)
+    hg.add_argument("--het-layers", type=int, default=2, help="message passing rounds")
+    hg.add_argument("--het-dropout", type=float, default=0.1)
+    hg.add_argument("--het-max-events", type=int, default=32,
+                    help="latest event edges kept per user and relation (default 32)")
+    hg.add_argument("--het-time", choices=["func", "none"], default="func",
+                    help="func: learned cos(w log(1 + age) + b) encoding of every edge's age; none: zeros "
+                         "(ablation, same architecture)")
+    hg.add_argument("--het-time-dim", type=int, default=16)
+    hg.add_argument("--het-entity-emb", action="store_true",
+                    help="add a learned embedding of each PR / issue / repo id to its node")
     eg = ap.add_argument_group("--graph-structure ego")
     eg.add_argument("--ego-lookback", type=float, default=14,
                     help="only activity rows of the last N days are tokens (default 14, as the old model)")
     eg.add_argument("--user-features", action="store_true",
                     help="add an MLP of the baseline user features to the learned user node")
+    eg.add_argument("--ego-time", choices=["sin", "func", "none"], default="sin",
+                    help="sin: sinusoidal log-age encoding inside each token (the original); func: the "
+                         "hetero model's learned cos(w log(1+age)+b) on the token <-> user edges, in the "
+                         "messages and the attention; none: the func architecture with zeros (ablation)")
+    eg.add_argument("--ego-time-dim", type=int, default=16, help="size of phi (--ego-time func)")
     eg.add_argument("--ego-dim", type=int, default=64)
     eg.add_argument("--ego-layers", type=int, default=2, help="message passing rounds")
     eg.add_argument("--ego-dropout", type=float, default=0.1)
@@ -877,10 +1186,11 @@ def main():
     g.add_argument("--channels", type=int, default=64)
     args = ap.parse_args()
     chain, ego = args.graph_structure == "chain", args.graph_structure == "ego"
-    args.lr = args.lr or {"ego": 1e-3, "user-repo": 2e-3, "chain": 3e-4}[args.graph_structure]
-    args.epochs = args.epochs or (40 if args.graph_structure == "user-repo" else 20)
+    het = args.graph_structure == "hetero"
+    args.lr = args.lr or {"ego": 1e-3, "user-repo": 2e-3, "hetero": 2e-3, "chain": 3e-4}[args.graph_structure]
+    args.epochs = args.epochs or (40 if args.graph_structure in ("user-repo", "hetero") else 20)
     args.batch_size = args.batch_size or (256 if ego else 512)
-    for group, needed in [(g, "chain"), (eg, "ego")]:
+    for group, needed in [(g, "chain"), (eg, "ego"), (hg, "hetero")]:
         changed = [a.option_strings[0] for a in group._group_actions if ap.get_default(a.dest) != getattr(args, a.dest)]
         if args.graph_structure != needed and changed:
             ap.error(f"these options need --graph-structure {needed}: " + ", ".join(changed))
@@ -888,6 +1198,8 @@ def main():
         ap.error("--time-enc is for the user-repo graph (the ego and chain tokens already encode their time)")
     if args.time_enc != "none" and (args.time_dim < 2 or args.time_dim % 2):
         ap.error("--time-dim must be an even number >= 2")
+    if het and (args.het_max_events < 1 or args.het_time_dim < 1 or args.het_layers < 1):
+        ap.error("--het-max-events, --het-time-dim and --het-layers must be >= 1")
     time_dim = args.time_dim if args.time_enc == "edge" else 0
     hist = args.history_days
     if hist is not None and not 8 <= hist <= 90:
@@ -918,6 +1230,8 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     default_name = ((args.task if args.users == "all" else f"{args.task}_{args.users}") + ("_chain" if chain else "")
                     + ("_ego" if ego else "") + ("_uf" if ego and args.user_features else "")
+                    + ({"func": "_ftime", "none": "_notime"}.get(args.ego_time, "") if ego else "")
+                    + ("_het" if het else "") + ("_notime" if het and args.het_time == "none" else "")
                     + (("_seg" + (str(args.active_min_events) if args.active_min_events != 1 else ""))
                        if ego and args.segment != "none" else "")
                     + (f"_lb{args.ego_lookback:g}" if ego and not hist and args.ego_lookback != 14 else "")
@@ -979,6 +1293,9 @@ def main():
     if ego:
         train, predict_week, segment_of = ego_stages(args, tables, feats, weeks, train_weeks, cohort, lags, test, labels, device,
                                          sel)
+    elif het:
+        train, predict_week = hetero_stages(args, tables, feats, train_weeks, cohort, ev, lags, sel, repo_is_org,
+                                            labels, device)
     elif chain:
         train, predict_week = token_stages(args, tables, feats, weeks, train_weeks, cohort, lags, test, labels, device)
     else:
@@ -1007,9 +1324,14 @@ def main():
         print(f"graph of the test week: {n} users, {graphs[base.TEST_START]['xr'].shape[0]} repos, "
               f"{sum(len(u) for u, _, _ in graphs[base.TEST_START]['edges'])} edges")
 
+        g0 = graphs[train_weeks[0]]
+
+        def make_model():
+            return HeteroSAGE(g0["xu"].shape[1], g0["xr"].shape[1], g0["edges"][0][2].shape[1], len(labels),
+                              time_dim=time_dim).to(device)
+
         def train(fit_weeks, epochs, val_weeks=None):
-            return fit(graphs, fit_weeks, len(labels), epochs, args.seed, device, val_weeks=val_weeks, lr=args.lr,
-                       time_dim=time_dim)
+            return fit(graphs, fit_weeks, make_model, epochs, args.seed, val_weeks=val_weeks, lr=args.lr)
 
         def predict_week(model, w):
             return predict(model, graphs[w])
@@ -1026,6 +1348,8 @@ def main():
     if ego:
         metrics["segment"] = args.segment
         metrics["active_min_events"] = args.active_min_events
+    if het:
+        metrics["graph"] = {a.dest: getattr(args, a.dest) for a in hg._group_actions}
     if chain or ego:
         metrics["graph"] = {a.dest: getattr(args, a.dest) for a in (g if chain else eg)._group_actions}
         metrics["graph"].update(batch_size=args.batch_size, max_steps_per_epoch=args.max_steps_per_epoch)
