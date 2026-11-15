@@ -141,8 +141,9 @@ python experiments/gnn/run.py --user-features    # -> experiments/gnn/outputs/al
 
 The relation-aware GNN of `old_experiments/relgt_inspired` (`gnn_model.py`), ported to the
 current protocol. It uses the same weeks, per-table lags, eligibility, split, thresholds and
-final retrain as the baseline. Its old backtest score (0.596) came from older data and its own
-splits, so that number can't be compared with the results here.
+final retrain as the baseline. Its old backtest score (0.596) used its own user selection and
+holdout weeks, so that number can't be compared with the results here (see *Rerun of the old
+backtest* below).
 
 - *One star graph per example* (eligible user, week). It has a learned user node and 48 tokens
   from the last 14 days (`--ego-lookback`) before each table's cutoff:
@@ -210,11 +211,39 @@ the entity-id embedding (599k × 64 ≈ 38M parameters), which can memorise indi
 PRs, issues and repos. As with the user–repo GNN, only one validation week is scored.
 
 The old backtest scored 0.596 against 0.46 here. That is not a regression. The old run:
-- kept only users with at least 5 events in the last 14 days (about 3,000 per week; positive
-  rates of 9–21%, and 77% for push, against 2–7% and 33% here);
+- kept only users with at least 5 events in the last 14 days (about 1,500 per holdout week,
+  1,200–1,740; positive rates of 12–24%, and 74% for push, against 3–6% and 33% in week 10-17
+  here);
 - used no data lags, so its features ran right up to the cutoff. Here the cutoff is about 7
   days earlier for most tables and 25.7 days earlier for push;
-- pooled 6 holdout weeks.
+- pooled 6 holdout weeks (09-13 → 10-18), including 09-13, the week after the September
+  backfill burst, which alone scores 0.67.
+
+#### Rerun of the old backtest on the current data
+
+```bash
+python -m old_experiments.relgt_inspired.run backtest --temporal-model gnn    # or relgt
+```
+
+Unchanged code, default seed 42, one run each (`old_experiments/relgt_inspired/outputs/rerun_gnn`,
+`rerun_relgt`; the original runs are `backtest_gnn_full`, `backtest_relgt_full` and the two in
+`results/archive_old_data`). The old code always holds out the last 6 weeks, which are now
+09-27 → 11-01, so the comparison is made on the 4 weeks both holdouts share, with each run's own
+thresholds:
+
+| Model | Run | Holdout weeks | Holdout score | Score on 09-27 → 10-18 |
+|---|---|---|---|---|
+| GNN | old data (2 runs) | 09-13 → 10-18 | 0.596 / 0.600 | 0.583 / 0.588 |
+| GNN | current data | 09-27 → 11-01 | 0.569 | **0.593** |
+| RelGT | old data (2 runs) | 09-13 → 10-18 | 0.583 / 0.587 | 0.574 / 0.575 |
+| RelGT | current data | 09-27 → 11-01 | 0.569 | **0.591** |
+
+**Result: the old score still holds; on the same weeks the rerun is equal or slightly better**
+(+0.005 to +0.010 for the GNN, +0.016 for RelGT, one seed). The rerun has 25 training weeks
+instead of 23. Its lower headline score comes from the two new holdout weeks: pushes are mostly
+missing from GH Archive after 10-27, so only 46% (10-25) and 21% (11-01) of these users have a
+push label against ~72% before. Push F1 falls to 0.63 and 0.34, and those weeks score 0.49 and
+0.44. The old code has no label masking for such weeks.
 
 ### Separate models for quiet and active users (`--segment activity`)
 
