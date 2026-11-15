@@ -59,25 +59,33 @@ PARAMS = dict(objective="binary", learning_rate=0.05, num_leaves=31, min_child_s
               verbose=-1, seed=0)
 
 
-def load():
+TABLE_COLUMNS = {
+    "users": ("Users", ["user_id", "github_user_id", "is_cohort"]),
+    "prs": ("PullRequests", ["repo_id", "author_id", "created_at", "closed_at", "first_seen_at"]),
+    "issues": ("Issues", ["repo_id", "author_id", "is_pull_request", "created_at", "closed_at",
+                          "first_seen_at"]),
+    "comments": ("IssueComments", ["issue_id", "repo_id", "author_id", "created_at"]),
+    "reviews": ("PRReviews", ["pr_id", "repo_id", "reviewer_id", "submitted_at", "first_seen_at"]),
+    "rcomments": ("PRReviewComments", ["pr_id", "repo_id", "author_id", "created_at"]),
+    "pushes": ("Pushes", ["user_id", "repo_id", "created_at"]),
+}
+
+
+def read_tables():
+    """The columns load() uses, per table (separate so an experiment can alter the rows first)."""
+    return {k: pd.read_parquet(DB / f"{name}.parquet", columns=cols)
+            for k, (name, cols) in TABLE_COLUMNS.items()}
+
+
+def load(tables=None):
     """Read the tables and turn them into per-source event lists of cohort users.
 
     Each event has uid (cohort index), t (when it happened), avail (when the row is visible in
-    the data, so features at cutoff c may only use avail < c) and repo.
+    the data, so features at cutoff c may only use avail < c) and repo. `tables` (from
+    read_tables(), possibly altered) replaces reading the parquet files.
     """
-    users = pd.read_parquet(DB / "Users.parquet", columns=["user_id", "github_user_id", "is_cohort"])
-    prs = pd.read_parquet(DB / "PullRequests.parquet",
-                          columns=["repo_id", "author_id", "created_at", "closed_at", "first_seen_at"])
-    issues = pd.read_parquet(DB / "Issues.parquet",
-                             columns=["repo_id", "author_id", "is_pull_request", "created_at",
-                                      "closed_at", "first_seen_at"])
-    comments = pd.read_parquet(DB / "IssueComments.parquet",
-                               columns=["issue_id", "repo_id", "author_id", "created_at"])
-    reviews = pd.read_parquet(DB / "PRReviews.parquet",
-                              columns=["pr_id", "repo_id", "reviewer_id", "submitted_at", "first_seen_at"])
-    rcomments = pd.read_parquet(DB / "PRReviewComments.parquet",
-                                columns=["pr_id", "repo_id", "author_id", "created_at"])
-    pushes = pd.read_parquet(DB / "Pushes.parquet", columns=["user_id", "repo_id", "created_at"])
+    t = read_tables() if tables is None else tables
+    users, prs, issues, comments, reviews, rcomments, pushes = (t[k] for k in TABLE_COLUMNS)
 
     cohort = users[users.is_cohort].reset_index(drop=True)
     to_cidx = np.full(len(users), -1, np.int64)
