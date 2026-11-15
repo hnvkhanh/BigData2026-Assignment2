@@ -517,6 +517,27 @@ Mean holdout F1 per activity:
   now counts and the activities are less thin. They are not comparable with the 5-activity tables.
 - One holdout week, 3 seeds.
 
+#### Chain-graph models on the same week (`script_chain_ho0927.sh`)
+
+The chain graph of `experiments/relgt/README.md` (a user's rows of each table linked in time order,
+the user linked to the newest one; the 16 latest actions are the seeds), scored on the same week:
+- `relgt_chain`: `experiments/relgt/run.py --graph-structure chain --chain-seed latest --num-seeds 16
+  --epochs 15`, with `--end`, `--holdout-weeks 1` and `--val-start / --val-end` giving the same
+  train / tune / holdout weeks. It reports two scores: the *validation model* (trained to 09-19,
+  thresholds of 09-19) and the *final model* (retrained through 09-26, the validation share of
+  predicted positives).
+- `gnn_chain`: `experiments/gnn/run.py --graph-structure chain` with the same token settings and
+  `--holdout --holdout-week` (trained to 09-19, the tune week's share of predicted positives).
+
+The decision rules are not identical to the GNN holdout's, so the two RelGT scores bracket it.
+
+```bash
+bash script_chain_ho0927.sh   # relgt_chain on GPU 0, gnn_chain on GPU 1, seeds 0-2; summary next to script_ho0927.sh
+SEQUENTIAL=1 bash script_chain_ho0927.sh   # both on GPU 0, one after another (less RAM)
+```
+
+**Results**: TODO.
+
 ## Experiment: GNN (user–repo graph), all labels vs push only (`experiments/gnn/run.py --graph-structure user-repo`)
 
 This was the default before the ego model. Every command in this section needs

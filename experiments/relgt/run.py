@@ -106,6 +106,7 @@ Run from the repo root (needs PyTorch, a GPU is used if available):
     python experiments/relgt/run.py --test-pre-june --history --name test_pre_june_history
 """
 import argparse
+import os
 import hashlib
 import importlib.util
 import json
@@ -660,6 +661,24 @@ class TimeEncoder(nn.Module):
         return (1 - mask) * out + mask * self.mask_vector
 
 
+class LearnedTimeEncoder(TimeEncoder):
+    """--time-emb func: TimeEncoder with learned frequencies and phases instead of the fixed sinusoids,
+    cos(w log(1 + days) + b) (TGAT's functional encoding on the log age, as FuncTimeEncoder in
+    experiments/gnn), then the same linear layer and mask vector."""
+
+    def __init__(self, d):
+        super().__init__(d)
+        del self.pos
+        self.w = nn.Parameter(torch.logspace(-1, 1, d))
+        self.b = nn.Parameter(torch.zeros(d))
+
+    def pos(self, rel_time):
+        return torch.cos(torch.log1p(rel_time.clamp(min=0)).unsqueeze(-1) * self.w + self.b)
+
+
+TIME_ENCODERS = {"sin": TimeEncoder, "func": LearnedTimeEncoder}
+
+
 class TableEncoder(nn.Module):
     """Stand-in for torch_frame's ResNet: input layer, residual blocks, LayerNorm-ReLU-Linear."""
 
@@ -947,7 +966,7 @@ class RelGT(nn.Module):
     def __init__(self, G, cutoffs, week_day, num_seeds, n_out, channels=128, local_layers=1, heads=4,
                  dropout=0.3, num_centroids=1024, conv_type="full", ablate="none", n_seed_feats=0,
                  path_token=False, rel_pe=False, attn_bias=False, action_edges=False, chain=False,
-                 max_hop=MAX_HOP, multi_seed=False, recency_days=None):
+                 max_hop=MAX_HOP, multi_seed=False, recency_days=None, time_emb="sin"):
         super().__init__()
         c = channels
         self.multi_seed = multi_seed  # several hop-0 tokens per example (--num-seeds > 1)
@@ -957,7 +976,7 @@ class RelGT(nn.Module):
                              if n_seed_feats else None)
         self.type_encoder = nn.Embedding(len(TABLES) + 1, c)
         self.hop_encoder = nn.Embedding(max_hop + 2, c)  # hops + 1: seed, ..., fallback
-        self.time_encoder = TimeEncoder(c)
+        self.time_encoder = TIME_ENCODERS[time_emb](c)
         self.pe_encoder = GNNPEEncoder(c, relational=rel_pe, n_rel=n_rel)
         self.path_encoder = nn.Embedding(N_PATHS + 2, c) if path_token else None
         self.attn_bias = AttentionBias(heads, n_rel, max_hop) if attn_bias and conv_type != "global" else None
@@ -1139,7 +1158,11 @@ def tokenize(G, groups, cutoffs, K, seed, budget="uniform", order="random", acti
     edges = tuple(np.concatenate(a) for a in (er, ei, ej, erel))
     out = np.concatenate(nodes), np.concatenate(hops), np.concatenate(paths), edges
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    np.savez(path, nodes=out[0], hops=out[1], paths=out[2], er=edges[0], ei=edges[1], ej=edges[2], erel=edges[3])
+    # Written to a temporary file and renamed, so a run sampling the same key at the same time never
+    # loads a half-written cache file.
+    tmp = path.with_name(f"{path.stem}.{os.getpid()}.tmp.npz")
+    np.savez(tmp, nodes=out[0], hops=out[1], paths=out[2], er=edges[0], ei=edges[1], ej=edges[2], erel=edges[3])
+    os.replace(tmp, path)
     print(f"sampled {n:,} examples x {K} tokens, {len(edges[0]):,} subgraph edges ({time.time() - t0:.0f}s)")
     return out
 
@@ -1188,6 +1211,9 @@ def main():
     ap.add_argument("--recency-days", type=float, default=7,
                     help="with --recency-attn: an action this many days older than the newest action token "
                          "starts at half the attention weight")
+    ap.add_argument("--time-emb", choices=list(TIME_ENCODERS), default="sin",
+                    help="token age encoding: sin = fixed sinusoids + linear (the paper), func = learned "
+                         "cos(w log(1 + days) + b) + linear")
     ap.add_argument("--channels", type=int, default=128, help="paper: 512")
     ap.add_argument("--num-layers", type=int, default=1, help="local transformer layers (paper: 1-8)")
     ap.add_argument("--num-heads", type=int, default=4)
@@ -1340,7 +1366,8 @@ def main():
                      action_edges=args.action_edges != "none", chain=args.graph_structure == "chain",
                      max_hop=args.max_hops + 1 if args.graph_structure == "chain" else MAX_HOP,
                      multi_seed=args.num_seeds > 1,
-                     recency_days=args.recency_days if args.recency_attn else None).to(device)
+                     recency_days=args.recency_days if args.recency_attn else None,
+                     time_emb=args.time_emb).to(device)
 
     print(f"model parameters: {sum(p.numel() for p in make_model().parameters()):,}")
     model, best_epoch, history = fit(make_model, S, train_ids, args, args.epochs, val_ids=val_ids)

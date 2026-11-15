@@ -65,7 +65,9 @@ are relgt's own (Graph, tokenize). Each example (eligible user, week) is its K t
 among them; a token is its row features, table, hop and time before the week, RowGNN passes
 relation-typed messages over those edges and reads out the seed token(s), which also hold the 60
 history features. Weeks, labels, --actions, --users, thresholds and output are the same as above.
---layers should reach the tokens: a message travels one hop per layer.
+--layers should reach the tokens: a message travels one hop per layer. The token time is relgt's
+TimeEncoder (fixed sinusoids + linear); --chain-time func uses relgt's LearnedTimeEncoder instead
+(learned cos(w log(1 + days) + b) + linear). Results go to outputs/<task>_chain[_ftime]/.
 
 --time-enc edge (user-repo graph): the days since the last and the first event of each user-repo
 edge (within the 90 days before the cutoff) go through relgt's sinusoidal PositionalEncoding and a
@@ -1082,7 +1084,8 @@ def token_stages(args, tables, feats, weeks, train_weeks, cohort, lags, test, la
           f"share of tokens within {args.layers} hops of a seed: {(hops <= args.layers).mean():.0%}")
 
     def make_model():
-        return RowGNN(relgt.RowEncoder(G, cutoffs, week_day, args.channels, 0.1), relgt.TimeEncoder(args.channels),
+        return RowGNN(relgt.RowEncoder(G, cutoffs, week_day, args.channels, 0.1),
+                      relgt.TIME_ENCODERS[args.chain_time](args.channels),
                       len(relgt.TABLES) + 1, args.max_hops + 3, relgt.N_ALL_REL, seed_x.shape[1], len(labels),
                       d=args.channels, layers=args.layers).to(device)
 
@@ -1189,6 +1192,9 @@ def main():
     g.add_argument("--num-neighbors", type=int, default=100, help="K tokens per example")
     g.add_argument("--layers", type=int, default=3, help="message passing rounds")
     g.add_argument("--channels", type=int, default=64)
+    g.add_argument("--chain-time", choices=["sin", "func"], default="sin",
+                   help="token age encoding: sin = relgt's fixed sinusoids + linear, func = learned "
+                        "cos(w log(1 + days) + b) + linear")
     args = ap.parse_args()
     chain, ego = args.graph_structure == "chain", args.graph_structure == "ego"
     het = args.graph_structure == "hetero"
@@ -1234,6 +1240,7 @@ def main():
     args.task = "all" if labels == list(EVENT_COLS) else "+".join(labels)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     default_name = ((args.task if args.users == "all" else f"{args.task}_{args.users}") + ("_chain" if chain else "")
+                    + ("_ftime" if chain and args.chain_time == "func" else "")
                     + ("_ego" if ego else "") + ("_uf" if ego and args.user_features else "")
                     + ({"func": "_ftime", "none": "_notime"}.get(args.ego_time, "") if ego else "")
                     + ("_het" if het else "") + ("_notime" if het and args.het_time == "none" else "")
@@ -1250,7 +1257,7 @@ def main():
         if args.holdout_week:
             HOLDOUT = pd.Timestamp(args.holdout_week)
             HOLDOUT_TUNE = HOLDOUT - WEEK
-            if HOLDOUT.dayofweek != 5 or HOLDOUT.hour != 16:
+            if HOLDOUT.day_of_week != 5 or HOLDOUT.hour != 16:
                 ap.error("--holdout-week must be a Saturday 16:00 UTC, like every week start")
             if not args.end:
                 args.end = str(HOLDOUT)  # weeks that end after the holdout week start are not built as weeks
@@ -1289,7 +1296,8 @@ def main():
         assert HOLDOUT not in train_weeks + val_weeks + final_weeks
         lag_short = max(HOLDOUT + WEEK - data_end[k] for k in (EVENT_COLS if full else NONPUSH))
         print(f"holdout week {str(HOLDOUT)[:10]}: {int(tables[HOLDOUT].eligible.sum()):,} eligible users, "
-              f"labels end {lag_short} before the full week, tune week {str(HOLDOUT_TUNE)[:10]}, "
+              + (f"fully labelled, tune week" if full else f"labels end {lag_short} before the full week, tune week")
+              + f" {str(HOLDOUT_TUNE)[:10]}, "
               f"last train week {str(train_weeks[-1])[:10]}")
     tables[base.TEST_START] = base.build_week(base.TEST_START, ev, own, lags, data_end, n,
                                               with_labels=False)
