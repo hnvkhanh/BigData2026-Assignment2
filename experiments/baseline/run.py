@@ -42,7 +42,7 @@ MIN_RECORDS = 3
 # 9/4-9/6), and pushes are (nearly) missing for several days in August-October. [start, end) UTC.
 GAPS = {
     "nonpush": [("2026-06-01", "2026-09-07")],
-    "push": [("2026-08-18", "2026-09-10"), ("2026-10-07", "2026-10-08"),
+    "push": [("2026-08-18", "2026-09-13"), ("2026-10-07", "2026-10-08"),
              ("2026-10-15", "2026-10-19"), ("2026-10-23", "2026-10-24")],
 }
 # Since 10/27 GH Archive's PushEvents are ~1% of their usual volume (cohort: ~2,500 pushes a day

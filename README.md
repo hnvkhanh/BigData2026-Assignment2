@@ -94,7 +94,7 @@ Daily cohort event counts show outages (listed in `GAPS` in `run.py`):
 
 - **Non-push, 2026-06-01 → 09-07:** issues, PRs, comments and reviews drop to ~5–20% of
   their usual level and end with a backfill burst (~1,400 events/day on 9/4–9/6).
-- **Push:** almost nothing 08-18 → 09-09; days missing on 10-07, 10-15 → 10-18 and 10-23.
+- **Push:** almost nothing 08-18 → 09-12 (≤ ~20% of the usual volume); days missing on 10-07, 10-15 → 10-18 and 10-23.
 - October is quieter than spring for every activity but steadily so; the test week is in this
   regime, so it is not treated as an outage.
 

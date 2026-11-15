@@ -32,13 +32,13 @@ from evaluate import EVENT_COLS  # noqa: E402
 # Same constants as experiments/baseline/run.py.
 TEST_START = pd.Timestamp("2026-11-21 16:00")      # 2026-11-22 00:00 Taiwan time
 SELECTION_TIME = pd.Timestamp("2026-11-04 12:00")  # test users: >= 3 records in the 90 days before
-DATA_START = pd.Timestamp("2025-12-01")  # placeholder; Data() resets it to the oldest event in the db
+DATA_START = pd.Timestamp("2025-12-01")  # placeholder; Data() resets it to the first hour of the data
 WEEK = pd.Timedelta(days=7)
 DAY = pd.Timedelta(days=1)
 MIN_RECORDS = 3
 GAPS = {
     "nonpush": [("2026-06-01", "2026-09-07")],
-    "push": [("2026-08-18", "2026-09-10"), ("2026-10-07", "2026-10-08"),
+    "push": [("2026-08-18", "2026-09-13"), ("2026-10-07", "2026-10-08"),
              ("2026-10-15", "2026-10-19"), ("2026-10-23", "2026-10-24")],
 }
 FEED_END = {"push": pd.Timestamp("2026-10-27")}  # GH Archive PushEvents ~1% of usual volume after
@@ -128,10 +128,14 @@ class Data:
             d["uid"] = to_cidx[d.uid.astype(np.int64).values]
             d = d[d.uid >= 0].assign(activity=k)
             parts.append(d)
-        ev = pd.concat(parts, ignore_index=True).sort_values("t", ignore_index=True)
-        # The span starts at the oldest event in the db, not at a fixed date.
+        ev = pd.concat(parts, ignore_index=True)
+        # The span starts at the first hour of the GH Archive files: the earliest time a row
+        # appears in the data. Older `created_at` values exist (e.g. issues from 2011 that got a
+        # comment in the window) but are not activity inside the data, so they are dropped,
+        # as in experiments/baseline/run.py.
         global DATA_START
-        DATA_START = ev.t.iloc[0].floor("D")
+        DATA_START = ev.seen.min().floor("D")
+        ev = ev[ev.t >= DATA_START].sort_values("t", ignore_index=True)
         ev["activity"] = pd.Categorical(ev.activity, categories=EVENT_COLS)
         ev["uid"] = ev.uid.astype(np.int32)
         ev["is_test"] = cohort.is_test.values[ev.uid.values]
