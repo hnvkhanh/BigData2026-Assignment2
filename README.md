@@ -409,6 +409,63 @@ user is almost never predicted to do anything except push (push F1 0.13, others 
 inside the seed spread. `--active-min-events 5` (quiet = fewer than 5 events in the window,
 3,918 quiet users; `all_ego_uf_seg5`, 4 seeds) gives 47.83 with user features, also no better.
 
+### Holdout week 11-07 (`--holdout`)
+
+```bash
+python experiments/gnn/run.py --holdout --user-features --seed 0   # -> outputs/all_ego_uf_ho/metrics.json
+bash script.sh   # all 5 configs below x seeds 0-2 on 2 GPUs, logs in outputs/logs/, prints the summary
+```
+
+The validation numbers above come from one week (10-17), which also sets early stopping and the
+thresholds. `--holdout` scores a week that nothing is tuned on:
+- training weeks: labels ending by 10-24;
+- tuning week 10-31: early stopping and the decision rule (share of predicted positives, per
+  segment with `--segment`);
+- holdout week 11-07 (4,670 eligible users; 1,460 quiet, 3,210 active), labelled up to the end of
+  the data (11-14 13:35 UTC, ~2 h short of the full week). It is scored with the official scorer
+  on the 5 non-push activities: push data ends 10-27, so neither 10-31 nor 11-07 has push labels;
+- the model trained up to 10-24 is scored directly (no final retrain, no `output.csv`).
+
+These are not comparable with the 6-activity scores above, nor with the missing-data holdout
+(tuned on 10-17, scored on 10-24 and 10-31, LightGBM).
+
+**Results** (3 seeds, runs `<name>_ho_s0-2`):
+
+| Model | Run | Holdout score, mean (min–max) | Tuning-week score | Best epoch |
+|---|---|---|---|---|
+| Ego GNN | `all_ego` | 36.53 (35.88–37.09) | 38.88 | 1, 1, 2 |
+| Ego GNN + user features | `all_ego_uf` | 38.80 (37.70–39.68) | 43.40 | 1, 1, 2 |
+| Ego GNN, segmented | `all_ego_seg` | 35.21 (34.49–35.77) | 38.97 | quiet 8 / 6 / 3, active 2 / 3 / 2 |
+| Ego GNN + user features, segmented | `all_ego_uf_seg` | 38.66 (38.50–38.81) | 43.31 | quiet 8 / 6 / 3, active 2 |
+| User–repo GNN | `user_repo` | **38.92** (38.09–39.80) | 43.17 | 11, 5, 12 |
+
+Mean holdout F1 per activity, and the mean F1 over the 5 activities per segment:
+
+| Activity | Ego | Ego + UF | Ego, seg | Ego + UF, seg | User–repo |
+|---|---|---|---|---|---|
+| open_pr | 0.346 | **0.377** | 0.329 | 0.370 | 0.371 |
+| open_issue | 0.417 | 0.424 | 0.410 | 0.415 | **0.441** |
+| issue_comment | 0.337 | 0.382 | 0.327 | **0.395** | 0.369 |
+| pr_review | 0.399 | 0.391 | 0.391 | 0.399 | **0.400** |
+| pr_review_comment | 0.317 | **0.363** | 0.293 | 0.346 | 0.360 |
+| quiet users (1,460) | 0.000 | 0.020 | 0.033 | 0.039 | – |
+| active users (3,210) | 0.374 | 0.400 | 0.360 | 0.396 | – |
+
+**Result: on the holdout week, the ego GNN with user features and the user–repo GNN are tied**
+(38.80 vs 38.92, well inside the seed spread of ~2 points). The 0.8-point lead of the ego model
+on 10-17 does not carry over.
+- User features are still the main gain for the ego model: +2.3 points, on every activity
+  except pr_review (open_pr +0.031, issue_comment +0.045, pr_review_comment +0.046).
+- Segmenting again does not help: −1.3 without user features, −0.1 with them. It gives the
+  quiet users slightly better F1 (0.039 vs 0.020) but costs more on the active ones. Its only
+  benefit is a smaller seed spread (38.50–38.81 against 37.70–39.68).
+- Quiet users remain unpredictable: every model's F1 on them is at most 0.04.
+- The ego models still stop after 1–2 epochs (the active segment model too); the user–repo GNN
+  trains for 5–12.
+- The tuning-week score is 4–5 points above the holdout for every model with user features, so
+  part of what is tuned on 10-31 does not transfer to the next week.
+- Only one holdout week, 3 seeds.
+
 ## Experiment: GNN (user–repo graph), all labels vs push only (`experiments/gnn/run.py --graph-structure user-repo`)
 
 This was the default before the ego model. Every command in this section needs

@@ -83,6 +83,7 @@ import numpy as np
 import pandas as pd
 import torch  # after numpy: importing torch first trips a duplicate-OpenMP error on this machine
 from torch import nn
+from tqdm import tqdm
 
 HERE = Path(__file__).resolve().parent
 _spec = importlib.util.spec_from_file_location("baseline_run", HERE.parent / "baseline" / "run.py")
@@ -93,6 +94,12 @@ EVENT_COLS, WEEK, DAY = base.EVENT_COLS, base.WEEK, base.DAY
 EDGE_TYPES = EVENT_COLS + ["received"]
 EDGE_WINDOWS = [7, 30, 90]
 OUT_DIR = HERE / "outputs"
+NONPUSH = [k for k in EVENT_COLS if k != "push"]
+# --holdout: train on weeks up to 10-24, tune on 10-31, score HOLDOUT (labels to the end of the data,
+# ~2 h short of the full week; push has no data after 10-27, so only the 5 non-push activities count).
+HOLDOUT_TUNE = pd.Timestamp("2026-10-31 16:00")
+HOLDOUT = pd.Timestamp("2026-11-07 16:00")
+PROGRESS = {"disable": False}  # --no-progress turns the tqdm bars off
 
 
 def windowed_tables(tables, ev, own, lags, data_end, n, days):
@@ -233,8 +240,10 @@ def fit(graphs, weeks, n_out, epochs, seed, device, val_weeks=None, patience=5, 
                        time_dim=time_dim).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
     best, best_state, best_epoch, bad = np.inf, None, epochs, 0
-    for epoch in range(1, epochs + 1):
+    bar = tqdm(range(1, epochs + 1), desc="epochs", unit="ep", dynamic_ncols=True, **PROGRESS)
+    for epoch in bar:
         model.train()
+        losses = []
         for w in rng.permutation(weeks):
             g = graphs[w]
             opt.zero_grad()
@@ -242,6 +251,8 @@ def fit(graphs, weeks, n_out, epochs, seed, device, val_weeks=None, patience=5, 
             loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             opt.step()
+            losses.append(loss.item())
+        bar.set_postfix(train=f"{np.mean(losses):.4f}")
         if val_weeks is None:
             continue
         model.eval()
@@ -249,14 +260,16 @@ def fit(graphs, weeks, n_out, epochs, seed, device, val_weeks=None, patience=5, 
             # weeks whose labels for this task are not known yet (e.g. push of the last week) are skipped
             vl = np.mean([masked_bce(model(graphs[w]), graphs[w]["y"], graphs[w]["mask"]).item()
                           for w in val_weeks if not torch.isnan(graphs[w]["y"]).all()])
-        print(f"  epoch {epoch:2d}  val loss {vl:.4f}")
+        tqdm.write(f"  epoch {epoch:2d}  val loss {vl:.4f}")
         if vl < best - 1e-4:
             best, best_epoch, bad = vl, epoch, 0
             best_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
         else:
             bad += 1
-            if bad >= patience:
-                break
+        bar.set_postfix(train=f"{np.mean(losses):.4f}", val=f"{vl:.4f}", best_ep=best_epoch)
+        if bad >= patience:
+            break
+    bar.close()
     if best_state is not None:
         model.load_state_dict(best_state)
     return model, best_epoch
@@ -279,18 +292,28 @@ def train_batched(make_model, batch, ids, fit_weeks, epochs, val_weeks, lr, seed
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
     best, best_state, best_epoch, bad = np.inf, None, epochs, 0
     examples = np.concatenate([ids[w] for w in fit_weeks])
+    n_steps = -(-len(examples) // batch_size)
+    if max_steps:
+        n_steps = min(n_steps, max_steps)
     for epoch in range(1, epochs + 1):
         model.train()
         perm = rng.permutation(examples)
-        for step, i in enumerate(range(0, len(perm), batch_size)):
-            if max_steps and step >= max_steps:
-                break
+        bar = tqdm(range(n_steps), desc=f"epoch {epoch}/{epochs}", unit="batch", dynamic_ncols=True,
+                   leave=False, **PROGRESS)
+        run_loss = None
+        for step in bar:
+            i = step * batch_size
             inputs, yb = batch(perm[i:i + batch_size])
             opt.zero_grad()
             loss = masked_bce(model(*inputs), yb, torch.ones(len(yb), dtype=torch.bool, device=yb.device))
             loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             opt.step()
+            if step % 20 == 0:  # .item() syncs the GPU; do it only now and then
+                lv = loss.item()
+                run_loss = lv if run_loss is None else 0.9 * run_loss + 0.1 * lv
+                bar.set_postfix(loss=f"{run_loss:.4f}")
+        bar.close()
         if val_weeks is None:
             continue
         model.eval()
@@ -303,7 +326,7 @@ def train_batched(make_model, batch, ids, fit_weeks, epochs, val_weeks, lr, seed
                 if not torch.isnan(yw).all():
                     vl.append(masked_bce(lw, yw, torch.ones(len(yw), dtype=torch.bool, device=yw.device)).item())
         vl = float(np.mean(vl))
-        print(f"  epoch {epoch:2d}  val loss {vl:.4f}")
+        tqdm.write(f"  epoch {epoch:2d}  train loss {run_loss:.4f}  val loss {vl:.4f}")
         if vl < best - 1e-4:
             best, best_epoch, bad = vl, epoch, 0
             best_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
@@ -810,6 +833,11 @@ def main():
                     "(default: ego 256, chain 512)")
     ap.add_argument("--max-steps-per-epoch", type=int, default=0, help="ego / chain; 0 = full epoch")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--holdout", action="store_true",
+                    help="train on weeks up to 10-24, tune (early stopping, decision rule) on 10-31 and "
+                         "score the held-out week 11-07 on the 5 non-push activities; no final model / "
+                         "output.csv. Overrides --val-start / --val-end; run name gets _ho")
+    ap.add_argument("--no-progress", action="store_true", help="turn off the tqdm progress bars")
     ap.add_argument("--time-enc", choices=["none", "edge"], default="none",
                     help="user-repo graph: edge = add a learned sinusoidal encoding of the days since the "
                          "last and the first event of each edge to its features")
@@ -893,7 +921,13 @@ def main():
                     + (("_seg" + (str(args.active_min_events) if args.active_min_events != 1 else ""))
                        if ego and args.segment != "none" else "")
                     + (f"_lb{args.ego_lookback:g}" if ego and not hist and args.ego_lookback != 14 else "")
-                    + ("_time" if time_dim else "") + (f"_h{hist}" if hist else ""))
+                    + ("_time" if time_dim else "") + (f"_h{hist}" if hist else "")
+                    + ("_ho" if args.holdout else ""))
+    PROGRESS["disable"] = args.no_progress
+    if args.holdout:
+        if args.val_start or args.val_end:
+            ap.error("--holdout sets the validation week itself (10-31); drop --val-start / --val-end")
+        args.val_start, args.val_end = str(HOLDOUT_TUNE), str(HOLDOUT_TUNE + WEEK)
     out_dir = OUT_DIR / (args.name or default_name)
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -910,6 +944,19 @@ def main():
           f"validation {[str(w)[:10] for w in val_weeks]}")
 
     tables = {w: base.build_week(w, ev, own, lags, data_end, n) for w in weeks}
+    if args.holdout:
+        assert val_weeks == [HOLDOUT_TUNE] and train_weeks[-1] + WEEK <= HOLDOUT_TUNE, (train_weeks, val_weeks)
+        assert HOLDOUT not in weeks and HOLDOUT + WEEK > min(data_end[k] for k in NONPUSH), \
+            "the holdout week is now fully labelled: move HOLDOUT_TUNE / HOLDOUT forward"
+        # Labels to the end of the data (only data_end of the labels is lifted; features use the lags).
+        tables[HOLDOUT] = base.build_week(HOLDOUT, ev, own, lags, {k: pd.Timestamp.max for k in data_end}, n)
+        tables[HOLDOUT]["y_push"] = np.nan  # no push data after 10-27
+        weeks = weeks + [HOLDOUT]  # built (graphs / tokens) like any week, but in none of the splits
+        assert HOLDOUT not in train_weeks + val_weeks + final_weeks
+        lag_short = max(HOLDOUT + WEEK - data_end[k] for k in NONPUSH)
+        print(f"holdout week {str(HOLDOUT)[:10]}: {int(tables[HOLDOUT].eligible.sum()):,} eligible users, "
+              f"labels end {lag_short} before the full week, tune week {str(HOLDOUT_TUNE)[:10]}, "
+              f"last train week {str(train_weeks[-1])[:10]}")
     tables[base.TEST_START] = base.build_week(base.TEST_START, ev, own, lags, data_end, n,
                                               with_labels=False)
     if hist:
@@ -993,6 +1040,10 @@ def main():
             if segment_of is not None:
                 ss.append(segment_of(w)[m])
         y, p = np.concatenate(ys), np.concatenate(ps)
+        if not len(y):  # --holdout: push has no labels in the tune week; it is not scored either
+            metrics["per_label"][k] = {"threshold": None, "val_f1": None, "val_pred_rate": None}
+            print(f"{k:18s} no labels in the validation weeks: not tuned, not scored")
+            continue
         thr, f1 = base.best_threshold(y, p)
         rates[k] = float((p >= thr).mean())
         metrics["per_label"][k] = {"threshold": thr, "val_f1": f1, "val_pred_rate": rates[k]}
@@ -1003,45 +1054,68 @@ def main():
             metrics["per_label"][k]["val_pred_rate_by_segment"] = seg_rates[k]
         print(f"{k:18s} val F1 {f1:.4f}  threshold {thr:.3f}  predicted {rates[k]:.3f}  "
               f"positives {y.mean():.3f}")
+    # Labels scored per week: all of them, or with --holdout the 5 non-push ones (push has no labels).
+    scored = [k for k in labels if k in rates]
+    if args.holdout and not scored:
+        ap.error("--holdout scores the non-push activities: add at least one to --actions")
 
-    # Per-week scores on weeks where the labels this model predicts are all known.
-    for w in val_weeks:
+    def decide(q, seg, k):
+        """Decision rule carried to a new week: the validation share of predicted positives (one
+        share per segment with --segment, since each segment model has its own probability scale)."""
+        pred = np.zeros(len(q), bool)
+        parts = [(seg == s, seg_rates[k].get(name, rates[k])) for s, name in enumerate(SEGMENTS)] if split \
+            else [(np.ones(len(q), bool), rates[k])]
+        for ms, share in parts:
+            if ms.any() and share > 0:
+                pred[ms] = q[ms] >= np.quantile(q[ms], 1 - share)
+        return pred
+
+    def week_result(w, pred, tag):
+        """F1 per scored label, official score over them (6-activity runs) and per-segment F1 of week
+        w; pred = {label: bool array over the eligible rows of the week}."""
         t = tables[w]
         m = t.eligible.values
-        if t.loc[m, [f"y_{k}" for k in labels]].isna().any().any():
-            continue
         f1 = {}
-        for j, k in enumerate(labels):
+        for k in scored:
             y = t[f"y_{k}"].values[m]
-            pred = val_p[w][m, j] >= metrics["per_label"][k]["threshold"]
-            f1[k] = float(2 * (pred & (y == 1)).sum() / (pred.sum() + y.sum()))
+            f1[k] = float(2 * (pred[k] & (y == 1)).sum() / max(pred[k].sum() + y.sum(), 1))
         r = {"week": str(w), "users": int(m.sum()), "f1": f1}
         if segment_of is not None:
-            sw = segment_of(w)
+            sw = segment_of(w)[m]
             r["per_segment"] = {}
             for s, name in enumerate(SEGMENTS):
-                ms = m & (sw == s)
+                ms = sw == s
                 d = {"users": int(ms.sum()), "f1": {}, "pos_rate": {}}
-                for j, k in enumerate(labels):
-                    y = t[f"y_{k}"].values[ms] == 1
-                    pred = val_p[w][ms, j] >= metrics["per_label"][k]["threshold"]
-                    d["f1"][k] = float(2 * (pred & y).sum() / max(pred.sum() + y.sum(), 1))
+                for k in scored:
+                    y = t[f"y_{k}"].values[m][ms] == 1
+                    pk = pred[k][ms]
+                    d["f1"][k] = float(2 * (pk & y).sum() / max(pk.sum() + y.sum(), 1))
                     d["pos_rate"][k] = float(y.mean()) if len(y) else float("nan")
                 d["f1_avg"] = float(np.mean(list(d["f1"].values())))
                 r["per_segment"][name] = d
-                print(f"  {str(w)[:10]} {name:6s} ({d['users']:,} users): "
+                print(f"  {tag} {str(w)[:10]} {name:6s} ({d['users']:,} users): "
                       + "  ".join(f"{k} {v:.3f}" for k, v in d["f1"].items()) + f"  avg {d['f1_avg']:.4f}")
         if args.task == "all":
             gids = cohort.github_user_id.values[t.cidx.values[m]]
-            truth = base.to_output(gids, {k: t[f"y_{k}"].values[m] for k in EVENT_COLS})
-            pred = base.to_output(gids, {k: val_p[w][m, j] >= metrics["per_label"][k]["threshold"]
-                                         for j, k in enumerate(EVENT_COLS)})
-            r.update(base.scores(pred, truth))
-        metrics["validation"].append(r)
-        print(f"validation {str(w)[:10]}: " + "  ".join(f"{k} F1 {v:.4f}" for k, v in f1.items())
-              + (f"  score {100 * r['score']:.2f}" if "score" in r else ""))
+            zero = np.zeros(int(m.sum()), bool)
+            truth = base.to_output(gids, {k: np.nan_to_num(t[f"y_{k}"].values[m]) for k in EVENT_COLS})
+            out = base.to_output(gids, {k: pred.get(k, zero) for k in EVENT_COLS})
+            r.update(base.scores(out, truth, events=scored))
+        print(f"{tag} {str(w)[:10]}: " + "  ".join(f"{k} F1 {v:.4f}" for k, v in f1.items())
+              + (f"  score {100 * r['score']:.2f}" if "score" in r else "")
+              + (f" ({len(scored)} activities)" if len(scored) != len(EVENT_COLS) and "score" in r else ""))
+        return r
+
+    # Per-week scores on weeks where the labels scored are all known.
+    for w in val_weeks:
+        m = tables[w].eligible.values
+        if tables[w].loc[m, [f"y_{k}" for k in scored]].isna().any().any():
+            continue
+        metrics["validation"].append(week_result(
+            w, {k: val_p[w][m, labels.index(k)] >= metrics["per_label"][k]["threshold"] for k in scored},
+            "validation"))
     metrics["val_f1_mean"] = {k: float(np.mean([r["f1"][k] for r in metrics["validation"]]))
-                              for k in labels}
+                              for k in scored}
     for k, v in metrics["val_f1_mean"].items():
         print(f"mean validation {k} F1 {v:.4f}")
     if args.task == "all":
@@ -1051,46 +1125,55 @@ def main():
         metrics["per_segment"] = {
             name: {"users": float(np.mean([r["per_segment"][name]["users"] for r in metrics["validation"]])),
                    "f1": {k: float(np.mean([r["per_segment"][name]["f1"][k] for r in metrics["validation"]]))
-                          for k in labels}}
+                          for k in scored}}
             for name in SEGMENTS}
         for name, d in metrics["per_segment"].items():
             d["f1_avg"] = float(np.mean(list(d["f1"].values())))
             print(f"mean validation F1, {name} segment: {d['f1_avg']:.4f}")
 
-    # Final model: all labelled weeks for the early-stopped number of epochs; the validation
-    # share of predicted positives is reused as the decision rule (as in the baseline).
-    final, _ = train(final_weeks, best_epoch)
-    p = predict_week(final, base.TEST_START)
-    tt = tables[base.TEST_START]
-    cidx = pd.Series(np.arange(len(tt)), index=cohort.github_user_id.values[tt.cidx.values]).loc[test.UserID].values
-    out = pd.DataFrame({"UserID": test.UserID.values})
-    test_seg = segment_of(base.TEST_START)[cidx] if segment_of is not None else None
-    if test_seg is not None:
-        print("test users per segment: " + ", ".join(f"{name} {(test_seg == s).sum()}"
-                                                      for s, name in enumerate(SEGMENTS)))
-    for j, k in enumerate(labels):
-        q = p[cidx, j]
-        if split:  # each final model has its own probability scale: one quantile per segment
-            pred = np.zeros(len(q), bool)
-            for s, name in enumerate(SEGMENTS):
-                ms = test_seg == s
-                if ms.any():
-                    pred[ms] = q[ms] >= np.quantile(q[ms], 1 - seg_rates[k].get(name, rates[k]))
-            out[k] = pred.astype(int)
-        else:
-            out[k] = (q >= np.quantile(q, 1 - rates[k])).astype(int)
-    name = "output.csv" if args.task == "all" else f"{args.task}.csv"
-    out.to_csv(out_dir / name, index=False)
-    (out_dir / "metrics.json").write_text(json.dumps(metrics, indent=2, default=str))
-    print(f"wrote {out_dir / name}")
+    if args.holdout:
+        # The model trained up to 10-24 (no retrain), the tune week's share of predicted positives.
+        m = tables[HOLDOUT].eligible.values
+        q = predict_week(model, HOLDOUT)[m]
+        seg = segment_of(HOLDOUT)[m] if segment_of is not None else None
+        metrics["holdout_protocol"] = {"train_last": str(train_weeks[-1]), "tune": str(HOLDOUT_TUNE),
+                                       "holdout": str(HOLDOUT), "scored": scored,
+                                       "label_end": str(min(data_end[k] for k in scored))}
+        metrics["holdout"] = week_result(HOLDOUT, {k: decide(q[:, labels.index(k)], seg, k) for k in scored},
+                                         "HOLDOUT")
+        (out_dir / "metrics.json").write_text(json.dumps(metrics, indent=2, default=str))
+        print(f"wrote {out_dir / 'metrics.json'} (--holdout: no final model, no output csv)")
+    else:
+        # Final model: all labelled weeks for the early-stopped number of epochs; the validation
+        # share of predicted positives is reused as the decision rule (as in the baseline).
+        final, _ = train(final_weeks, best_epoch)
+        p = predict_week(final, base.TEST_START)
+        tt = tables[base.TEST_START]
+        cidx = pd.Series(np.arange(len(tt)), index=cohort.github_user_id.values[tt.cidx.values]).loc[test.UserID].values
+        out = pd.DataFrame({"UserID": test.UserID.values})
+        test_seg = segment_of(base.TEST_START)[cidx] if segment_of is not None else None
+        if test_seg is not None:
+            print("test users per segment: " + ", ".join(f"{name} {(test_seg == s).sum()}"
+                                                          for s, name in enumerate(SEGMENTS)))
+        for j, k in enumerate(labels):
+            out[k] = decide(p[cidx, j], test_seg, k).astype(int)
+        name = "output.csv" if args.task == "all" else f"{args.task}.csv"
+        out.to_csv(out_dir / name, index=False)
+        (out_dir / "metrics.json").write_text(json.dumps(metrics, indent=2, default=str))
+        print(f"wrote {out_dir / name}")
 
     print(f"\nF1 per action (run {out_dir.name}, validation weeks):")
     print(f"  {'action':18s} {'pooled F1':>10s} {'mean weekly F1':>15s}")
-    for k in labels:
+    for k in scored:
         weekly = metrics["val_f1_mean"].get(k, float("nan"))
         print(f"  {k:18s} {metrics['per_label'][k]['val_f1']:10.4f} {weekly:15.4f}")
-    print(f"  {'average':18s} {np.mean([metrics['per_label'][k]['val_f1'] for k in labels]):10.4f} "
-          f"{np.mean([metrics['val_f1_mean'][k] for k in labels]):15.4f}")
+    print(f"  {'average':18s} {np.mean([metrics['per_label'][k]['val_f1'] for k in scored]):10.4f} "
+          f"{np.mean([metrics['val_f1_mean'][k] for k in scored]):15.4f}")
+    if args.holdout:
+        h = metrics["holdout"]
+        print(f"\nHOLDOUT {str(HOLDOUT)[:10]} ({h['users']:,} users, {len(scored)} activities): "
+              + (f"score {100 * h['score']:.2f}  " if "score" in h else "")
+              + "  ".join(f"{k} {v:.4f}" for k, v in h["f1"].items()))
 
 
 if __name__ == "__main__":
