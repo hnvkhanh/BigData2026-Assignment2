@@ -466,6 +466,23 @@ on 10-17 does not carry over.
   part of what is tuned on 10-31 does not transfer to the next week.
 - Only one holdout week, 3 seeds.
 
+### Holdout week 09-27 → 10-04 with push (`--holdout-week`)
+
+Week 11-07 cannot score push (GH Archive has no PushEvents after 10-26). The week 09-27 → 10-04
+(Taiwan time; 09-26 16:00 UTC) has labels for all 6 activities, so `--holdout-week` runs the same
+protocol there and scores the 6-activity official score:
+- training weeks: labels ending by 09-19;
+- tuning week 09-19 → 09-26 (early stopping and the share of predicted positives);
+- holdout week 09-26 16:00 UTC, no retrain, no `output.csv`.
+
+```bash
+python experiments/gnn/run.py --holdout --holdout-week "2026-09-26 16:00" --user-features   # -> outputs/all_ego_uf_ho0926/
+bash script_ho0927.sh   # het, het_notime, all_ego_uf, user_repo x seeds 0-2 -> outputs/<cfg>_ho0926_s*
+```
+
+Not comparable with the 11-07 holdout: a different week, push included, and the non-push activities
+were then at ~10-30% of their usual volume. **Results**: TODO.
+
 ## Experiment: GNN (user–repo graph), all labels vs push only (`experiments/gnn/run.py --graph-structure user-repo`)
 
 This was the default before the ego model. Every command in this section needs

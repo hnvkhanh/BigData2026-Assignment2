@@ -1102,6 +1102,7 @@ def token_stages(args, tables, feats, weeks, train_weeks, cohort, lags, test, la
 
 
 def main():
+    global HOLDOUT, HOLDOUT_TUNE
     ap = argparse.ArgumentParser()
     ap.add_argument("--actions", nargs="+", choices=EVENT_COLS, default=None, metavar="ACTION",
                     help=f"activities to train and predict, one shared model (default: all of "
@@ -1128,6 +1129,10 @@ def main():
                     help="train on weeks up to 10-24, tune (early stopping, decision rule) on 10-31 and "
                          "score the held-out week 11-07 on the 5 non-push activities; no final model / "
                          "output.csv. Overrides --val-start / --val-end; run name gets _ho")
+    ap.add_argument("--holdout-week", default=None, metavar="UTC",
+                    help="with --holdout: score this week instead of 11-07 (UTC start, Saturday 16:00, e.g. "
+                         "'2026-09-26 16:00'); the tune week is the week before. A week that is fully "
+                         "labelled (push included) is scored on all the activities; run name gets _ho<MMDD>")
     ap.add_argument("--no-progress", action="store_true", help="turn off the tqdm progress bars")
     ap.add_argument("--time-enc", choices=["none", "edge"], default="none",
                     help="user-repo graph: edge = add a learned sinusoidal encoding of the days since the "
@@ -1236,11 +1241,22 @@ def main():
                        if ego and args.segment != "none" else "")
                     + (f"_lb{args.ego_lookback:g}" if ego and not hist and args.ego_lookback != 14 else "")
                     + ("_time" if time_dim else "") + (f"_h{hist}" if hist else "")
-                    + ("_ho" if args.holdout else ""))
+                    + (("_ho" + (args.holdout_week[5:10].replace("-", "") if args.holdout_week else ""))
+                       if args.holdout else ""))
     PROGRESS["disable"] = args.no_progress
+    if args.holdout_week and not args.holdout:
+        ap.error("--holdout-week needs --holdout")
     if args.holdout:
+        if args.holdout_week:
+            HOLDOUT = pd.Timestamp(args.holdout_week)
+            HOLDOUT_TUNE = HOLDOUT - WEEK
+            if HOLDOUT.dayofweek != 5 or HOLDOUT.hour != 16:
+                ap.error("--holdout-week must be a Saturday 16:00 UTC, like every week start")
+            if not args.end:
+                args.end = str(HOLDOUT)  # weeks that end after the holdout week start are not built as weeks
         if args.val_start or args.val_end:
-            ap.error("--holdout sets the validation week itself (10-31); drop --val-start / --val-end")
+            ap.error("--holdout sets the validation week itself (the week before the holdout); "
+                     "drop --val-start / --val-end")
         args.val_start, args.val_end = str(HOLDOUT_TUNE), str(HOLDOUT_TUNE + WEEK)
     out_dir = OUT_DIR / (args.name or default_name)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -1260,14 +1276,18 @@ def main():
     tables = {w: base.build_week(w, ev, own, lags, data_end, n) for w in weeks}
     if args.holdout:
         assert val_weeks == [HOLDOUT_TUNE] and train_weeks[-1] + WEEK <= HOLDOUT_TUNE, (train_weeks, val_weeks)
-        assert HOLDOUT not in weeks and HOLDOUT + WEEK > min(data_end[k] for k in NONPUSH), \
+        full = HOLDOUT + WEEK <= min(data_end.values())  # every activity is labelled for the whole week
+        assert HOLDOUT not in weeks and (args.holdout_week or not full), \
             "the holdout week is now fully labelled: move HOLDOUT_TUNE / HOLDOUT forward"
-        # Labels to the end of the data (only data_end of the labels is lifted; features use the lags).
-        tables[HOLDOUT] = base.build_week(HOLDOUT, ev, own, lags, {k: pd.Timestamp.max for k in data_end}, n)
-        tables[HOLDOUT]["y_push"] = np.nan  # no push data after 10-27
+        if full:
+            tables[HOLDOUT] = base.build_week(HOLDOUT, ev, own, lags, data_end, n)
+        else:
+            # Labels to the end of the data (only data_end of the labels is lifted; features use the lags).
+            tables[HOLDOUT] = base.build_week(HOLDOUT, ev, own, lags, {k: pd.Timestamp.max for k in data_end}, n)
+            tables[HOLDOUT]["y_push"] = np.nan  # no push data after 10-27
         weeks = weeks + [HOLDOUT]  # built (graphs / tokens) like any week, but in none of the splits
         assert HOLDOUT not in train_weeks + val_weeks + final_weeks
-        lag_short = max(HOLDOUT + WEEK - data_end[k] for k in NONPUSH)
+        lag_short = max(HOLDOUT + WEEK - data_end[k] for k in (EVENT_COLS if full else NONPUSH))
         print(f"holdout week {str(HOLDOUT)[:10]}: {int(tables[HOLDOUT].eligible.sum()):,} eligible users, "
               f"labels end {lag_short} before the full week, tune week {str(HOLDOUT_TUNE)[:10]}, "
               f"last train week {str(train_weeks[-1])[:10]}")
