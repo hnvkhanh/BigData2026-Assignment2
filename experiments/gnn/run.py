@@ -1,7 +1,32 @@
-"""Heterogeneous GNN over the relational data: cohort users <-> repositories.
+"""GNNs over the relational data, on the weeks, lags, eligibility, split and thresholds of the baseline.
 
-Graph of one sample week s (built only from rows visible before the per-table cutoff s - lag,
-exactly like the LightGBM baseline):
+--graph-structure ego (default) is the relation-aware ego-graph GNN of old_experiments/relgt_inspired
+(gnn_model.py), ported to the current protocol. Each example (eligible user, week) is a star graph:
+  * a learned user node (with --user-features, plus an MLP of the baseline's 60 history features);
+  * 48 tokens from the last --ego-lookback days (14) before each table's cutoff s - lag: the 4 latest
+    objects of each of the 6 activities (the PR / issue acted on; for a push, its repository; hop 1)
+    and the 24 latest repositories of any activity (hop 2, relation "member");
+  * a token is its entity id (learned embedding), node type, relation, hop, 4 counts (events, active
+    days, events of the entity / repo by all cohort users, users per relation) and a sinusoidal
+    encoding of its log age; the six are concatenated and mixed by an MLP.
+Message passing (--ego-layers rounds): token -> user with one weight per relation, user -> token, and
+push repository <-> member token of the same repo, mean-aggregated and added to a self transform. The
+head reads the user node and the mean of all nodes. Mini-batches, AdamW lr 1e-3, early stopping.
+Results go to outputs/<task>_ego[_uf][_seg]/.
+
+--segment activity (ego) trains two models: one on the quiet examples (no ego token, i.e. no visible
+activity in the last --ego-lookback days before the cutoffs) and one on the active ones. Each is
+early-stopped on its own segment's validation loss and retrained for its own best epoch. The quiet
+model always gets the user features (its tokens are all padding); the active one follows
+--user-features. Thresholds are tuned on the pooled predictions, as for one model; on the test week
+the validation share of predicted positives is reused per segment. Every ego run also reports the
+F1 per segment on validation, so single and split models can be compared segment by segment.
+--active-min-events N (default 1) makes an example active only with >= N visible activity rows (all 6
+activities) in that window; 5 reproduces the selection of the old experiment.
+
+--graph-structure user-repo is the heterogeneous GraphSAGE over cohort users <-> repositories
+(HeteroSAGE, the default before; experiments/gnn_review builds on it). Graph of one sample week s
+(built only from rows visible before the per-table cutoff s - lag, exactly like the LightGBM baseline):
   * user nodes: the 9,000 cohort users, with the baseline's 60 history features;
   * repository nodes: every repo touched in the 90 days before the cutoff, with its activity
     volume per edge type and whether it belongs to an organisation;
@@ -24,12 +49,32 @@ relation-typed messages over those edges and reads out the seed token(s), which 
 history features. Weeks, labels, --actions, --users, thresholds and output are the same as above.
 --layers should reach the tokens: a message travels one hop per layer.
 
+--time-enc edge (user-repo graph): the days since the last and the first event of each user-repo
+edge (within the 90 days before the cutoff) go through relgt's sinusoidal PositionalEncoding and a
+linear layer shared by the edge types (--time-dim each), and are appended to the edge features of
+every message. Without it time is only seen through the 7 / 30 / 90-day counts and the linear
+days-since-last / 90.
+
+--history-days N: the model only sees rows of the last N days before each table's cutoff, in every
+week (training, validation, final fit and test). The user features are recomputed from those rows
+(the 30d / 90d / all-time counts, then copies of the shorter ones, are dropped; open PRs / issues
+count only those opened in the window), the user-repo edges and repo features cover N days
+(edge counts over 7 days and N days), with --graph-structure chain it sets --lookback-days N and with
+ego --ego-lookback N.
+Eligibility and labels are unchanged, so the run is scored on the same users as the others.
+
 Run from the repo root:
-    python experiments/gnn/run.py
-    python experiments/gnn/run.py --actions push
+    python experiments/gnn/run.py                       # ego, all 6 activities -> outputs/all_ego/
+    python experiments/gnn/run.py --user-features       # -> outputs/all_ego_uf/
+    python experiments/gnn/run.py --user-features --segment activity   # -> outputs/all_ego_uf_seg/
+    python experiments/gnn/run.py --graph-structure user-repo
+    python experiments/gnn/run.py --graph-structure user-repo --history-days 14
+    python experiments/gnn/run.py --graph-structure user-repo --time-enc edge
+    python experiments/gnn/run.py --graph-structure user-repo --actions push
     python experiments/gnn/run.py --graph-structure chain --chain-seed latest --num-seeds 16 --exclude-push
 """
 import argparse
+import functools
 import importlib.util
 import json
 from pathlib import Path
@@ -50,41 +95,68 @@ EDGE_WINDOWS = [7, 30, 90]
 OUT_DIR = HERE / "outputs"
 
 
-def week_graph(ev, s, lags, repo_is_org, keep):
+def windowed_tables(tables, ev, own, lags, data_end, n, days):
+    """--history-days: recompute the user features of every week from rows of the last `days`
+    days before each table's cutoff only. Eligibility, labels, cidx and week are kept from the full
+    tables; count features over longer windows (30d / 90d / all), now copies of the shorter ones,
+    are dropped."""
+    out = {}
+    for s, t in tables.items():
+        ev_w = {k: e[e.t.values >= np.datetime64(s - lags[k] - days * DAY)] for k, e in ev.items()}
+        start = np.datetime64(s - lags["open_pr"] - days * DAY)
+        own_w = {k: d[d.avail.values >= start] for k, d in own.items()}  # PRs / issues opened in the window
+        f = base.build_week(s, ev_w, own_w, lags, data_end, n, with_labels=False)
+        feats = [c for c in f.columns if c not in {"eligible", "cidx", "week"}
+                 and not any(c.endswith(f"_cnt_{w}") for w in ["30d", "90d", "all"])]
+        t = t.drop(columns=[c for c in t.columns if c not in {"eligible", "cidx", "week"}
+                            and not c.startswith("y_")])
+        out[s] = pd.concat([f[feats], t], axis=1)
+    return out
+
+
+def week_graph(ev, s, lags, repo_is_org, keep, times=False, window=90):
     """User-repo edges of every type and the repo node features, from rows before each cutoff.
 
     Only users with keep[cohort index] are nodes; their ids are renumbered 0..keep.sum()-1.
+    Edges are the rows of the last `window` days; they count events in the EDGE_WINDOWS shorter
+    than it and in the whole window.
+    With times, also returns per edge type the days since the last and the first event of the
+    pair in the window, (n_edges, 2), for --time-enc edge.
     """
     new_id = np.cumsum(keep) - 1
+    windows = [w for w in EDGE_WINDOWS if w < window] + [window]
     raw = {}
     for k in EDGE_TYPES:
         c = s - lags[k]
         e = ev[k]
-        m = ((e.avail.values < np.datetime64(c)) & (e.t.values >= np.datetime64(c - 90 * DAY))
+        m = ((e.avail.values < np.datetime64(c)) & (e.t.values >= np.datetime64(c - window * DAY))
              & ~np.isnan(e.repo.values))
         m &= keep[e.uid.values.clip(0)] & (e.uid.values >= 0)
         u, r = new_id[e.uid.values[m]], e.repo.values[m].astype(np.int64)
         age = (np.datetime64(c) - e.t.values[m]) / np.timedelta64(1, "D")
         pair, inv = np.unique(u * len(repo_is_org) + r, return_inverse=True)
-        cnt = np.stack([np.bincount(inv, weights=age < w, minlength=len(pair)) for w in EDGE_WINDOWS], 1)
-        last = pd.Series(age).groupby(inv).min().values
-        raw[k] = (pair // len(repo_is_org), pair % len(repo_is_org), cnt, last)
+        cnt = np.stack([np.bincount(inv, weights=age < w, minlength=len(pair)) for w in windows], 1)
+        by_pair = pd.Series(age).groupby(inv)
+        last, first = by_pair.min().values, by_pair.max().values
+        raw[k] = (pair // len(repo_is_org), pair % len(repo_is_org), cnt, last, first)
 
     repos = np.unique(np.concatenate([v[1] for v in raw.values()]))
     local = pd.Series(np.arange(len(repos)), index=repos)
     xr = [repo_is_org[repos].astype(np.float32)[:, None]]
-    edges = []
+    edges, ages = [], []
     for k in EDGE_TYPES:
-        u, r, cnt, last = raw[k]
+        u, r, cnt, last, first = raw[k]
+        ages.append(np.stack([last, first], 1).astype(np.float32).reshape(-1, 2))
         r = local.loc[r].values if len(r) else r
-        # per repo: events of this type in 30 / 90 days and number of distinct cohort users
-        xr.append(np.stack([np.bincount(r, weights=cnt[:, 1], minlength=len(repos)),
-                            np.bincount(r, weights=cnt[:, 2], minlength=len(repos)),
+        # per repo: events of this type in the two longest windows (30 / 90 days by default) and
+        # number of distinct cohort users
+        xr.append(np.stack([np.bincount(r, weights=cnt[:, -2], minlength=len(repos)),
+                            np.bincount(r, weights=cnt[:, -1], minlength=len(repos)),
                             np.bincount(r, minlength=len(repos))], 1))
-        ef = np.concatenate([np.log1p(cnt), (last / 90)[:, None]], 1).astype(np.float32)
+        ef = np.concatenate([np.log1p(cnt), (last / window)[:, None]], 1).astype(np.float32)
         edges.append((u.astype(np.int64), r.astype(np.int64), ef))
     xr = np.concatenate([xr[0]] + [np.log1p(x) for x in xr[1:]], 1).astype(np.float32)
-    return xr, edges
+    return (xr, edges, ages) if times else (xr, edges)
 
 
 def mean_agg(msg, idx, n):
@@ -93,10 +165,25 @@ def mean_agg(msg, idx, n):
     return out / deg.clamp(min=1)[:, None]
 
 
+class EdgeTimeEncoder(nn.Module):
+    """--time-enc edge: relgt's sinusoidal PositionalEncoding + a linear layer, shared by the edge
+    types, applied to the days since the last and the first event of each user-repo edge."""
+
+    def __init__(self, d):
+        super().__init__()
+        self.pos = load_relgt().PositionalEncoding(d)
+        self.linear = nn.Linear(d, d)
+
+    def forward(self, ages):
+        return self.linear(self.pos(ages.reshape(-1))).view(len(ages), -1)
+
+
 class HeteroSAGE(nn.Module):
-    def __init__(self, du, dr, de, n_out, d=64, layers=2, dropout=0.1):
+    def __init__(self, du, dr, de, n_out, d=64, layers=2, dropout=0.1, time_dim=0):
         super().__init__()
         nt = len(EDGE_TYPES)
+        self.time_enc = EdgeTimeEncoder(time_dim) if time_dim else None
+        de += 2 * time_dim
 
         def enc(i):
             return nn.Sequential(nn.Linear(i, d), nn.ReLU(), nn.Dropout(dropout), nn.Linear(d, d))
@@ -116,12 +203,15 @@ class HeteroSAGE(nn.Module):
     def forward(self, g):
         hu, hr = self.enc_u(g["xu"]), self.enc_r(g["xr"])
         nu, nr = hu.shape[0], hr.shape[0]
+        edges = g["edges"]
+        if self.time_enc is not None:
+            edges = [(u, r, torch.cat([e, self.time_enc(t)], 1)) for (u, r, e), t in zip(edges, g["edge_t"])]
         for layer in range(len(self.u2r)):
             mr = sum(mean_agg(torch.relu(lin(torch.cat([hu[u], e], 1))), r, nr)
-                     for lin, (u, r, e) in zip(self.u2r[layer], g["edges"]))
+                     for lin, (u, r, e) in zip(self.u2r[layer], edges))
             hr = self.norm_r[layer](hr + self.drop(torch.relu(self.upd_r[layer](torch.cat([hr, mr], 1)))))
             mu = sum(mean_agg(torch.relu(lin(torch.cat([hr[r], e], 1))), u, nu)
-                     for lin, (u, r, e) in zip(self.r2u[layer], g["edges"]))
+                     for lin, (u, r, e) in zip(self.r2u[layer], edges))
             hu = self.norm_u[layer](hu + self.drop(torch.relu(self.upd_u[layer](torch.cat([hu, mu], 1)))))
         return self.head(hu)
 
@@ -134,12 +224,13 @@ def masked_bce(logits, y, mask):
     return per_task[m.any(0)].mean()
 
 
-def fit(graphs, weeks, n_out, epochs, seed, device, val_weeks=None, patience=5, lr=2e-3):
+def fit(graphs, weeks, n_out, epochs, seed, device, val_weeks=None, patience=5, lr=2e-3, time_dim=0):
     """Train on the given weeks; with val_weeks, early-stop on validation loss."""
     torch.manual_seed(seed)
     rng = np.random.default_rng(seed)
     g0 = graphs[weeks[0]]
-    model = HeteroSAGE(g0["xu"].shape[1], g0["xr"].shape[1], g0["edges"][0][2].shape[1], n_out).to(device)
+    model = HeteroSAGE(g0["xu"].shape[1], g0["xr"].shape[1], g0["edges"][0][2].shape[1], n_out,
+                       time_dim=time_dim).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
     best, best_state, best_epoch, bad = np.inf, None, epochs, 0
     for epoch in range(1, epochs + 1):
@@ -177,6 +268,408 @@ def predict(model, g):
         return torch.sigmoid(model(g)).cpu().numpy()
 
 
+def train_batched(make_model, batch, ids, fit_weeks, epochs, val_weeks, lr, seed, batch_size, max_steps=0,
+                  patience=5):
+    """Mini-batch training over examples (ego and chain): batch(example ids) -> (model inputs, y). With
+    val_weeks, early stop on the mean weekly validation loss; weeks whose labels are not known yet are
+    skipped."""
+    torch.manual_seed(seed)
+    rng = np.random.default_rng(seed)
+    model = make_model()
+    opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+    best, best_state, best_epoch, bad = np.inf, None, epochs, 0
+    examples = np.concatenate([ids[w] for w in fit_weeks])
+    for epoch in range(1, epochs + 1):
+        model.train()
+        perm = rng.permutation(examples)
+        for step, i in enumerate(range(0, len(perm), batch_size)):
+            if max_steps and step >= max_steps:
+                break
+            inputs, yb = batch(perm[i:i + batch_size])
+            opt.zero_grad()
+            loss = masked_bce(model(*inputs), yb, torch.ones(len(yb), dtype=torch.bool, device=yb.device))
+            loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            opt.step()
+        if val_weeks is None:
+            continue
+        model.eval()
+        with torch.no_grad():
+            vl = []
+            for w in val_weeks:
+                if len(ids[w]) == 0:
+                    continue
+                lw, yw = batched_logits(model, batch, ids[w], batch_size)
+                if not torch.isnan(yw).all():
+                    vl.append(masked_bce(lw, yw, torch.ones(len(yw), dtype=torch.bool, device=yw.device)).item())
+        vl = float(np.mean(vl))
+        print(f"  epoch {epoch:2d}  val loss {vl:.4f}")
+        if vl < best - 1e-4:
+            best, best_epoch, bad = vl, epoch, 0
+            best_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
+        else:
+            bad += 1
+            if bad >= patience:
+                break
+    if best_state is not None:
+        model.load_state_dict(best_state)
+    return model, best_epoch
+
+
+def batched_logits(model, batch, examples, batch_size):
+    """Logits and labels of the given examples, in chunks of batch_size."""
+    out = [batch(examples[i:i + batch_size]) for i in range(0, len(examples), batch_size)]
+    return torch.cat([model(*inputs) for inputs, _ in out]), torch.cat([y for _, y in out])
+
+
+# ---------------------------------------------------------------------------------------------------
+# --graph-structure ego (default): the relation-aware ego-graph GNN of
+# old_experiments/relgt_inspired (gnn_model.py, model.py, data.py), on the current weeks and protocol.
+
+EGO_OBJECTS_PER_REL = 4                                   # hop-1 objects kept per relation
+EGO_OBJECT_SLOTS = len(EVENT_COLS) * EGO_OBJECTS_PER_REL  # 24
+EGO_REPO_SLOTS = 24                                       # hop-2 repository membership tokens
+EGO_K = EGO_OBJECT_SLOTS + EGO_REPO_SLOTS
+EGO_REPO_REL = len(EVENT_COLS) + 1                        # relation 7; 1..6 are EVENT_COLS, 0 padding
+EGO_N_REL = EGO_REPO_REL + 1
+EGO_N_TYPES = 4                                           # padding, pull request, issue, repository
+EGO_N_HOPS = 3                                            # padding, object, repository
+EGO_N_FEATS = 4
+SEGMENTS = ["quiet", "active"]                            # --segment activity: 0 = no ego token, 1 = some
+
+
+def load_entity_events(cohort):
+    """Activity rows of cohort users with the entity they act on, for the ego tokens.
+
+    Per EVENT_COLS key: uid (cohort index), t, avail (as in base.load), repo, entity (global id:
+    1 + PRs | issues | repositories, the old EntityVocabulary) and entity_avail (first_seen_at of that
+    PR / issue / repository). Node type 1 = PR, 2 = issue, 3 = repository.
+    """
+    db = base.DB
+    users = pd.read_parquet(db / "Users.parquet", columns=["user_id", "is_cohort"])
+    to_cidx = np.full(len(users), -1, np.int64)
+    to_cidx[cohort.user_id.values] = np.arange(len(cohort))
+    prs = pd.read_parquet(db / "PullRequests.parquet",
+                          columns=["pr_id", "repo_id", "author_id", "created_at", "first_seen_at"])
+    issues = pd.read_parquet(db / "Issues.parquet", columns=["issue_id", "repo_id", "author_id", "is_pull_request",
+                                                             "created_at", "first_seen_at"])
+    comments = pd.read_parquet(db / "IssueComments.parquet",
+                               columns=["issue_id", "repo_id", "author_id", "created_at"])
+    reviews = pd.read_parquet(db / "PRReviews.parquet",
+                              columns=["pr_id", "repo_id", "reviewer_id", "submitted_at", "first_seen_at"])
+    rcomments = pd.read_parquet(db / "PRReviewComments.parquet",
+                                columns=["pr_id", "repo_id", "author_id", "created_at"])
+    pushes = pd.read_parquet(db / "Pushes.parquet", columns=["user_id", "repo_id", "created_at"])
+    repos = pd.read_parquet(db / "Repositories.parquet", columns=["repo_id", "first_seen_at"])
+    offset = {1: 1, 2: 1 + len(prs), 3: 1 + len(prs) + len(issues)}
+    seen = {1: prs.set_index("pr_id").first_seen_at, 2: issues.set_index("issue_id").first_seen_at,
+            3: repos.set_index("repo_id").first_seen_at}
+    n_entities = offset[3] + len(repos)
+
+    def later(*cols):
+        return np.maximum.reduce([np.asarray(c, dtype="datetime64[ns]") for c in cols])
+
+    def events(uid, t, avail, repo, entity, node_type):
+        d = pd.DataFrame({"uid": uid.values, "t": t.values, "avail": avail, "repo": repo.values,
+                          "entity": entity.values})
+        d = d.dropna()
+        d = d[d.t >= base.DATA_START]
+        d["uid"] = to_cidx[d.uid.astype(np.int64).values]
+        d = d[d.uid >= 0]
+        ent = d.entity.astype(np.int64).values
+        d["entity_avail"] = seen[node_type].reindex(ent).values
+        d["entity"] = ent + offset[node_type]
+        d["repo"] = d.repo.astype(np.int64)
+        d["node_type"] = node_type
+        return d.dropna(subset=["entity_avail"]).reset_index(drop=True)
+
+    plain = issues[~issues.is_pull_request.fillna(False)]
+    ev = {
+        "open_pr": events(prs.author_id, prs.created_at, later(prs.created_at, prs.first_seen_at), prs.repo_id,
+                          prs.pr_id, 1),
+        "open_issue": events(plain.author_id, plain.created_at, later(plain.created_at, plain.first_seen_at),
+                             plain.repo_id, plain.issue_id, 2),
+        "issue_comment": events(comments.author_id, comments.created_at, comments.created_at.values,
+                                comments.repo_id, comments.issue_id, 2),
+        "pr_review": events(reviews.reviewer_id, reviews.submitted_at,
+                            later(reviews.submitted_at, reviews.first_seen_at), reviews.repo_id, reviews.pr_id, 1),
+        "pr_review_comment": events(rcomments.author_id, rcomments.created_at, rcomments.created_at.values,
+                                    rcomments.repo_id, rcomments.pr_id, 1),
+        "push": events(pushes.user_id, pushes.created_at, pushes.created_at.values, pushes.repo_id,
+                       pushes.repo_id, 3),
+    }
+    return ev, n_entities, offset[3]
+
+
+def ego_tokens(ent_ev, s, lags, keep, lookback, repo_offset):
+    """The ego tokens of every cohort user for the week starting at s (old data.py:snapshot_tokens).
+
+    Activity k is visible through its own cutoff c_k = s - lags[k]: a row is used if avail < c_k,
+    entity_avail < c_k and c_k - lookback <= t < c_k. Per user, slots 0..23 are the 4 latest objects of
+    each relation (hop 1; a push object is its repository) and slots 24..47 the 24 latest repositories
+    over all relations (hop 2, relation 7). Token features: log events, log active days, log events of
+    the entity (or repo) by all kept cohort users in the window, and its distinct users / relations.
+    relative_days is the days from the latest such event to its cutoff. Only users with keep are used.
+    Returns a dict of (n_cohort, EGO_K[, 4]) arrays; users without visible rows are all padding. Also
+    "n_events", (n_cohort,): the number of visible rows of each user in the window.
+    """
+    parts = []
+    for rel, k in enumerate(EVENT_COLS, start=1):
+        c = np.datetime64(s - lags[k])
+        e = ent_ev[k]
+        m = ((e.avail.values < c) & (e.entity_avail.values < c) & (e.t.values < c)
+             & (e.t.values >= c - np.timedelta64(int(lookback * 86400), "s")))
+        m &= keep[e.uid.values]
+        d = e.loc[m, ["uid", "repo", "entity", "node_type", "t"]].copy()
+        d["rel"] = rel
+        d["age"] = (c - d.t.values) / np.timedelta64(1, "D")
+        parts.append(d)
+    known = pd.concat(parts, ignore_index=True)
+    n = len(keep)
+    out = {"entity": np.zeros((n, EGO_K), np.int64), "type": np.zeros((n, EGO_K), np.int64),
+           "rel": np.zeros((n, EGO_K), np.int64), "hop": np.zeros((n, EGO_K), np.int64),
+           "feat": np.zeros((n, EGO_K, EGO_N_FEATS), np.float32), "days": np.zeros((n, EGO_K), np.float32),
+           "n_events": np.zeros(n, np.int64)}
+    if known.empty:
+        return out
+    out["n_events"] = np.bincount(known.uid.values, minlength=n)
+    known["day"] = known.t.values.astype("datetime64[D]")
+
+    def neighbours(by, structure_key):
+        g = (known.groupby(by, sort=False)
+             .agg(count=("t", "size"), active=("day", "nunique"), age=("age", "min")).reset_index())
+        st = (known.groupby(structure_key, sort=False)
+              .agg(degree=("t", "size"), users=("uid", "nunique"), rels=("rel", "nunique")).reset_index())
+        return g.merge(st, on=structure_key, validate="many_to_one")
+
+    def place(g, slot, entity, node_type, rel, hop):
+        f = np.stack([np.log1p(g["count"].values), np.log1p(g.active.values), np.log1p(g.degree.values),
+                      g.users.values / np.maximum(g.rels.values, 1)], 1).astype(np.float32)
+        u = g.uid.values
+        out["entity"][u, slot], out["type"][u, slot] = entity, node_type
+        out["rel"][u, slot], out["hop"][u, slot] = rel, hop
+        out["feat"][u, slot], out["days"][u, slot] = f, np.clip(g.age.values, 0, 3650)
+
+    obj = neighbours(["uid", "rel", "entity", "node_type"], "entity")
+    obj = obj.sort_values(["uid", "rel", "age", "count"], ascending=[True, True, True, False], kind="stable")
+    obj["rank"] = obj.groupby(["uid", "rel"], sort=False).cumcount()
+    obj = obj[obj["rank"] < EGO_OBJECTS_PER_REL]
+    place(obj, (obj.rel.values - 1) * EGO_OBJECTS_PER_REL + obj["rank"].values, obj.entity.values,
+          obj.node_type.values, obj.rel.values, 1)
+
+    rep = neighbours(["uid", "repo"], "repo")
+    rep = rep.sort_values(["uid", "age", "count"], ascending=[True, True, False], kind="stable")
+    rep["rank"] = rep.groupby("uid", sort=False).cumcount()
+    rep = rep[rep["rank"] < EGO_REPO_SLOTS]
+    place(rep, EGO_OBJECT_SLOTS + rep["rank"].values, rep.repo.values + repo_offset, 3, EGO_REPO_REL, 2)
+    real = out["type"] != 0
+    assert (out["days"][real] > 0).all(), "an ego token is not strictly before its cutoff"
+    return out
+
+
+class EgoTimeEncoder(nn.Module):
+    """Sinusoidal features of the log age in days, then a linear map (old model.py TimeEncoder)."""
+
+    def __init__(self, d, n_freq=8):
+        super().__init__()
+        self.register_buffer("freq", torch.logspace(-1, 1, n_freq))
+        self.proj = nn.Linear(2 * n_freq + 1, d)
+
+    def forward(self, days):
+        age = torch.log1p(days.clamp(min=0)).unsqueeze(-1)
+        a = age * self.freq
+        return self.proj(torch.cat([age, a.sin(), a.cos()], -1))
+
+
+class EgoTokenEncoder(nn.Module):
+    """Entity id, node type, relation, hop, row features and time, concatenated and mixed by an MLP
+    (old model.py TokenEncoder)."""
+
+    def __init__(self, n_entities, d, dropout):
+        super().__init__()
+        self.entity = nn.Embedding(n_entities, d, padding_idx=0)
+        self.node_type = nn.Embedding(EGO_N_TYPES, d)
+        self.rel = nn.Embedding(EGO_N_REL, d)
+        self.hop = nn.Embedding(EGO_N_HOPS, d)
+        self.feat = nn.Sequential(nn.Linear(EGO_N_FEATS, d), nn.GELU(), nn.Linear(d, d))
+        self.time = EgoTimeEncoder(d)
+        self.mix = nn.Sequential(nn.Linear(6 * d, d), nn.GELU(), nn.Dropout(dropout), nn.Linear(d, d),
+                                 nn.LayerNorm(d))
+
+    def forward(self, entity, types, rel, hop, feat, days):
+        return self.mix(torch.cat([self.entity(entity), self.node_type(types), self.rel(rel), self.hop(hop),
+                                   self.feat(feat), self.time(days)], -1))
+
+
+class EgoLayer(nn.Module):
+    """One round of relation-aware message passing on the star graph (old gnn_model.py RelationalLayer):
+    token -> user with one weight per relation, user -> token, and push repository <-> the repository
+    membership token of the same repo, each mean-aggregated and added to a self transform."""
+
+    def __init__(self, d, dropout):
+        super().__init__()
+        self.d = d
+        self.self_loop = nn.Linear(d, d)
+        self.token_to_user = nn.Linear(d, (EGO_N_REL - 1) * d, bias=False)
+        self.user_to_token = nn.Linear(d, d, bias=False)
+        self.same_entity = nn.Linear(d, d, bias=False)
+        self.norm = nn.LayerNorm(d)
+        self.drop = nn.Dropout(dropout)
+
+    @staticmethod
+    def _mean(adj, msg):
+        return adj @ msg / adj.sum(-1, keepdim=True).clamp(min=1.0)
+
+    def forward(self, x, rel, to_user, to_token, same):
+        B, N, _ = x.shape
+        per_rel = self.token_to_user(x).view(B, N, EGO_N_REL - 1, self.d)
+        picked = per_rel.gather(2, rel.view(B, N, 1, 1).expand(-1, -1, 1, self.d)).squeeze(2)
+        upd = (self.self_loop(x) + self._mean(to_user, picked) + self._mean(to_token, self.user_to_token(x))
+               + self._mean(same, self.same_entity(x)))
+        return self.norm(x + self.drop(torch.relu(upd)))
+
+
+class EgoGNN(nn.Module):
+    """Old gnn_model.py RelationalGNN: a learned user node (plus, with n_seed_feats, an MLP of the
+    baseline user features) joined to its ego tokens, `layers` rounds of EgoLayer, then a head on the
+    user node and the mean of all nodes."""
+
+    def __init__(self, n_entities, n_out, d=64, layers=2, dropout=0.1, n_seed_feats=0):
+        super().__init__()
+        self.tokens = EgoTokenEncoder(n_entities, d, dropout)
+        self.user_token = nn.Parameter(torch.randn(d) / np.sqrt(d))
+        self.seed_encoder = (nn.Sequential(nn.Linear(n_seed_feats, d), nn.ReLU(), nn.Linear(d, d))
+                             if n_seed_feats else None)
+        self.layers = nn.ModuleList(EgoLayer(d, dropout) for _ in range(layers))
+        self.head = nn.Sequential(nn.Linear(2 * d, d), nn.GELU(), nn.Dropout(dropout), nn.Linear(d, n_out))
+
+    def forward(self, entity, types, rel, hop, feat, days, seed_x=None):
+        tok = self.tokens(entity, types, rel, hop, feat, days)
+        B, K, _ = tok.shape
+        user = self.user_token.expand(B, 1, -1)
+        if self.seed_encoder is not None:
+            user = user + self.seed_encoder(seed_x).unsqueeze(1)
+        x = torch.cat([user, tok], 1)
+        valid = types != 0
+        # Node 0 is the user; padding tokens use relation 1's weights but have no edges.
+        rels = torch.cat([rel.new_ones(B, 1), rel.clamp(min=1)], 1) - 1
+        vf = valid.to(x.dtype)
+        to_user = torch.zeros(B, K + 1, K + 1, dtype=x.dtype, device=x.device)
+        to_user[:, 0, 1:] = vf
+        to_token = torch.zeros_like(to_user)
+        to_token[:, 1:, 0] = vf
+        is_repo = types == 3
+        link = ((entity.unsqueeze(2) == entity.unsqueeze(1)) & is_repo.unsqueeze(2) & is_repo.unsqueeze(1)
+                & (hop.unsqueeze(2) != hop.unsqueeze(1)))
+        same = torch.zeros_like(to_user)
+        same[:, 1:, 1:] = link.to(x.dtype)
+        for layer in self.layers:
+            x = layer(x, rels, to_user, to_token, same)
+        mask = torch.cat([valid.new_ones(B, 1), valid], 1).unsqueeze(-1).to(x.dtype)
+        mean = (x * mask).sum(1) / mask.sum(1).clamp(min=1.0)
+        return self.head(torch.cat([x[:, 0], mean], -1))
+
+
+def ego_stages(args, tables, feats, weeks, train_weeks, cohort, lags, test, labels, device, sel):
+    """--graph-structure ego: the ego tokens of every example, and the functions that train on weeks,
+    predict one week (one value per row of its table; NaN for users without an example) and give the
+    segment of every row of a week (-1 no example, 0 quiet = no ego token, 1 active)."""
+    all_weeks = weeks + [base.TEST_START]
+    ent_ev, n_entities, repo_offset = load_entity_events(cohort)
+
+    # Examples: the eligible users of every labelled week, then the test users, as in token_stages.
+    rows = {w: np.flatnonzero(tables[w].eligible.values) for w in weeks}
+    tt = tables[base.TEST_START]
+    rows[base.TEST_START] = pd.Series(np.arange(len(tt)), index=cohort.github_user_id.values[tt.cidx.values]
+                                      ).loc[test.UserID].values
+    parts = {key: [] for key in ["entity", "type", "rel", "hop", "feat", "days"]}
+    n_events = []
+    for w in all_weeks:
+        tok = ego_tokens(ent_ev, w, lags, sel[w], args.ego_lookback, repo_offset)
+        c = tables[w].cidx.values[rows[w]]
+        for key in parts:
+            parts[key].append(tok[key][c])
+        n_events.append(tok["n_events"][c])
+    n_events = np.concatenate(n_events)
+    label_cols = [f"y_{k}" for k in labels]
+    y = np.concatenate([tables[w][label_cols].values[rows[w]] if w != base.TEST_START
+                        else np.full((len(rows[w]), len(labels)), np.nan) for w in all_weeks])
+    sizes = np.cumsum([0] + [len(rows[w]) for w in all_weeks])
+    ids = {w: np.arange(sizes[i], sizes[i + 1]) for i, w in enumerate(all_weeks)}
+    T = {key: torch.tensor(np.concatenate(v), device=device) for key, v in parts.items()}
+    Y = torch.tensor(y, dtype=torch.float32, device=device)
+    seed_x = None
+    split = args.segment != "none"
+    if args.user_features or split:  # the quiet model of --segment activity always uses them
+        sx = np.log1p(np.concatenate([tables[w][feats].values[rows[w]] for w in all_weeks]))
+        train_ids = np.concatenate([ids[w] for w in train_weeks])
+        sx = (sx - sx[train_ids].mean(0)) / (sx[train_ids].std(0) + 1e-6)
+        seed_x = torch.tensor(sx, dtype=torch.float32, device=device)
+    real = T["type"] != 0
+    seg = (n_events >= args.active_min_events).astype(np.int64)
+    seg_rows = {}
+    for w in all_weeks:
+        seg_rows[w] = np.full(len(tables[w]), -1, np.int64)
+        seg_rows[w][rows[w]] = seg[ids[w]]
+    print(f"{sizes[-1]:,} examples x {EGO_K} ego tokens (last {args.ego_lookback:g} days), "
+          f"{real.float().mean().item():.0%} of slots used, {(~real.any(1)).float().mean().item():.1%} "
+          f"of examples without tokens, {n_entities:,} entities"
+          + (f", {seed_x.shape[1]} user features" if seed_x is not None else ""))
+    print(f"segments (>= {args.active_min_events} visible events = active): quiet {(seg == 0).mean():.1%}, "
+          f"active {(seg == 1).mean():.1%} of examples")
+
+    def batch(ex):
+        i = torch.as_tensor(ex, device=device)
+        inputs = [T[key][i] for key in ["entity", "type", "rel", "hop", "feat", "days"]]
+        if seed_x is not None:
+            inputs.append(seed_x[i])
+        return inputs, Y[i]
+
+    n_sx = 0 if seed_x is None else seed_x.shape[1]
+    seg_feats = {"quiet": n_sx, "active": n_sx if args.user_features else 0}
+
+    def make_model(n_seed_feats):
+        return EgoGNN(n_entities, len(labels), d=args.ego_dim, layers=args.ego_layers, dropout=args.ego_dropout,
+                      n_seed_feats=n_seed_feats).to(device)
+
+    def train(fit_weeks, epochs, val_weeks=None):
+        """One model, or with --segment activity a {segment: model} dict and a {segment: best epoch}
+        dict; epochs may then be such a dict too (the final retrain)."""
+        if not split:
+            return train_batched(lambda: make_model(n_sx), batch, ids, fit_weeks, epochs, val_weeks, args.lr,
+                                 args.seed, args.batch_size, args.max_steps_per_epoch)
+        models, best = {}, {}
+        for s, name in enumerate(SEGMENTS):
+            sub = {w: ids[w][seg[ids[w]] == s] for w in ids}
+            print(f"segment {name}: {sum(len(sub[w]) for w in fit_weeks):,} examples, "
+                  f"{seg_feats[name]} user features")
+            models[name], best[name] = train_batched(
+                lambda n=seg_feats[name]: make_model(n), batch, sub, fit_weeks,
+                epochs[name] if isinstance(epochs, dict) else epochs, val_weeks, args.lr, args.seed,
+                args.batch_size, args.max_steps_per_epoch)
+        return models, best
+
+    def probs(model, ex):
+        model.eval()
+        with torch.no_grad():
+            return torch.sigmoid(batched_logits(model, batch, ex, args.batch_size)[0]).cpu().numpy()
+
+    def predict_week(model, w):
+        if isinstance(model, dict):
+            p = np.zeros((len(ids[w]), len(labels)))
+            for s, name in enumerate(SEGMENTS):
+                m = seg[ids[w]] == s
+                if m.any():
+                    p[m] = probs(model[name], ids[w][m])
+        else:
+            p = probs(model, ids[w])
+        out = np.full((len(tables[w]), len(labels)), np.nan)
+        out[rows[w]] = p
+        return out
+
+    return train, predict_week, seg_rows.__getitem__
+
+
 class RowGNN(nn.Module):
     """Relation-typed GraphSAGE-style message passing over each example's K tokens (--graph-structure
     chain). rows and time_encoder are relgt's RowEncoder and TimeEncoder."""
@@ -210,6 +703,7 @@ class RowGNN(nn.Module):
         return self.head((h.view(B, K, -1) * seed).sum(1) / seed.sum(1))
 
 
+@functools.cache
 def load_relgt():
     """experiments/relgt/run.py; loaded only when used, as relgt itself imports this file."""
     spec = importlib.util.spec_from_file_location("relgt_run", HERE.parent / "relgt" / "run.py")
@@ -273,59 +767,19 @@ def token_stages(args, tables, feats, weeks, train_weeks, cohort, lags, test, la
     print(f"{sizes[-1]:,} examples x {args.num_neighbors} tokens, {len(edges[0]):,} subgraph edges; "
           f"share of tokens within {args.layers} hops of a seed: {(hops <= args.layers).mean():.0%}")
 
-    def logits(model, examples):
-        return torch.cat([model(*S.batch(examples[i:i + args.batch_size])[0])
-                          for i in range(0, len(examples), args.batch_size)])
+    def make_model():
+        return RowGNN(relgt.RowEncoder(G, cutoffs, week_day, args.channels, 0.1), relgt.TimeEncoder(args.channels),
+                      len(relgt.TABLES) + 1, args.max_hops + 3, relgt.N_ALL_REL, seed_x.shape[1], len(labels),
+                      d=args.channels, layers=args.layers).to(device)
 
-    def train(fit_weeks, epochs, val_weeks=None, patience=5):
-        """Like fit: batches of examples; with val_weeks, early stop on the mean weekly validation loss."""
-        torch.manual_seed(args.seed)
-        rng = np.random.default_rng(args.seed)
-        model = RowGNN(relgt.RowEncoder(G, cutoffs, week_day, args.channels, 0.1), relgt.TimeEncoder(args.channels),
-                       len(relgt.TABLES) + 1, args.max_hops + 3, relgt.N_ALL_REL, seed_x.shape[1], len(labels),
-                       d=args.channels, layers=args.layers).to(device)
-        opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
-        best, best_state, best_epoch, bad = np.inf, None, epochs, 0
-        examples = np.concatenate([ids[w] for w in fit_weeks])
-        for epoch in range(1, epochs + 1):
-            model.train()
-            perm = rng.permutation(examples)
-            for step, i in enumerate(range(0, len(perm), args.batch_size)):
-                if args.max_steps_per_epoch and step >= args.max_steps_per_epoch:
-                    break
-                inputs, yb = S.batch(perm[i:i + args.batch_size])
-                opt.zero_grad()
-                loss = masked_bce(model(*inputs), yb, torch.ones(len(yb), dtype=torch.bool, device=device))
-                loss.backward()
-                nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                opt.step()
-            if val_weeks is None:
-                continue
-            model.eval()
-            with torch.no_grad():
-                vl = []
-                for w in val_weeks:
-                    yw = S.y[torch.tensor(ids[w], device=device)]
-                    if not torch.isnan(yw).all():  # weeks whose labels are not known yet are skipped
-                        vl.append(masked_bce(logits(model, ids[w]), yw, torch.ones(len(yw), dtype=torch.bool,
-                                                                                   device=device)).item())
-            vl = float(np.mean(vl))
-            print(f"  epoch {epoch:2d}  val loss {vl:.4f}")
-            if vl < best - 1e-4:
-                best, best_epoch, bad = vl, epoch, 0
-                best_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
-            else:
-                bad += 1
-                if bad >= patience:
-                    break
-        if best_state is not None:
-            model.load_state_dict(best_state)
-        return model, best_epoch
+    def train(fit_weeks, epochs, val_weeks=None):
+        return train_batched(make_model, S.batch, ids, fit_weeks, epochs, val_weeks, args.lr, args.seed,
+                             args.batch_size, args.max_steps_per_epoch)
 
     def predict_week(model, w):
         model.eval()
         with torch.no_grad():
-            p = torch.sigmoid(logits(model, ids[w])).cpu().numpy()
+            p = torch.sigmoid(batched_logits(model, S.batch, ids[w], args.batch_size)[0]).cpu().numpy()
         out = np.full((len(tables[w]), len(labels)), np.nan)
         out[rows[w]] = p
         return out
@@ -350,12 +804,38 @@ def main():
                     help="name of the run: results are saved in outputs/<name>/ "
                          "(default: derived from the actions and --users)")
     ap.add_argument("--lr", type=float, default=None,
-                    help="AdamW learning rate (default: 2e-3, with --graph-structure chain 3e-4)")
-    ap.add_argument("--epochs", type=int, default=None, help="default: 40, with --graph-structure chain 20")
+                    help="AdamW learning rate (default: ego 1e-3, user-repo 2e-3, chain 3e-4)")
+    ap.add_argument("--epochs", type=int, default=None, help="default: ego / chain 20, user-repo 40")
+    ap.add_argument("--batch-size", type=int, default=None, help="ego / chain examples per batch "
+                    "(default: ego 256, chain 512)")
+    ap.add_argument("--max-steps-per-epoch", type=int, default=0, help="ego / chain; 0 = full epoch")
     ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--graph-structure", choices=["user-repo", "chain"], default="user-repo",
-                    help="user-repo: one user <-> repository graph per week. chain: the row graph of "
-                         "experiments/relgt, one token subgraph per example; the options below need it")
+    ap.add_argument("--time-enc", choices=["none", "edge"], default="none",
+                    help="user-repo graph: edge = add a learned sinusoidal encoding of the days since the "
+                         "last and the first event of each edge to its features")
+    ap.add_argument("--time-dim", type=int, default=16, help="size of each time encoding (--time-enc edge)")
+    ap.add_argument("--history-days", type=int, default=None,
+                    help="the model only sees rows of the last N days before each cutoff (user features, "
+                         "graph edges and repo features; with --graph-structure chain, the tokens), in "
+                         "training, validation and test alike (default: all, edges 90 days)")
+    ap.add_argument("--graph-structure", choices=["ego", "user-repo", "chain"], default="ego",
+                    help="ego: one star graph per example, the user and its recent PRs / issues / repos "
+                         "(old_experiments/relgt_inspired GNN). user-repo: one user <-> repository graph "
+                         "per week (HeteroSAGE). chain: the row graph of experiments/relgt, one token "
+                         "subgraph per example")
+    eg = ap.add_argument_group("--graph-structure ego")
+    eg.add_argument("--ego-lookback", type=float, default=14,
+                    help="only activity rows of the last N days are tokens (default 14, as the old model)")
+    eg.add_argument("--user-features", action="store_true",
+                    help="add an MLP of the baseline user features to the learned user node")
+    eg.add_argument("--ego-dim", type=int, default=64)
+    eg.add_argument("--ego-layers", type=int, default=2, help="message passing rounds")
+    eg.add_argument("--ego-dropout", type=float, default=0.1)
+    eg.add_argument("--segment", choices=["none", "activity"], default="none",
+                    help="activity: one model for quiet examples (no ego token) and one for active ones")
+    eg.add_argument("--active-min-events", type=int, default=1,
+                    help="an example is active with >= N visible activity rows in the ego window "
+                         "(default 1 = any token; 5 = the old experiment's selection)")
     g = ap.add_argument_group("--graph-structure chain (same meaning as in experiments/relgt)")
     g.add_argument("--max-hops", type=int, default=50, help="how far the walk may go from the seed")
     g.add_argument("--chain-seed", choices=["user", "latest"], default="user",
@@ -367,15 +847,35 @@ def main():
     g.add_argument("--num-neighbors", type=int, default=100, help="K tokens per example")
     g.add_argument("--layers", type=int, default=3, help="message passing rounds")
     g.add_argument("--channels", type=int, default=64)
-    g.add_argument("--batch-size", type=int, default=512)
-    g.add_argument("--max-steps-per-epoch", type=int, default=0, help="0 = full epoch")
     args = ap.parse_args()
-    chain = args.graph_structure == "chain"
-    args.lr = args.lr or (3e-4 if chain else 2e-3)
-    args.epochs = args.epochs or (20 if chain else 40)
-    if not chain and any(ap.get_default(a.dest) != getattr(args, a.dest) for a in g._group_actions):
-        ap.error("these options need --graph-structure chain: " + ", ".join(
-            a.option_strings[0] for a in g._group_actions if ap.get_default(a.dest) != getattr(args, a.dest)))
+    chain, ego = args.graph_structure == "chain", args.graph_structure == "ego"
+    args.lr = args.lr or {"ego": 1e-3, "user-repo": 2e-3, "chain": 3e-4}[args.graph_structure]
+    args.epochs = args.epochs or (40 if args.graph_structure == "user-repo" else 20)
+    args.batch_size = args.batch_size or (256 if ego else 512)
+    for group, needed in [(g, "chain"), (eg, "ego")]:
+        changed = [a.option_strings[0] for a in group._group_actions if ap.get_default(a.dest) != getattr(args, a.dest)]
+        if args.graph_structure != needed and changed:
+            ap.error(f"these options need --graph-structure {needed}: " + ", ".join(changed))
+    if args.graph_structure != "user-repo" and args.time_enc != "none":
+        ap.error("--time-enc is for the user-repo graph (the ego and chain tokens already encode their time)")
+    if args.time_enc != "none" and (args.time_dim < 2 or args.time_dim % 2):
+        ap.error("--time-dim must be an even number >= 2")
+    time_dim = args.time_dim if args.time_enc == "edge" else 0
+    hist = args.history_days
+    if hist is not None and not 8 <= hist <= 90:
+        ap.error("--history-days must be in 8..90")
+    if hist and chain:
+        if args.lookback_days not in (None, hist):
+            ap.error("--history-days and --lookback-days disagree")
+        args.lookback_days = float(hist)
+    if hist and ego:
+        if args.ego_lookback not in (ap.get_default("ego_lookback"), hist):
+            ap.error("--history-days and --ego-lookback disagree")
+        args.ego_lookback = float(hist)
+    if ego and args.active_min_events < 1:
+        ap.error("--active-min-events must be >= 1")
+    if ego and args.ego_lookback <= 0:
+        ap.error("--ego-lookback must be positive")
     if args.num_seeds != 1 and args.chain_seed != "latest":
         ap.error("--num-seeds needs --chain-seed latest")
     if not 1 <= args.num_seeds < args.num_neighbors:
@@ -388,7 +888,12 @@ def main():
     labels = [k for k in EVENT_COLS if k in labels]  # canonical order, no duplicates
     args.task = "all" if labels == list(EVENT_COLS) else "+".join(labels)
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    default_name = (args.task if args.users == "all" else f"{args.task}_{args.users}") + ("_chain" if chain else "")
+    default_name = ((args.task if args.users == "all" else f"{args.task}_{args.users}") + ("_chain" if chain else "")
+                    + ("_ego" if ego else "") + ("_uf" if ego and args.user_features else "")
+                    + (("_seg" + (str(args.active_min_events) if args.active_min_events != 1 else ""))
+                       if ego and args.segment != "none" else "")
+                    + (f"_lb{args.ego_lookback:g}" if ego and not hist and args.ego_lookback != 14 else "")
+                    + ("_time" if time_dim else "") + (f"_h{hist}" if hist else ""))
     out_dir = OUT_DIR / (args.name or default_name)
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -407,6 +912,9 @@ def main():
     tables = {w: base.build_week(w, ev, own, lags, data_end, n) for w in weeks}
     tables[base.TEST_START] = base.build_week(base.TEST_START, ev, own, lags, data_end, n,
                                               with_labels=False)
+    if hist:
+        tables = windowed_tables(tables, ev, own, lags, data_end, n, hist)
+        print(f"history: only the last {hist} days before each cutoff are visible")
     test = pd.read_csv(base.TEST_INPUT)
     is_test = np.isin(cohort.github_user_id.values, test.UserID.values)
     keep = {"all": np.ones(n, bool), "test": is_test, "exclude_test": ~is_test}[args.users]
@@ -419,10 +927,15 @@ def main():
     tables = {w: t[sel[w]].reset_index(drop=True) for w, t in tables.items()}
     feats = [c for c in tables[weeks[0]].columns
              if c not in {"eligible", "cidx", "week"} and not c.startswith("y_")]
-    if chain:
+    segment_of = None  # ego only: segment of every row of a week (-1 no example, 0 quiet, 1 active)
+    split = ego and args.segment != "none"
+    if ego:
+        train, predict_week, segment_of = ego_stages(args, tables, feats, weeks, train_weeks, cohort, lags, test, labels, device,
+                                         sel)
+    elif chain:
         train, predict_week = token_stages(args, tables, feats, weeks, train_weeks, cohort, lags, test, labels, device)
     else:
-        raw_graphs = {w: week_graph(ev, w, lags, repo_is_org, sel[w]) for w in tables}
+        raw_graphs = {w: week_graph(ev, w, lags, repo_is_org, sel[w], times=True, window=hist or 90) for w in tables}
 
         # Standardise log1p features with statistics of the training weeks only.
         xu_tr = np.log1p(np.concatenate([tables[w][feats].values for w in train_weeks]))
@@ -432,7 +945,7 @@ def main():
 
         graphs = {}
         for w, t in tables.items():
-            xr, edges = raw_graphs[w]
+            xr, edges, ages = raw_graphs[w]
             y = (t[[f"y_{k}" for k in labels]].values if w != base.TEST_START
                  else np.full((len(t), len(labels)), np.nan))
             graphs[w] = {
@@ -440,6 +953,7 @@ def main():
                 "xr": torch.tensor((xr - mu_r) / sd_r, dtype=torch.float32, device=device),
                 "edges": [(torch.tensor(u, device=device), torch.tensor(r, device=device),
                            torch.tensor(e, device=device)) for u, r, e in edges],
+                "edge_t": [torch.tensor(a, device=device) for a in ages] if time_dim else None,
                 "y": torch.tensor(y, dtype=torch.float32, device=device),
                 "mask": torch.tensor(t.eligible.values, device=device),
             }
@@ -447,7 +961,8 @@ def main():
               f"{sum(len(u) for u, _, _ in graphs[base.TEST_START]['edges'])} edges")
 
         def train(fit_weeks, epochs, val_weeks=None):
-            return fit(graphs, fit_weeks, len(labels), epochs, args.seed, device, val_weeks=val_weeks, lr=args.lr)
+            return fit(graphs, fit_weeks, len(labels), epochs, args.seed, device, val_weeks=val_weeks, lr=args.lr,
+                       time_dim=time_dim)
 
         def predict_week(model, w):
             return predict(model, graphs[w])
@@ -456,22 +971,36 @@ def main():
     print(f"best epoch {best_epoch}")
 
     # Thresholds on the pooled validation weeks (same rule as the baseline).
-    metrics = {"task": args.task, "seed": args.seed, "lr": args.lr, "best_epoch": best_epoch, "per_label": {},
-               "validation": []}
-    if chain:
-        metrics["graph"] = {a.dest: getattr(args, a.dest) for a in g._group_actions}
+    metrics = {"task": args.task, "seed": args.seed, "lr": args.lr, "best_epoch": best_epoch,
+               "history_days": hist, "n_user_features": len(feats), "per_label": {}, "validation": []}
+    metrics["graph_structure"] = args.graph_structure
+    if args.graph_structure == "user-repo":
+        metrics.update(time_enc=args.time_enc, time_dim=time_dim)
+    if ego:
+        metrics["segment"] = args.segment
+        metrics["active_min_events"] = args.active_min_events
+    if chain or ego:
+        metrics["graph"] = {a.dest: getattr(args, a.dest) for a in (g if chain else eg)._group_actions}
+        metrics["graph"].update(batch_size=args.batch_size, max_steps_per_epoch=args.max_steps_per_epoch)
     val_p = {w: predict_week(model, w) for w in val_weeks}
-    rates = {}
+    rates, seg_rates = {}, {}
     for j, k in enumerate(labels):
-        ys, ps = [], []
+        ys, ps, ss = [], [], []
         for w in val_weeks:
             m = tables[w].eligible.values & ~np.isnan(tables[w][f"y_{k}"].values)
             ys.append(tables[w][f"y_{k}"].values[m])
             ps.append(val_p[w][m, j])
+            if segment_of is not None:
+                ss.append(segment_of(w)[m])
         y, p = np.concatenate(ys), np.concatenate(ps)
         thr, f1 = base.best_threshold(y, p)
         rates[k] = float((p >= thr).mean())
         metrics["per_label"][k] = {"threshold": thr, "val_f1": f1, "val_pred_rate": rates[k]}
+        if split:
+            sv = np.concatenate(ss)
+            seg_rates[k] = {name: float((p[sv == s] >= thr).mean()) for s, name in enumerate(SEGMENTS)
+                            if (sv == s).any()}
+            metrics["per_label"][k]["val_pred_rate_by_segment"] = seg_rates[k]
         print(f"{k:18s} val F1 {f1:.4f}  threshold {thr:.3f}  predicted {rates[k]:.3f}  "
               f"positives {y.mean():.3f}")
 
@@ -487,6 +1016,21 @@ def main():
             pred = val_p[w][m, j] >= metrics["per_label"][k]["threshold"]
             f1[k] = float(2 * (pred & (y == 1)).sum() / (pred.sum() + y.sum()))
         r = {"week": str(w), "users": int(m.sum()), "f1": f1}
+        if segment_of is not None:
+            sw = segment_of(w)
+            r["per_segment"] = {}
+            for s, name in enumerate(SEGMENTS):
+                ms = m & (sw == s)
+                d = {"users": int(ms.sum()), "f1": {}, "pos_rate": {}}
+                for j, k in enumerate(labels):
+                    y = t[f"y_{k}"].values[ms] == 1
+                    pred = val_p[w][ms, j] >= metrics["per_label"][k]["threshold"]
+                    d["f1"][k] = float(2 * (pred & y).sum() / max(pred.sum() + y.sum(), 1))
+                    d["pos_rate"][k] = float(y.mean()) if len(y) else float("nan")
+                d["f1_avg"] = float(np.mean(list(d["f1"].values())))
+                r["per_segment"][name] = d
+                print(f"  {str(w)[:10]} {name:6s} ({d['users']:,} users): "
+                      + "  ".join(f"{k} {v:.3f}" for k, v in d["f1"].items()) + f"  avg {d['f1_avg']:.4f}")
         if args.task == "all":
             gids = cohort.github_user_id.values[t.cidx.values[m]]
             truth = base.to_output(gids, {k: t[f"y_{k}"].values[m] for k in EVENT_COLS})
@@ -503,6 +1047,15 @@ def main():
     if args.task == "all":
         metrics["val_score_mean"] = float(np.mean([r["score"] for r in metrics["validation"]]))
         print(f"mean validation score {100 * metrics['val_score_mean']:.2f}")
+    if segment_of is not None and metrics["validation"]:
+        metrics["per_segment"] = {
+            name: {"users": float(np.mean([r["per_segment"][name]["users"] for r in metrics["validation"]])),
+                   "f1": {k: float(np.mean([r["per_segment"][name]["f1"][k] for r in metrics["validation"]]))
+                          for k in labels}}
+            for name in SEGMENTS}
+        for name, d in metrics["per_segment"].items():
+            d["f1_avg"] = float(np.mean(list(d["f1"].values())))
+            print(f"mean validation F1, {name} segment: {d['f1_avg']:.4f}")
 
     # Final model: all labelled weeks for the early-stopped number of epochs; the validation
     # share of predicted positives is reused as the decision rule (as in the baseline).
@@ -511,9 +1064,21 @@ def main():
     tt = tables[base.TEST_START]
     cidx = pd.Series(np.arange(len(tt)), index=cohort.github_user_id.values[tt.cidx.values]).loc[test.UserID].values
     out = pd.DataFrame({"UserID": test.UserID.values})
+    test_seg = segment_of(base.TEST_START)[cidx] if segment_of is not None else None
+    if test_seg is not None:
+        print("test users per segment: " + ", ".join(f"{name} {(test_seg == s).sum()}"
+                                                      for s, name in enumerate(SEGMENTS)))
     for j, k in enumerate(labels):
         q = p[cidx, j]
-        out[k] = (q >= np.quantile(q, 1 - rates[k])).astype(int)
+        if split:  # each final model has its own probability scale: one quantile per segment
+            pred = np.zeros(len(q), bool)
+            for s, name in enumerate(SEGMENTS):
+                ms = test_seg == s
+                if ms.any():
+                    pred[ms] = q[ms] >= np.quantile(q[ms], 1 - seg_rates[k].get(name, rates[k]))
+            out[k] = pred.astype(int)
+        else:
+            out[k] = (q >= np.quantile(q, 1 - rates[k])).astype(int)
     name = "output.csv" if args.task == "all" else f"{args.task}.csv"
     out.to_csv(out_dir / name, index=False)
     (out_dir / "metrics.json").write_text(json.dumps(metrics, indent=2, default=str))
