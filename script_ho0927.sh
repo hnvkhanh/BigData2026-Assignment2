@@ -23,9 +23,12 @@ declare -A CFG=(
   [het]="--graph-structure hetero --task all"
   [het_notime]="--graph-structure hetero --task all --het-time none"
   [all_ego_uf]="--user-features"
+  [all_ego_uf_pprev]="--user-features --push-share prev-week"
+  [all_ego_uf_rel]="--user-features --relative-features"
+  [all_ego_uf_rel_pprev]="--user-features --relative-features --push-share prev-week"
   [user_repo]="--graph-structure user-repo"
 )
-ALL="het het_notime all_ego_uf user_repo"
+ALL="het het_notime all_ego_uf all_ego_uf_pprev all_ego_uf_rel all_ego_uf_rel_pprev user_repo"
 CONFIGS=${CONFIGS:-"het het_notime all_ego_uf user_repo"}
 jobs=(); for c in $CONFIGS; do for s in 0 1 2; do jobs+=("$c $s"); done; done
 
@@ -70,5 +73,8 @@ for c in '$ALL'.split():
     ms=[json.load(open(f)) for f in sorted(glob.glob(f'experiments/gnn/outputs/{c}_${SUF}_s*/metrics.json'))]
     if not ms: continue
     sc=[100*m['holdout']['score'] for m in ms]; f1={k:np.mean([m['holdout']['f1'][k] for m in ms]) for k in ms[0]['holdout']['f1']}
-    print(f'{c:16s} n={len(ms)} score {np.mean(sc):.2f} ({min(sc):.2f}-{max(sc):.2f}) best_ep {[m[\"best_epoch\"] for m in ms]}  '+'  '.join(f'{k} {v:.3f}' for k,v in f1.items()))
+    print(f'{c:22s} n={len(ms)} score {np.mean(sc):.2f} ({min(sc):.2f}-{max(sc):.2f}) best_ep {[m[\"best_epoch\"] for m in ms]}  '+'  '.join(f'{k} {v:.3f}' for k,v in f1.items()))
+    hps=[m.get('holdout_push') for m in ms if m.get('holdout_push')]
+    if hps:
+        print(f'{\"\":22s} 6-activity score by push rule: '+'  '.join(f'{o} {np.mean([100*h[o][\"score\"] for h in hps]):.2f} (share {np.mean([h[o][\"share\"] for h in hps]):.3f})' for o in hps[0] if isinstance(hps[0][o], dict)))
 "

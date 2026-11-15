@@ -1150,6 +1150,14 @@ def main():
                     help="the model only sees rows of the last N days before each cutoff (user features, "
                          "graph edges and repo features; with --graph-structure chain, the tokens), in "
                          "training, validation and test alike (default: all, edges 90 days)")
+    ap.add_argument("--relative-features", action="store_true",
+                    help="user features: each count divided by the cohort mean of the same week, plus log cohort "
+                         "volumes (experiments/missing_data/run.py 'relative'), so their scale does not follow "
+                         "GH Archive's capture level")
+    ap.add_argument("--push-share", choices=["tune", "prev-week"], default="tune",
+                    help="share of users predicted to push on a new week: tune = the validation share (default); "
+                         "prev-week = the share of those users with a push in the last 7 days of push data "
+                         "before the week (push capture fell to ~1-7%% after 10-27)")
     ap.add_argument("--graph-structure", choices=["ego", "user-repo", "hetero", "chain"], default="ego",
                     help="ego: one star graph per example, the user and its recent PRs / issues / repos "
                          "(old_experiments/relgt_inspired GNN). user-repo: one user <-> repository graph "
@@ -1258,6 +1266,7 @@ def main():
                     + ("_qprev" if ego and args.quiet_rule == "prev-week" else "")
                     + (f"_lb{args.ego_lookback:g}" if ego and not hist and args.ego_lookback != 14 else "")
                     + ("_time" if time_dim else "") + (f"_h{hist}" if hist else "")
+                    + ("_rel" if args.relative_features else "") + ("_pprev" if args.push_share == "prev-week" else "")
                     + (("_ho" + (args.holdout_week[5:10].replace("-", "") if args.holdout_week else ""))
                        if args.holdout else ""))
     PROGRESS["disable"] = args.no_progress
@@ -1304,7 +1313,10 @@ def main():
         else:
             # Labels to the end of the data (only data_end of the labels is lifted; features use the lags).
             tables[HOLDOUT] = base.build_week(HOLDOUT, ev, own, lags, {k: pd.Timestamp.max for k in data_end}, n)
-            tables[HOLDOUT]["y_push"] = np.nan  # no push data after 10-27
+            # Push data is treated as ending 10-27, so push is not in the holdout score; the raw labels
+            # (GH Archive's few PushEvents to the end of the data) are kept for metrics["holdout_push"].
+            tables[HOLDOUT]["y_raw_push"] = tables[HOLDOUT]["y_push"]
+            tables[HOLDOUT]["y_push"] = np.nan
         weeks = weeks + [HOLDOUT]  # built (graphs / tokens) like any week, but in none of the splits
         assert HOLDOUT not in train_weeks + val_weeks + final_weeks
         lag_short = max(HOLDOUT + WEEK - data_end[k] for k in (EVENT_COLS if full else NONPUSH))
@@ -1317,6 +1329,13 @@ def main():
     if hist:
         tables = windowed_tables(tables, ev, own, lags, data_end, n, hist)
         print(f"history: only the last {hist} days before each cutoff are visible")
+    rel_feats = None
+    if args.relative_features:
+        feats0 = [c for c in tables[weeks[0]].columns
+                  if c not in {"eligible", "cidx", "week"} and not c.startswith("y_")]
+        for w in tables:
+            tables[w], rel_feats = base.relative_features(tables[w], feats0)
+        print(f"--relative-features: {len(rel_feats)} user features (counts / cohort mean of the week + volumes)")
     test = pd.read_csv(base.TEST_INPUT)
     is_test = np.isin(cohort.github_user_id.values, test.UserID.values)
     keep = {"all": np.ones(n, bool), "test": is_test, "exclude_test": ~is_test}[args.users]
@@ -1327,8 +1346,19 @@ def main():
     if args.users == "exclude_test":
         sel[base.TEST_START] = np.ones(n, bool)
     tables = {w: t[sel[w]].reset_index(drop=True) for w, t in tables.items()}
-    feats = [c for c in tables[weeks[0]].columns
-             if c not in {"eligible", "cidx", "week"} and not c.startswith("y_")]
+    feats = rel_feats or [c for c in tables[weeks[0]].columns
+                          if c not in {"eligible", "cidx", "week"} and not c.startswith("y_")]
+    push_end = ev["push"].t.max()  # raw push data (not cut at FEED_END)
+
+    def observed_push_share(w, rows):
+        """--push-share prev-week: share of the rows `rows` (positions in tables[w]) with >= 1 raw push in
+        the last 7 days of push data before week w starts."""
+        end = min(w, push_end)
+        e = ev["push"]
+        m = (e.t.values >= np.datetime64(end - WEEK)) & (e.t.values < np.datetime64(end))
+        seen = np.bincount(e.uid.values[m], minlength=n) > 0
+        return float(seen[tables[w].cidx.values[rows]].mean()) if len(rows) else 0.0
+
     segment_of = None  # ego only: segment of every row of a week (-1 no example, 0 quiet, 1 active)
     split = ego and args.segment != "none"
     qprev = ego and args.quiet_rule == "prev-week"
@@ -1383,7 +1413,8 @@ def main():
 
     # Thresholds on the pooled validation weeks (same rule as the baseline).
     metrics = {"task": args.task, "seed": args.seed, "lr": args.lr, "best_epoch": best_epoch,
-               "history_days": hist, "n_user_features": len(feats), "per_label": {}, "validation": []}
+               "history_days": hist, "n_user_features": len(feats), "per_label": {}, "validation": [],
+               "relative_features": args.relative_features, "push_share": args.push_share, "push_share_used": {}}
     metrics["graph_structure"] = args.graph_structure
     if args.graph_structure == "user-repo":
         metrics.update(time_enc=args.time_enc, time_dim=time_dim)
@@ -1428,16 +1459,69 @@ def main():
     if args.holdout and not scored:
         ap.error("--holdout scores the non-push activities: add at least one to --actions")
 
-    def decide(q, seg, k):
-        """Decision rule carried to a new week: the validation share of predicted positives (one
-        share per segment with --segment, since each segment model has its own probability scale)."""
+    def decide(q, seg, k, w, rows):
+        """Decision rule carried to a new week w (q = predictions of the rows `rows` of tables[w]): the
+        validation share of predicted positives (one share per segment with --segment, since each segment
+        model has its own probability scale). Push with --push-share prev-week: the share of the same rows
+        seen pushing in the 7 days of push data before w."""
         pred = np.zeros(len(q), bool)
-        parts = [(seg == s, seg_rates[k].get(name, rates[k])) for s, name in enumerate(SEGMENTS)] if split \
-            else [(np.ones(len(q), bool), rates[k])]
+        masks = [seg == s for s in range(len(SEGMENTS))] if split else [np.ones(len(q), bool)]
+        if k == "push" and args.push_share == "prev-week":
+            parts = [(ms, observed_push_share(w, rows[ms])) for ms in masks]
+            metrics["push_share_used"][str(w)] = [round(sh, 4) for _, sh in parts]
+            print(f"--push-share prev-week, week {str(w)[:10]}: push predicted for "
+                  + ", ".join(f"{sh:.3f}" for _, sh in parts) + " of users")
+        elif split:
+            parts = [(ms, seg_rates[k].get(name, rates[k])) for ms, name in zip(masks, SEGMENTS)]
+        else:
+            parts = [(masks[0], rates[k])]
         for ms, share in parts:
             if ms.any() and share > 0:
                 pred[ms] = q[ms] >= np.quantile(q[ms], 1 - share)
         return pred
+
+    def holdout_push(m, q, hp):
+        """6-activity official score of the holdout week with push decided by each rule (the non-push
+        predictions hp as scored): tune = the validation share (tune_proxy when the tune week has no push
+        labels: the best-F1 share of the latest push-labelled week before it, a training week), prev_week
+        (--push-share prev-week), none, and the best share in hindsight. Push is pooled over segments."""
+        t = tables[HOLDOUT]
+        col = "y_raw_push" if "y_raw_push" in t else "y_push"
+        y = t[col].values[m]
+        if np.isnan(y).all():
+            return None
+        y = np.nan_to_num(y)
+        qp = q[:, labels.index("push")]
+        gids = cohort.github_user_id.values[t.cidx.values[m]]
+        truth = base.to_output(gids, {**{k: np.nan_to_num(t[f"y_{k}"].values[m]) for k in NONPUSH}, "push": y})
+
+        def top(share):
+            return qp >= np.quantile(qp, 1 - share) if share > 0 else np.zeros(len(qp), bool)
+
+        def score(share):
+            r = base.scores(base.to_output(gids, {**hp, "push": top(share)}), truth)
+            return {"share": round(float(share), 4), "score": r["score"], "push_f1": r["per_event"]["push"],
+                    "macro_f1": r["macro_f1"], "micro_f1": r["micro_f1"]}
+
+        out = {"truth": col, "push_pos_rate": float(y.mean())}
+        if "push" in rates:
+            out["tune"] = score(rates["push"])
+        else:
+            lw = [w for w in weeks if w < HOLDOUT_TUNE and not np.isnan(tables[w]["y_push"].values).all()]
+            if lw:
+                w = lw[-1]
+                mw = tables[w].eligible.values & ~np.isnan(tables[w]["y_push"].values)
+                pw = predict_week(model, w)[mw, labels.index("push")]
+                thr, _ = base.best_threshold(tables[w]["y_push"].values[mw], pw)
+                out["tune_proxy"] = {**score(float((pw >= thr).mean())), "week": str(w)}
+        out["prev_week"] = score(observed_push_share(HOLDOUT, np.flatnonzero(m)))
+        out["none"] = score(0.0)
+        out["best_in_hindsight"] = max((score(s) for s in np.linspace(0.005, 1, 200)), key=lambda r: r["score"])
+        print(f"HOLDOUT_PUSH {str(HOLDOUT)[:10]} (6 activities, push from {col}, positive rate "
+              f"{out['push_pos_rate']:.3f}): " + "  ".join(
+                  f"{k} {100 * v['score']:.2f} (share {v['share']:.3f}, push F1 {v['push_f1']:.3f})"
+                  for k, v in out.items() if isinstance(v, dict)))
+        return out
 
     def with_prev_week(w, pred):
         """--quiet-rule prev-week: the quiet eligible rows of week w take the labels of week w - 7 days."""
@@ -1528,10 +1612,12 @@ def main():
             hp = {}
             for k in scored:
                 hp[k] = np.zeros(len(q), bool)
-                hp[k][act] = decide(q[act, labels.index(k)], None, k)
+                hp[k][act] = decide(q[act, labels.index(k)], None, k, HOLDOUT, np.flatnonzero(m)[act])
         else:
-            hp = {k: decide(q[:, labels.index(k)], seg, k) for k in scored}
+            hp = {k: decide(q[:, labels.index(k)], seg, k, HOLDOUT, np.flatnonzero(m)) for k in scored}
         metrics["holdout"] = week_result(HOLDOUT, hp, "HOLDOUT")
+        if args.task == "all" and not qprev:
+            metrics["holdout_push"] = holdout_push(m, q, hp)
         (out_dir / "metrics.json").write_text(json.dumps(metrics, indent=2, default=str))
         print(f"wrote {out_dir / 'metrics.json'} (--holdout: no final model, no output csv)")
     else:
@@ -1547,7 +1633,7 @@ def main():
             print("test users per segment: " + ", ".join(f"{name} {(test_seg == s).sum()}"
                                                           for s, name in enumerate(SEGMENTS)))
         for j, k in enumerate(labels):
-            out[k] = decide(p[cidx, j], test_seg, k).astype(int)
+            out[k] = decide(p[cidx, j], test_seg, k, base.TEST_START, cidx).astype(int)
         name = "output.csv" if args.task == "all" else f"{args.task}.csv"
         out.to_csv(out_dir / name, index=False)
         (out_dir / "metrics.json").write_text(json.dumps(metrics, indent=2, default=str))

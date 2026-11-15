@@ -258,7 +258,9 @@ Caveats:
 - Only 2 holdout weeks are scored, and the decision rule is set on 1 week.
 - These scores (5 activities, holdout not used for tuning) are not comparable with the 6-activity
   validation scores elsewhere in this README.
-- Neither `relative` nor the push rule is in `experiments/baseline/run.py` yet.
+- Neither `relative` nor the push rule is in `experiments/baseline/run.py` yet. Both are flags of the
+  GNN runner. For the GNN, the push rule helps (+6.0 on 11-07) and `relative` does not (see
+  "The LightGBM missing-data fixes in the GNN").
 - LightGBM runs with `--threads 8` (default). With all 28 cores it was ~170× slower under WSL
   (100 rounds: 187 s against 1.1 s).
 
@@ -536,7 +538,49 @@ bash script_chain_ho0927.sh   # relgt_chain on GPU 0, gnn_chain on GPU 1, seeds 
 SEQUENTIAL=1 bash script_chain_ho0927.sh   # both on GPU 0, one after another (less RAM)
 ```
 
-**Results**: TODO.
+**Results** (3 seeds, runs `relgt_chain_ho0926_s0-2` and `gnn_chain_ho0926_s0-2`, the same 6,064
+users, 6-activity score; the last four rows are the table above):
+
+| Model | Run | Holdout score, mean (min–max) | Macro / micro F1 | Best epoch |
+|---|---|---|---|---|
+| RelGT chain, final model | `relgt_chain` | **53.12** (52.72–53.59) | 47.97 / 58.28 | 11, 8, 8 |
+| RelGT chain, validation model | `relgt_chain` | 52.01 (51.32–52.80) | 46.28 / 57.74 | 11, 8, 8 |
+| GNN chain | `gnn_chain` | 52.48 (51.90–52.94) | 47.38 / 57.57 | 1, 1, 1 |
+| Ego GNN + user features | `all_ego_uf` | 53.02 (52.42–53.35) | 47.79 / 58.25 | 1, 1, 1 |
+| Temporal hetero GNN | `het` | 52.77 (52.21–53.69) | 48.28 / 57.26 | 17, 6, 16 |
+| Hetero, time embedding off | `het_notime` | 52.34 (51.96–52.84) | 47.24 / 57.44 | 5, 12, 5 |
+| User–repo GNN | `user_repo` | 52.29 (52.07–52.47) | 47.32 / 57.25 | 13, 12, 5 |
+
+Mean holdout F1 per activity:
+
+| Activity | relgt final | relgt validation | gnn_chain | all_ego_uf | het | het_notime | user_repo |
+|---|---|---|---|---|---|---|---|
+| open_pr | 0.395 | 0.373 | 0.434 | **0.436** | 0.411 | 0.405 | 0.417 |
+| open_issue | **0.470** | 0.442 | 0.416 | 0.415 | 0.445 | 0.445 | 0.435 |
+| issue_comment | 0.407 | 0.360 | 0.392 | 0.417 | **0.425** | 0.395 | 0.403 |
+| pr_review | 0.481 | 0.470 | 0.475 | 0.474 | **0.486** | 0.456 | 0.467 |
+| pr_review_comment | 0.442 | 0.454 | 0.453 | 0.448 | **0.461** | 0.458 | 0.447 |
+| push | **0.683** | 0.678 | 0.674 | 0.678 | 0.669 | 0.675 | 0.670 |
+
+**Result: the chain graph does not beat the other graphs on this week.**
+- The RelGT final model has the highest mean (53.12), but it is only 0.10 above `all_ego_uf` (53.02),
+  and the seed ranges overlap. Leaving out the RelGT validation model, the seven means span 0.83 points
+  (52.29–53.12). The seed spreads are 0.4–1.5 points, so no ranking is supported.
+- `gnn_chain` (52.48) is in the middle of the GNN results. Like `all_ego_uf`, it stops after epoch 1
+  on every seed. Its per-activity F1 is close to `all_ego_uf`'s (open_pr 0.434 against 0.436). Only
+  issue_comment is lower (0.392 against 0.417).
+- The RelGT final model scores 1.11 above its validation model, and it is ahead on every seed (+0.79,
+  +1.15, +1.40). It has two differences: it is trained on one more week (through 09-26), and it
+  reuses the share of predicted positives instead of the thresholds. These runs cannot tell which
+  one helps. Most of the gain is on issue_comment (0.360 → 0.407), open_issue (0.442 → 0.470) and
+  open_pr (0.373 → 0.395). pr_review_comment falls (0.454 → 0.442).
+- The GNN holdout uses the validation model's training weeks and the final model's decision rule.
+  `gnn_chain` (52.48) falls between the two RelGT scores, as expected.
+- The validation model chooses its threshold rule on the tune week, one choice per seed: joint
+  thresholds on seeds 0 and 1, per-label F1 thresholds on seed 2.
+- Push F1 is again 0.669–0.683 for every model, so the models differ only on the other 5 activities.
+  RelGT has the best open_issue F1 of all models (0.470) and the lowest open_pr F1 (0.373–0.395).
+- One holdout week, 3 seeds.
 
 #### Quiet users copy their previous week (`--quiet-rule prev-week`, `script_qprev_ho0927.sh`)
 
@@ -607,6 +651,88 @@ copy their previous week, so the score covers all 6,064 users.
   and pr_review_comment (0.445 → 0.423); only push gains (0.699 → 0.714).
 - So the ≥ 5 filter makes the old backtest's numbers look higher, but it does not help when every
   user is scored. On the full user set, ≥ 1 event (or the model for everyone) is the better split.
+
+### The LightGBM missing-data fixes in the GNN (`--relative-features`, `--push-share prev-week`)
+
+The two fixes that worked for LightGBM in the missing-data experiment, ported to `experiments/gnn/run.py`
+as opt-in flags (defaults unchanged: a default run gives the same scores as before):
+- `--relative-features`: the user features become the `relative` set of `experiments/missing_data/run.py`.
+  Each count is divided by the cohort mean of the same week, and the log of the cohort totals of the 7- and
+  30-day counts is added (60 → 74 features). The code is shared through
+  `experiments/baseline/run.py` (`relative_features`). It works for every graph structure. The ego tokens keep their raw counts.
+- `--push-share prev-week`: push is predicted for the share of users with a push in the last 7 days of
+  raw push data before the week (not cut at 10-27), instead of the validation share. For the test week
+  this is 11-07 → 11-14: 5.5% of the test users, against ~47% with the validation share.
+- Every `--holdout` run now also writes `holdout_push` to `metrics.json` (the `HOLDOUT_PUSH` line in the
+  log): the 6-activity score with push decided by each rule, the non-push predictions unchanged. Week
+  11-07 has no push labels in the pipeline (push data ends 10-27), so it uses the raw push rows to the end
+  of the data (positive rate 5.2%). The rules: `tune` is the validation share. Week 11-07's tune week has
+  no push labels, so `tune_proxy` stands in for it: the best-F1 share on 10-17, the last week with push labels
+  (a training week). `prev_week` is the new rule. `none` predicts nobody, and `best_in_hindsight` is the best
+  share chosen with the labels.
+
+```bash
+GPU=0 HO_WEEK="2026-09-26 16:00" CONFIGS="all_ego_uf all_ego_uf_rel" bash script_ho0927.sh
+GPU=1 HO_WEEK="2026-11-07 16:00" CONFIGS="all_ego_uf all_ego_uf_rel" bash script_ho0927.sh
+```
+
+The `*_pprev` configs of `script_ho0927.sh` are not needed for these numbers: a run's
+`holdout_push.prev_week` uses the same model as its `--push-share prev-week` twin.
+
+**Relative features** (3 seeds, `holdout` score; 09-26: 6 activities, 11-07: 5 activities):
+
+| Week | `all_ego_uf` | `all_ego_uf_rel` | Change |
+|---|---|---|---|
+| 09-26 (push capture 30–60%) | 52.98 (52.39–53.33) | 53.06 (52.85–53.47) | +0.08 |
+| 11-07 (non-push ~12–20%) | **38.58** (38.36–38.90) | 37.13 (35.72–38.04) | **−1.45** |
+
+Mean F1 per activity on 11-07:
+
+| Activity | `all_ego_uf` | `all_ego_uf_rel` |
+|---|---|---|
+| open_pr | 0.380 | 0.386 |
+| open_issue | 0.409 | 0.411 |
+| issue_comment | **0.382** | 0.344 |
+| pr_review | 0.393 | 0.405 |
+| pr_review_comment | **0.361** | 0.294 |
+
+**Result: the relative features do not carry over to the GNN.**
+- They tie on 09-26 (+0.08, the ranges overlap) and lose 1.45 on 11-07, with a wider seed spread
+  (2.3 points against 0.5).
+- The loss on 11-07 is on issue_comment (−0.038) and pr_review_comment (−0.067). It is the opposite of
+  LightGBM, where most of the gain was on pr_review_comment and pr_review. pr_review (+0.012) and the two
+  opening activities change little.
+- The model with relative features trains for 2–3 epochs instead of 1–2.
+- The ego tokens still carry raw counts, so the model sees both scales. These runs do not show why the
+  features hurt here.
+- 3 seeds, one week each. The `all_ego_uf` reruns are within the noise of the earlier runs: 52.98 against
+  53.02 on 09-26, and 38.58 against 38.80 for the `_ho` runs of 11-07.
+
+**Push rule** (6-activity score, mean of 3 seeds, the same models; share = users predicted to push):
+
+| Rule | 09-26, `all_ego_uf` | 09-26, `_rel` | 11-07, `all_ego_uf` | 11-07, `_rel` |
+|---|---|---|---|---|
+| Validation share (`tune`; 11-07: `tune_proxy`) | **52.98** (51.4%) | **53.06** (47.2%) | 31.75 (43.2%) | 31.48 (38.3%) |
+| Last 7 days of push data (`prev_week`) | 51.60 (39.2%) | 52.19 (39.2%) | **37.73** (5.7%) | **36.26** (5.7%) |
+| Nobody (`none`) | 31.33 | 31.81 | 33.43 | 32.20 |
+| Best share in hindsight | 53.20 (60.2%) | 53.57 (58.8%) | 37.80 (4.3%) | 36.59 (8.7%) |
+
+Push positive rate: 41.8% on 09-26, 5.2% on 11-07.
+
+**Result: on week 11-07 the prev-week rule is worth +6.0 points and matches the best share in hindsight.**
+- On 11-07, predicting push for the validation share (43%) scores below predicting it for nobody
+  (31.75 against 33.43). The prev-week rule (37.73, push F1 0.338) is 0.07 below the best share in
+  hindsight. This matches LightGBM (~29 → ~35).
+- On 09-26 it costs 1.38 points (−0.87 with relative features). There push was common, and the best share
+  (~60%) is about 1.5× last week's push rate (39%). On 11-07 the best share (4–9%) is about the same as
+  the rate (5.7%). So scaling the rate up would only help when push is common.
+- The test week looks like 11-07: push has been at ~1–7% of its usual volume since 10-27. **For the
+  submission, use `--push-share prev-week`.** If GH Archive's push capture recovers before the test week,
+  the validation share would be better again.
+- One week per regime, 3 seeds. The `tune_proxy` share is taken on a training week, so it only
+  approximates what the final pipeline does.
+
+**For the submission:** `python experiments/gnn/run.py --user-features --push-share prev-week`.
 
 ## Experiment: GNN (user–repo graph), all labels vs push only (`experiments/gnn/run.py --graph-structure user-repo`)
 

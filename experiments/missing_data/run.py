@@ -64,7 +64,7 @@ REF = (RECENT_START, TUNE + WEEK)  # recent weeks p is measured on, all before t
 # Re-measured on the GH Archive data (the baseline's GAPS describe the old course data).
 NEW_GAPS = {"nonpush": [("2026-06-01", "2026-09-18")],
             "push": [("2026-08-18", "2026-09-17"), ("2026-10-23", "2026-10-24")]}
-COUNT_KEYS = ("_cnt_", "_active_days_30d", "_repos_30d", "open_prs_now", "open_issues_now")
+COUNT_KEYS = B.COUNT_KEYS
 
 APPROACHES = {  # name: (thinned draws, feature view, week weighting)
     "baseline": (0, "base", None),
@@ -95,12 +95,9 @@ def week_starts(first, last):
 
 def add_views(df, base_feats):
     """Capture-independent versions of the count features, computed over all cohort users of the week."""
-    cnt = [c for c in base_feats if any(k in c for k in COUNT_KEYS)]
-    x = df[cnt].astype(float)
-    rel = x.div(x.mean().replace(0, np.nan)).fillna(0).add_prefix("rel_")
+    rel, vol = B.relative_views(df, base_feats)  # shared with experiments/gnn/run.py --relative-features
+    x = df[[c for c in base_feats if any(k in c for k in COUNT_KEYS)]].astype(float)
     rank = x.rank(pct=True).where(x > 0, 0).add_prefix("rank_")
-    vol = pd.DataFrame({f"vol_{c}": np.log1p(x[c].sum()) for c in cnt if c.endswith(("_cnt_7d", "_cnt_30d"))},
-                       index=df.index)
     return pd.concat([df, rel, rank, vol], axis=1)
 
 

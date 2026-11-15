@@ -227,6 +227,31 @@ def build_week(s, ev, own, lags, data_end, n, with_labels=True):
     return df
 
 
+# Count-like features: their scale follows how much of the week GH Archive captured.
+COUNT_KEYS = ("_cnt_", "_active_days_30d", "_repos_30d", "open_prs_now", "open_issues_now")
+
+
+def relative_views(df, feats):
+    """Capture-independent views of the count features of one week's table (all cohort rows of the week).
+
+    rel_<c> = c / cohort mean of c in that week; vol_<c> = log1p(cohort total of c) for the 7d / 30d counts.
+    Returns (rel, vol) DataFrames on df's index."""
+    cnt = [c for c in feats if any(k in c for k in COUNT_KEYS)]
+    x = df[cnt].astype(float)
+    rel = x.div(x.mean().replace(0, np.nan)).fillna(0).add_prefix("rel_")
+    vol = pd.DataFrame({f"vol_{c}": np.log1p(x[c].sum()) for c in cnt if c.endswith(("_cnt_7d", "_cnt_30d"))},
+                       index=df.index)
+    return rel, vol
+
+
+def relative_features(df, feats):
+    """The `relative` feature set of experiments/missing_data/run.py: non-count features, rel_ counts and
+    vol_ cohort volumes. Returns (df with the new columns, new feature list)."""
+    rel, vol = relative_views(df, feats)
+    other = [c for c in feats if not any(k in c for k in COUNT_KEYS)]
+    return pd.concat([df, rel, vol], axis=1), other + list(rel.columns) + list(vol.columns)
+
+
 def group_of(k):
     return "push" if k == "push" else "nonpush"
 
