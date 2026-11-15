@@ -640,7 +640,36 @@ against ~300k).
 bash script_h14.sh   # het_h14 and het_notime_h14 x seeds 0-2 under --holdout; summary next to het / het_notime
 ```
 
-**Results**: TODO.
+**Results** (holdout protocol, 3 seeds, runs `het_h14_ho_s0-2` and `het_notime_h14_ho_s0-2`):
+
+| Model | 90 days | 14 days | Change | Best epoch (14 days) |
+|---|---|---|---|---|
+| Temporal hetero GNN | **38.71** (37.98–39.59) | 36.01 (35.54–36.43) | -2.70 | 11, 6, 4 |
+| Same, time embedding off | 37.42 (36.90–37.78) | 36.67 (36.33–36.89) | -0.75 | 4, 6, 12 |
+
+Mean holdout F1 per activity:
+
+| Activity | het | het_h14 | het_notime | het_notime_h14 |
+|---|---|---|---|---|
+| open_pr | 0.380 | 0.357 | 0.371 | 0.350 |
+| open_issue | 0.432 | 0.403 | 0.418 | 0.405 |
+| issue_comment | 0.393 | 0.352 | 0.382 | 0.374 |
+| pr_review | 0.386 | 0.375 | 0.383 | 0.390 |
+| pr_review_comment | 0.335 | 0.290 | 0.303 | 0.300 |
+
+**Result: the 14-day window hurts, and it removes the benefit of the time embedding.**
+- The time embedding model loses 2.7 points (38.71 to 36.01), on every activity: most on
+  pr_review_comment (-0.045) and issue_comment (-0.041). The seed ranges do not overlap.
+- Without the embedding the loss is 0.75 points (37.42 to 36.67) and the ranges overlap, so
+  that drop is within the seed spread. pr_review even gains slightly (+0.007).
+- At 14 days the order flips: the model with time embedding scores 0.66 under the one without
+  (36.01 against 36.67, ranges overlapping, so no real difference). The 1.3-point gain at 90 days
+  disappears. A 14-day window leaves little age variation for the embedding to use, and the
+  longer history it exploited at 90 days is gone.
+- The extra history is useful, mainly to the model that can place it in time. A shorter window
+  gives no gain and no cheaper way to match the 90-day score, although the graph is about 4x
+  smaller.
+- Best epochs are early and uneven (4-12). One holdout week, 3 seeds.
 
 ## Experiment: ego GNN with the hetero model's time encoding (`--ego-time func`)
 
