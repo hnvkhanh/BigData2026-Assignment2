@@ -538,6 +538,76 @@ SEQUENTIAL=1 bash script_chain_ho0927.sh   # both on GPU 0, one after another (l
 
 **Results**: TODO.
 
+#### Quiet users copy their previous week (`--quiet-rule prev-week`, `script_qprev_ho0927.sh`)
+
+```bash
+bash script_qprev_ho0927.sh                         # active = >= 5 events (old experiment's rule), seeds 0-2 -> outputs/ego_uf_qprev5_ho0926_s*
+CONFIGS="ego_uf_qprev" bash script_qprev_ho0927.sh  # active = >= 1 event -> outputs/ego_uf_qprev_ho0926_s*
+```
+
+The `all_ego_uf` GNN predicts almost nothing for quiet users. A user is quiet when they have no
+visible activity in the 14-day ego window, the same split as `--segment activity`. On this week
+2,822 of the 6,064 users are quiet, and their mean F1 is 0.025. Here the two groups are predicted
+in different ways:
+- **Active users (3,242):** one ego GNN with user features is trained, early-stopped and tuned on
+  active examples only. The share of active users predicted positive in the tune week (09-20 →
+  09-27) is applied to the active users of the holdout week.
+- **Quiet users:** the prediction is what the user really did in the previous week (labels of
+  09-20 → 09-27; in the tune week, labels of 09-13 → 09-20).
+
+The predictions of both groups are joined and scored once over all 6,064 users with the official
+scorer: score = (macro-F1 + micro-F1) / 2 over the 6 activities. The F1 for quiet and active users
+(`holdout.per_segment` in `metrics.json`) shows where the gains come from. It is not part of the
+score.
+
+**The previous week is not visible in the test week.** Non-push data lags about 7 days and push
+about 26, so the run needs `--holdout`. Its score is an upper bound for this rule, and the rule
+cannot be used for the submission.
+
+**Results** (3 seeds, 6,064 users, 6-activity score; mean F1 per activity):
+
+| Run | Score, mean (min–max) | open_pr | open_issue | issue_comment | pr_review | pr_review_comment | push | F1 quiet | F1 active |
+|---|---|---|---|---|---|---|---|---|---|
+| `all_ego_uf` (model for everyone) | 53.02 (52.42–53.35) | **0.436** | 0.415 | 0.417 | **0.474** | **0.448** | 0.678 | 0.025 | **0.505** |
+| `ego_uf_qprev` (quiet users copy the previous week) | **53.08** (52.63–53.70) | 0.388 | **0.423** | **0.418** | 0.448 | 0.445 | 0.699 | **0.226** | 0.493 |
+| `ego_uf_qprev5` (same, active = ≥ 5 events) | 52.25 (52.20–52.28) | 0.367 | 0.408 | 0.384 | 0.453 | 0.423 | **0.714** | 0.221 | 0.554 * |
+| Everyone copies the previous week (no model) | 50.00 | 0.394 | 0.411 | 0.385 | 0.369 | 0.360 | 0.697 | – | – |
+| Everyone copies the last 7 *visible* days (no model) | 42.86 | 0.381 | 0.404 | 0.418 | 0.461 | 0.427 | 0.457 | – | – |
+
+\* Over 1,508 active users, not 3,242; see below. Best epoch is 1 on every seed of the three GNN runs. The last two rows are deterministic rules,
+scored on the same week and users (macro / micro: 43.60 / 56.40 and 42.46 / 43.26).
+
+**Result: copying the previous week for quiet users does not raise the score** (53.08 against
+53.02; the seed ranges overlap).
+- Quiet users gain a lot: their mean F1 rises from 0.025 to 0.226. The copied week does best on
+  push (0.489 against 0.151) and worst on open_pr (0.146) and pr_review (0.114).
+- The model for active users gets worse: its mean F1 falls from 0.505 to 0.493. Most of the loss
+  is on open_pr (0.459 → 0.415) and pr_review (0.489 → 0.466), which cancels the quiet gain on
+  those two activities. Training on active examples only also changes the share of positives
+  tuned on the tune week: open_pr 0.077 → 0.103 of users, push 0.514 → 0.791. (The two shares are
+  taken over different user sets: all users against active users only.)
+- Even this upper bound only ties the plain model. A rule that the test week can use, such as
+  copying the last visible days, would do worse.
+- One holdout week, 3 seeds.
+
+**Closest match to the old GNN's user filter (`ego_uf_qprev5`, `--active-min-events 5`).** The
+old experiment (`old_experiments/relgt_inspired/data.py`, `eligible_only`) kept a user as an
+example only with ≥ 5 visible events in the 14-day lookback. It dropped everyone else from
+training, calibration and the backtest score. Here the same ≥ 5 rule picks the users of the GNN
+(119,532 training examples; on the holdout week 1,508 active, 4,556 quiet). The quiet users still
+copy their previous week, so the score covers all 6,064 users.
+- Score 52.25 (macro / micro 45.82 / 58.69), 0.8 below `ego_uf_qprev` (53.08) and `all_ego_uf`
+  (53.02). The seed range (52.20–52.28) is narrow and lies below both.
+- The active F1 of 0.554 is the number to compare with the old backtest, which scored only these
+  users. It does **not** mean a better model than the 0.493 of `ego_uf_qprev`: it is over the
+  1,508 most active users, whose labels are denser (positive rate 0.739 for push and 0.259 for
+  open_pr, against 0.603 and 0.158 over the 3,242 users with ≥ 1 event).
+- The 3,048 users with 1–4 events move from the model to the copy rule. Quiet F1 stays at 0.221
+  but now covers 4,556 users instead of 2,822. Overall F1 falls on issue_comment (0.418 → 0.384)
+  and pr_review_comment (0.445 → 0.423); only push gains (0.699 → 0.714).
+- So the ≥ 5 filter makes the old backtest's numbers look higher, but it does not help when every
+  user is scored. On the full user set, ≥ 1 event (or the model for everyone) is the better split.
+
 ## Experiment: GNN (user–repo graph), all labels vs push only (`experiments/gnn/run.py --graph-structure user-repo`)
 
 This was the default before the ego model. Every command in this section needs

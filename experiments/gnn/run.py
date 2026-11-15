@@ -711,6 +711,11 @@ def ego_stages(args, tables, feats, weeks, train_weeks, cohort, lags, test, labe
     def train(fit_weeks, epochs, val_weeks=None):
         """One model, or with --segment activity a {segment: model} dict and a {segment: best epoch}
         dict; epochs may then be such a dict too (the final retrain)."""
+        if args.quiet_rule == "prev-week":  # one model, trained and early-stopped on the active examples only
+            sub = {w: ids[w][seg[ids[w]] == 1] for w in ids}
+            print(f"--quiet-rule prev-week: model on {sum(len(sub[w]) for w in fit_weeks):,} active examples")
+            return train_batched(lambda: make_model(n_sx), batch, sub, fit_weeks, epochs, val_weeks, args.lr,
+                                 args.seed, args.batch_size, args.max_steps_per_epoch)
         if not split:
             return train_batched(lambda: make_model(n_sx), batch, ids, fit_weeks, epochs, val_weeks, args.lr,
                                  args.seed, args.batch_size, args.max_steps_per_epoch)
@@ -1178,6 +1183,10 @@ def main():
     eg.add_argument("--ego-dropout", type=float, default=0.1)
     eg.add_argument("--segment", choices=["none", "activity"], default="none",
                     help="activity: one model for quiet examples (no ego token) and one for active ones")
+    eg.add_argument("--quiet-rule", choices=["model", "prev-week"], default="model",
+                    help="prev-week (needs --holdout): the GNN is trained on and predicts the active examples "
+                         "only; a quiet user is predicted to do what they really did in the previous week "
+                         "(its labels, which the test week cannot see: an upper bound for that rule)")
     eg.add_argument("--active-min-events", type=int, default=1,
                     help="an example is active with >= N visible activity rows in the ego window "
                          "(default 1 = any token; 5 = the old experiment's selection)")
@@ -1246,11 +1255,15 @@ def main():
                     + ("_het" if het else "") + ("_notime" if het and args.het_time == "none" else "")
                     + (("_seg" + (str(args.active_min_events) if args.active_min_events != 1 else ""))
                        if ego and args.segment != "none" else "")
+                    + ("_qprev" if ego and args.quiet_rule == "prev-week" else "")
                     + (f"_lb{args.ego_lookback:g}" if ego and not hist and args.ego_lookback != 14 else "")
                     + ("_time" if time_dim else "") + (f"_h{hist}" if hist else "")
                     + (("_ho" + (args.holdout_week[5:10].replace("-", "") if args.holdout_week else ""))
                        if args.holdout else ""))
     PROGRESS["disable"] = args.no_progress
+    if ego and args.quiet_rule == "prev-week" and (not args.holdout or args.segment != "none"):
+        ap.error("--quiet-rule prev-week needs --holdout (the test week has no previous-week labels) "
+                 "and --segment none")
     if args.holdout_week and not args.holdout:
         ap.error("--holdout-week needs --holdout")
     if args.holdout:
@@ -1318,6 +1331,7 @@ def main():
              if c not in {"eligible", "cidx", "week"} and not c.startswith("y_")]
     segment_of = None  # ego only: segment of every row of a week (-1 no example, 0 quiet, 1 active)
     split = ego and args.segment != "none"
+    qprev = ego and args.quiet_rule == "prev-week"
     if ego:
         train, predict_week, segment_of = ego_stages(args, tables, feats, weeks, train_weeks, cohort, lags, test, labels, device,
                                          sel)
@@ -1374,6 +1388,7 @@ def main():
     if args.graph_structure == "user-repo":
         metrics.update(time_enc=args.time_enc, time_dim=time_dim)
     if ego:
+        metrics["quiet_rule"] = args.quiet_rule
         metrics["segment"] = args.segment
         metrics["active_min_events"] = args.active_min_events
     if het:
@@ -1387,6 +1402,8 @@ def main():
         ys, ps, ss = [], [], []
         for w in val_weeks:
             m = tables[w].eligible.values & ~np.isnan(tables[w][f"y_{k}"].values)
+            if qprev:
+                m &= segment_of(w) == 1  # thresholds and shares of the active model, on active users
             ys.append(tables[w][f"y_{k}"].values[m])
             ps.append(val_p[w][m, j])
             if segment_of is not None:
@@ -1422,11 +1439,26 @@ def main():
                 pred[ms] = q[ms] >= np.quantile(q[ms], 1 - share)
         return pred
 
+    def with_prev_week(w, pred):
+        """--quiet-rule prev-week: the quiet eligible rows of week w take the labels of week w - 7 days."""
+        t, m = tables[w], tables[w].eligible.values
+        prev = tables[w - WEEK]
+        pos = pd.Series(np.arange(len(prev)), index=prev.cidx.values).loc[t.cidx.values[m]].values
+        quiet = segment_of(w)[m] == 0
+        out = {}
+        for k, v in pred.items():
+            yp = prev[f"y_{k}"].values[pos]
+            assert not np.isnan(yp[quiet]).any(), f"week {str(w - WEEK)[:10]} has no {k} labels"
+            out[k] = np.where(quiet, yp == 1, v)
+        return out
+
     def week_result(w, pred, tag):
         """F1 per scored label, official score over them (6-activity runs) and per-segment F1 of week
         w; pred = {label: bool array over the eligible rows of the week}."""
         t = tables[w]
         m = t.eligible.values
+        if qprev:
+            pred = with_prev_week(w, pred)
         f1 = {}
         for k in scored:
             y = t[f"y_{k}"].values[m]
@@ -1491,8 +1523,15 @@ def main():
         metrics["holdout_protocol"] = {"train_last": str(train_weeks[-1]), "tune": str(HOLDOUT_TUNE),
                                        "holdout": str(HOLDOUT), "scored": scored,
                                        "label_end": str(min(data_end[k] for k in scored))}
-        metrics["holdout"] = week_result(HOLDOUT, {k: decide(q[:, labels.index(k)], seg, k) for k in scored},
-                                         "HOLDOUT")
+        if qprev:  # the tune week's share of active users predicted positive, applied to the active users
+            act = seg == 1
+            hp = {}
+            for k in scored:
+                hp[k] = np.zeros(len(q), bool)
+                hp[k][act] = decide(q[act, labels.index(k)], None, k)
+        else:
+            hp = {k: decide(q[:, labels.index(k)], seg, k) for k in scored}
+        metrics["holdout"] = week_result(HOLDOUT, hp, "HOLDOUT")
         (out_dir / "metrics.json").write_text(json.dumps(metrics, indent=2, default=str))
         print(f"wrote {out_dir / 'metrics.json'} (--holdout: no final model, no output csv)")
     else:
