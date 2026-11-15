@@ -481,7 +481,41 @@ bash script_ho0927.sh   # het, het_notime, all_ego_uf, user_repo x seeds 0-2 -> 
 ```
 
 Not comparable with the 11-07 holdout: a different week, push included, and the non-push activities
-were then at ~10-30% of their usual volume. **Results**: TODO.
+were then at ~10-30% of their usual volume.
+
+**Results** (3 seeds, runs `<cfg>_ho0926_s0-2`, 6,064 eligible users, 6-activity score):
+
+| Model | Run | Holdout score, mean (min–max) | Best epoch |
+|---|---|---|---|
+| Ego GNN + user features | `all_ego_uf` | **53.02** (52.42–53.35) | 1, 1, 1 |
+| Temporal hetero GNN | `het` | 52.77 (52.21–53.69) | 17, 6, 16 |
+| Hetero, time embedding off | `het_notime` | 52.34 (51.96–52.84) | 5, 12, 5 |
+| User–repo GNN | `user_repo` | 52.29 (52.07–52.47) | 13, 12, 5 |
+
+Mean holdout F1 per activity:
+
+| Activity | all_ego_uf | het | het_notime | user_repo |
+|---|---|---|---|---|
+| open_pr | **0.436** | 0.411 | 0.405 | 0.417 |
+| open_issue | 0.415 | **0.445** | **0.445** | 0.435 |
+| issue_comment | 0.417 | **0.425** | 0.395 | 0.403 |
+| pr_review | 0.474 | **0.486** | 0.456 | 0.467 |
+| pr_review_comment | 0.448 | **0.461** | 0.458 | 0.447 |
+| push | **0.678** | 0.669 | 0.675 | 0.670 |
+
+**Result: the four models are tied on this week.**
+- The means span 0.73 points (52.29–53.02), and the seed ranges overlap. The seed spread of each
+  model is 0.4–1.5 points, so no ranking is supported.
+- The time embedding of the hetero GNN is worth +0.43 here (52.77 against 52.34), against +1.3 on
+  week 11-07; the ranges overlap. The 11-07 gain does not show clearly on this week.
+- Push F1 is 0.669–0.678 for every model, so the push part of the score is the same everywhere.
+  The models differ only on the 5 other activities. The hetero model with time embedding has the
+  lowest push F1 (0.669) and the best on pr_review (0.486), issue_comment and pr_review_comment.
+- The ego model with user features stops after epoch 1 on every seed and is as good as models
+  that train for 5–17 epochs.
+- The scores are 14–15 points above the 11-07 holdout (38–39), mainly because push (F1 ~0.67)
+  now counts and the activities are less thin. They are not comparable with the 5-activity tables.
+- One holdout week, 3 seeds.
 
 ## Experiment: GNN (user–repo graph), all labels vs push only (`experiments/gnn/run.py --graph-structure user-repo`)
 
