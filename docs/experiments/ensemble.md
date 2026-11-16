@@ -132,7 +132,7 @@ pr_review, pr_review_comment <- relgt_chain_hist; push <- relgt_chain. The offic
   F1 falls from about 0.68 to 0.65-0.67. Against single runs under the same rule (all_ego_uf 51.98, het 51.89
   by `summarize_runs.py`), the ensemble `mean` (53.08) and `bag:relgt_chain` (53.73) are about 1-2 points
   higher, in line with the tune-rule comparison.
-- Conclusion: nothing here justifies changing the README results table. The ensemble gain is at most about
+- Conclusion: nothing here justifies changing the WRITEUP.md results table. The ensemble gain is at most about
   1 point, supported only for bagging RelGT seeds, and not measured on a second week.
 
 ### RelGT-only ensemble (chain / fk graph, with and without `recent`)
@@ -180,7 +180,7 @@ Reading:
   the holdout; the tune week ranks the bags wrongly (chain has the lowest tune score of the three good bags and
   the highest holdout score).
 - Conclusion: among the RelGT variants only fk without `recent` is worse; chain, chain_recent and fk_recent
-  tie at 54.1-54.4 as bags. No change to the README table.
+  tie at 54.1-54.4 as bags. No change to the WRITEUP.md table.
 
 ## Current stage (2026-11-16)
 
@@ -197,7 +197,7 @@ Not done:
   retraining (`HO_WEEK="<UTC start of scored week>" bash runs/ensemble_ho0927.sh`, ~2.5 h on two GPUs; for the
   bagging check alone `CONFIGS="relgt_chain" QUEUE_A="relgt_chain" QUEUE_B=""`, ~30 min a seed). The week
   still has to be chosen and checked for enough labelled data and outage handling.
-- The README results table and the submission pipeline are unchanged: they do not use seed bagging or an
+- The WRITEUP.md results table and the submission pipeline are unchanged: they do not use seed bagging or an
   ensemble.
 - `all_ego_uf_ens0926_s0` was retrained by mistake (see the provenance note), so the original `s0` numbers
   are gone; the `ens0926_full.log` figures differ slightly from the tables.
