@@ -71,28 +71,56 @@ it writes `experiments/ensemble/outputs/<members>_ens0926/metrics.json`. It need
 `relgt_chain_ens0926_s0-2` from `bash runs/ensemble_ho0927.sh` (or `CONFIGS="relgt_chain" QUEUE_A="relgt_chain"
 QUEUE_B="" bash runs/ensemble_ho0927.sh`, ~30 min per seed) if you want that comparison.
 
-## 4. Predict the test week (2026-11-22 to 11-29 Taiwan time)
+## 4. Predict the test week with the best model (seed bag)
 
-Train on every labelled week, with no holdout, and write the submission file:
+The best model is the **seed bag**: three RelGT runs (seeds 0-2) of the same config, averaged. On the holdout
+week the bag of `relgt_chain_recent` scores 54.06 against 53.36 for the mean of its single seeds.
 
-```bash
-python experiments/relgt/run.py --graph-structure chain --chain-seed latest --num-seeds 16 --fk-order recent \
-    --epochs 15 --holdout-weeks 0 --seed 0 --name relgt_chain_recent_test
+**Step 1: train one final model per seed** on every labelled week (no holdout). Each run writes `output.csv`
+(that seed alone) and `test.npz` (its test-week probabilities and validation share of positives):
+
+```powershell
+foreach ($s in 0,1,2) {
+  python experiments/relgt/run.py --graph-structure chain --chain-seed latest --num-seeds 16 --fk-order recent `
+      --epochs 15 --holdout-weeks 0 --seed $s --name relgt_chain_recent_test_s$s
+}
 ```
 
-The predictions are `experiments/relgt/outputs/relgt_chain_recent_test/output.csv` (one row per user of
-`assignment2/submission/test_input.csv`, six 0/1 columns). The share of users predicted positive per activity
-comes from the validation weeks (the last 3 labelled weeks by default; `--val-weeks`, `--val-start`/`--val-end`
-change that). Check it:
+```bash
+for s in 0 1 2; do
+  python experiments/relgt/run.py --graph-structure chain --chain-seed latest --num-seeds 16 --fk-order recent \
+      --epochs 15 --holdout-weeks 0 --seed $s --name relgt_chain_recent_test_s$s
+done
+```
+
+About 30 min per seed (see section 1). Seeds can run on different GPUs at once with `CUDA_VISIBLE_DEVICES=<i>`.
+The share of users predicted positive per activity comes from the validation weeks (the last 3 labelled
+weeks by default; `--val-weeks`, `--val-start`/`--val-end` change that).
+
+**Step 2: bag the seeds** into one submission:
 
 ```bash
-python assignment2/scripts/evaluate.py --pred experiments/relgt/outputs/relgt_chain_recent_test/output.csv \
+python experiments/relgt/bag_submit.py relgt_chain_recent_test_s0 relgt_chain_recent_test_s1 \
+    relgt_chain_recent_test_s2 --name relgt_chain_recent_bag
+```
+
+Per activity it ranks each seed's probabilities, averages the ranks over the seeds, and predicts positive for
+the top share of users, the share being the mean of the seeds' validation shares. This is the bag of
+`experiments/ensemble/run.py` (rank averaging), except that the share is the mean of the per-seed shares
+instead of being re-tuned on the bag's own tune week, which `test.npz` does not carry.
+
+**Step 3: check and submit.** The file is `experiments/relgt/outputs/relgt_chain_recent_bag/output.csv` (one
+row per user of `assignment2/submission/test_input.csv`, six 0/1 columns). Rename it to
+`output_{studentID}.csv` and check the format:
+
+```bash
+python assignment2/scripts/evaluate.py --pred experiments/relgt/outputs/relgt_chain_recent_bag/output.csv \
     --input assignment2/submission/test_input.csv
 ```
 
-`evaluate.py` only checks the format here: the test labels do not exist yet. Note that the submission
-pipeline does not bag seeds; the seed-bag result (54.06 on the holdout week) needs the `holdout.npz` files of
-several runs and the ensemble script, which are holdout tools.
+`evaluate.py` only checks the format here: the test labels do not exist yet. A single run's `output.csv`
+(step 1) is a valid submission too, but it is the weaker, unbagged model. The 54.06 above is a holdout-week
+result of the ensemble script; the submission bag has not been scored on a holdout week.
 
 ## 5. Troubleshooting
 

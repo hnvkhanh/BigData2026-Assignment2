@@ -1495,6 +1495,10 @@ def main():
             continue
         out[k] = (p[:, j] >= np.quantile(p[:, j], 1 - rates[k])).astype(int)
     out.to_csv(out_dir / "output.csv", index=False)
+    # Test-week probabilities of the final model and the validation share of positives per label, so that
+    # experiments/relgt/bag_submit.py can bag several seeds into one submission.
+    np.savez(out_dir / "test.npz", user_id=test.UserID.values, prob=p[:, :len(EVENT_COLS)].astype(np.float32),
+             rates=np.array([rates[k] for k in EVENT_COLS]), labels=np.array(EVENT_COLS))
     if dump:
         np.savez(out_dir / "holdout.npz", **dump)
     (out_dir / "metrics.json").write_text(json.dumps(metrics, indent=2, default=str))
