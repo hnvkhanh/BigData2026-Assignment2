@@ -56,7 +56,13 @@ with the objects and the events kept (TemporalHeteroGNN, TGAT-style):
     a learned cos(w log(1 + age) + b) encoding (--het-time-dim), part of the message and of the
     attention score; messages are softmax-attention weighted per relation and node.
 --het-time none feeds zeros instead (same architecture): the ablation of the time embedding.
-Results go to outputs/<task>_het[_notime]/.
+--het-graph event (hetero_event_graph) makes every kept event a node, so events can link to each other:
+user -> event -> PR / issue / repo, "next" from each event of a user to its next one (the order of
+actions, the gap as edge age), review comment -> its review, review comment -> the comment it answers,
+issue comment on a PR -> the PR node, push -> the PR it likely updates (masked branch match), and
+"received" from another user's event on my PR / issue straight to me. 4 layers by default (user ->
+event -> object -> event -> other user). Issue -> fixing PR cannot be linked: PR texts are masked.
+Results go to outputs/<task>_het[_ev][_l<layers>][_notime]/.
 
 --graph-structure chain replaces that graph by the relational entity graph of experiments/relgt:
 every row a node, a user linked to its latest visible row of each table, a row to the previous and
@@ -388,22 +394,35 @@ def load_entity_events(cohort):
     Per EVENT_COLS key: uid (cohort index), t, avail (as in base.load), repo, entity (global id:
     1 + PRs | issues | repositories, the old EntityVocabulary) and entity_avail (first_seen_at of that
     PR / issue / repository). Node type 1 = PR, 2 = issue, 3 = repository.
+
+    Link columns, used by --het-graph event (-1 / NaT when there is no link):
+      * owner (all but push): cohort index of the author of the PR / issue acted on;
+      * issue_comment: pr, pr_avail: the PR entity when the issue is a PR (Issues.pull_request_id);
+      * pr_review: rid (review_id); pr_review_comment: rid (pull_request_review_id, the review it
+        belongs to), cid (comment_id) and reply (in_reply_to_id, the comment it answers);
+      * push: pr, pr_avail: the PR the push most likely updates. Text is masked in the data, so this is
+        a heuristic: a same-repository PR by the pusher whose (masked) head branch equals the pushed
+        branch and that is open at the push (created at most 2 days after it, not closed before it);
+        of several, the one created closest to the push.
     """
     db = base.DB
     users = pd.read_parquet(db / "Users.parquet", columns=["user_id", "is_cohort"])
     to_cidx = np.full(len(users), -1, np.int64)
     to_cidx[cohort.user_id.values] = np.arange(len(cohort))
     prs = pd.read_parquet(db / "PullRequests.parquet",
-                          columns=["pr_id", "repo_id", "author_id", "created_at", "first_seen_at"])
+                          columns=["pr_id", "repo_id", "author_id", "created_at", "first_seen_at", "closed_at",
+                                   "head_ref", "is_cross_repo"])
     issues = pd.read_parquet(db / "Issues.parquet", columns=["issue_id", "repo_id", "author_id", "is_pull_request",
-                                                             "created_at", "first_seen_at"])
+                                                             "pull_request_id", "created_at", "first_seen_at"])
     comments = pd.read_parquet(db / "IssueComments.parquet",
                                columns=["issue_id", "repo_id", "author_id", "created_at"])
     reviews = pd.read_parquet(db / "PRReviews.parquet",
-                              columns=["pr_id", "repo_id", "reviewer_id", "submitted_at", "first_seen_at"])
+                              columns=["review_id", "pr_id", "repo_id", "reviewer_id", "submitted_at",
+                                       "first_seen_at"])
     rcomments = pd.read_parquet(db / "PRReviewComments.parquet",
-                                columns=["pr_id", "repo_id", "author_id", "created_at"])
-    pushes = pd.read_parquet(db / "Pushes.parquet", columns=["user_id", "repo_id", "created_at"])
+                                columns=["comment_id", "pr_id", "repo_id", "author_id", "pull_request_review_id",
+                                         "in_reply_to_id", "created_at"])
+    pushes = pd.read_parquet(db / "Pushes.parquet", columns=["push_id", "user_id", "repo_id", "branch", "created_at"])
     repos = pd.read_parquet(db / "Repositories.parquet", columns=["repo_id", "first_seen_at"])
     offset = {1: 1, 2: 1 + len(prs), 3: 1 + len(prs) + len(issues)}
     seen = {1: prs.set_index("pr_id").first_seen_at, 2: issues.set_index("issue_id").first_seen_at,
@@ -413,10 +432,20 @@ def load_entity_events(cohort):
     def later(*cols):
         return np.maximum.reduce([np.asarray(c, dtype="datetime64[ns]") for c in cols])
 
-    def events(uid, t, avail, repo, entity, node_type):
+    def cidx_of(user_ids):
+        u = pd.Series(user_ids).values
+        ok = pd.notna(u)
+        out = np.full(len(u), -1, np.int64)
+        out[ok] = to_cidx[u[ok].astype(np.int64)]
+        return out
+
+    def ids_or(v, fill=-1):
+        return pd.Series(v).fillna(fill).astype(np.int64).values
+
+    def events(uid, t, avail, repo, entity, node_type, **extra):
         d = pd.DataFrame({"uid": uid.values, "t": t.values, "avail": avail, "repo": repo.values,
-                          "entity": entity.values})
-        d = d.dropna()
+                          "entity": entity.values, **{k: np.asarray(v) for k, v in extra.items()}})
+        d = d.dropna(subset=["uid", "t", "avail", "repo", "entity"])
         d = d[d.t >= base.DATA_START]
         d["uid"] = to_cidx[d.uid.astype(np.int64).values]
         d = d[d.uid >= 0]
@@ -427,20 +456,48 @@ def load_entity_events(cohort):
         d["node_type"] = node_type
         return d.dropna(subset=["entity_avail"]).reset_index(drop=True)
 
+    pr_avail = pd.Series(later(prs.created_at, prs.first_seen_at), index=prs.pr_id.values)
+    pr_owner = pd.Series(cidx_of(prs.author_id), index=prs.pr_id.values)
+    issue_owner = pd.Series(cidx_of(issues.author_id), index=issues.issue_id.values)
+    issue_pr = issues.set_index("issue_id").pull_request_id
+    # issue comment on a PR -> that PR (only a third of the PR issues carry pull_request_id)
+    c_pr = issue_pr.reindex(comments.issue_id.values).values
+    c_pr_avail = pr_avail.reindex(c_pr).values
+    c_pr = np.where(pd.notna(c_pr), pd.Series(c_pr).fillna(0).astype(np.int64).values + offset[1], -1)
+    # push -> PR, heuristic (see the docstring)
+    same = prs[~prs.is_cross_repo.fillna(False)]
+    m = pushes[["push_id", "user_id", "repo_id", "branch", "created_at"]].merge(
+        same[["pr_id", "author_id", "repo_id", "head_ref", "created_at", "closed_at"]],
+        left_on=["user_id", "repo_id", "branch"], right_on=["author_id", "repo_id", "head_ref"], suffixes=("", "_pr"))
+    m = m[(m.created_at_pr <= m.created_at + pd.Timedelta(days=2))
+          & (m.closed_at.isna() | (m.closed_at >= m.created_at))]
+    m = m.assign(gap=(m.created_at - m.created_at_pr).abs()).sort_values(["push_id", "gap"])
+    push_pr = m.drop_duplicates("push_id").set_index("push_id").pr_id
+    p_pr = push_pr.reindex(pushes.push_id.values).values
+    p_pr_avail = pr_avail.reindex(p_pr).values
+    p_pr = np.where(pd.notna(p_pr), pd.Series(p_pr).fillna(0).astype(np.int64).values + offset[1], -1)
+
     plain = issues[~issues.is_pull_request.fillna(False)]
     ev = {
         "open_pr": events(prs.author_id, prs.created_at, later(prs.created_at, prs.first_seen_at), prs.repo_id,
-                          prs.pr_id, 1),
+                          prs.pr_id, 1, owner=pr_owner.values),
         "open_issue": events(plain.author_id, plain.created_at, later(plain.created_at, plain.first_seen_at),
-                             plain.repo_id, plain.issue_id, 2),
+                             plain.repo_id, plain.issue_id, 2, owner=issue_owner.reindex(plain.issue_id.values).values),
         "issue_comment": events(comments.author_id, comments.created_at, comments.created_at.values,
-                                comments.repo_id, comments.issue_id, 2),
+                                comments.repo_id, comments.issue_id, 2,
+                                owner=issue_owner.reindex(comments.issue_id.values).fillna(-1).astype(np.int64).values,
+                                pr=c_pr, pr_avail=c_pr_avail),
         "pr_review": events(reviews.reviewer_id, reviews.submitted_at,
-                            later(reviews.submitted_at, reviews.first_seen_at), reviews.repo_id, reviews.pr_id, 1),
+                            later(reviews.submitted_at, reviews.first_seen_at), reviews.repo_id, reviews.pr_id, 1,
+                            owner=pr_owner.reindex(reviews.pr_id.values).fillna(-1).astype(np.int64).values,
+                            rid=ids_or(reviews.review_id)),
         "pr_review_comment": events(rcomments.author_id, rcomments.created_at, rcomments.created_at.values,
-                                    rcomments.repo_id, rcomments.pr_id, 1),
+                                    rcomments.repo_id, rcomments.pr_id, 1,
+                                    owner=pr_owner.reindex(rcomments.pr_id.values).fillna(-1).astype(np.int64).values,
+                                    rid=ids_or(rcomments.pull_request_review_id), cid=ids_or(rcomments.comment_id),
+                                    reply=ids_or(rcomments.in_reply_to_id)),
         "push": events(pushes.user_id, pushes.created_at, pushes.created_at.values, pushes.repo_id,
-                       pushes.repo_id, 3),
+                       pushes.repo_id, 3, pr=p_pr, pr_avail=p_pr_avail),
     }
     return ev, n_entities, offset[3]
 
@@ -857,6 +914,165 @@ def hetero_graph(ent_ev, ev, s, lags, keep, window, max_events, repo_is_org, max
     return {"x": x, "ent": ids, "edges": edges}
 
 
+# --het-graph event: every kept event is a node of its own, so events can be linked to each other.
+EV_TYPES = HET_TYPES + ["event"]
+EV_NODE = 4
+EV_RELS = ([(k, 0, EV_NODE, 0) for k in EVENT_COLS]                           # user -> own event
+           + [(f"{k}_on", EV_NODE, HET_OBJ_TYPE[k], 2) for k in EVENT_COLS]    # event -> PR / issue / repo
+           + [("issue_comment_on_pr", EV_NODE, 1, 2),  # issue comment on a PR -> the PR node
+              ("push_to_pr", EV_NODE, 1, 2),           # push -> the PR it likely updates (heuristic)
+              ("next", EV_NODE, EV_NODE, 3),           # the user's previous event -> next event
+              ("in_review", EV_NODE, EV_NODE, 3),      # review comment -> the review it belongs to
+              ("reply_to", EV_NODE, EV_NODE, 3),       # review comment -> the comment it answers
+              ("received", EV_NODE, 0, 1),             # other user's event on my PR / issue -> me
+              ("pr_in", 1, 3, 2), ("issue_in", 2, 3, 2)])
+EV_N_FAMILIES = 4  # user events, received, object membership, gap between two events
+EV_POSITIVE = {r[0] for r in EV_RELS if r[3] in (0, 1)} | {f"{k}_on" for k in EVENT_COLS} | {
+    "issue_comment_on_pr", "push_to_pr", "pr_in", "issue_in"}  # ages strictly > 0; gaps may be 0
+
+
+def hetero_event_graph(ent_ev, s, lags, keep, window, max_events, repo_is_org, max_seen=None):
+    """The --het-graph event graph of week s: hetero_graph's users, PRs, issues and repositories, plus one
+    node per kept event (the same latest max_events per user and activity, same visibility rules), so
+    the links between events can be edges:
+      * user -> event (relation = activity), event -> what it acts on; an issue comment on a PR goes to
+        the PR node when the PR is visible (Issues.pull_request_id), a push to its repository and, with
+        the heuristic of load_entity_events, to the PR it updates;
+      * next: the user's events in time order, each to the following one (across activities);
+      * in_review: review comment -> the review it is part of; reply_to: comment -> the one it answers
+        (both only when both events are kept);
+      * received: event of another cohort user on my PR / issue -> me, visible through the cutoff of
+        "received" (as the baseline's received rows);
+      * PR / issue -> repository as in hetero_graph.
+    Ages: user -> event, event -> object, push -> PR and received: days before the cutoff of the event;
+    next / in_review / reply_to: days between the two events; PR / issue -> repo: days since first seen.
+    Event features: one-hot activity, log1p age, on own PR / issue, linked (issue comment moved to its
+    PR, push linked to a PR, review comment in a kept review). Object features as hetero_graph.
+    Returns the dict of hetero_graph with a fifth node type (ent None for events)."""
+    new_id = np.cumsum(keep) - 1
+    win = np.timedelta64(int(window * 86400), "s")
+    one_day = np.timedelta64(1, "D")
+    nk = len(EVENT_COLS)
+    c_rec = np.datetime64(s - lags["received"])
+
+    def col(e, name, m, fill):
+        return e[name].values[m] if name in e else np.full(m.sum(), fill)
+
+    vis = []
+    for rel, k in enumerate(EVENT_COLS):
+        c = np.datetime64(s - lags[k])
+        e = ent_ev[k]
+        m = ((e.avail.values < c) & (e.entity_avail.values < c) & (e.t.values < c) & (e.t.values >= c - win)
+             & keep[e.uid.values])
+        d = pd.DataFrame({"uid": e.uid.values[m], "entity": e.entity.values[m], "repo": e.repo.values[m],
+                          "t": e.t.values[m], "age": (c - e.t.values[m]) / one_day,
+                          "seen": (c - e.entity_avail.values[m]) / one_day, "rel": rel,
+                          "otype": HET_OBJ_TYPE[k], "owner": col(e, "owner", m, -1),
+                          "rid": col(e, "rid", m, -1), "cid": col(e, "cid", m, -1), "reply": col(e, "reply", m, -1)})
+        pr = col(e, "pr", m, -1)
+        pr_avail = col(e, "pr_avail", m, np.datetime64("NaT", "ns")).astype("datetime64[ns]")
+        pr_ok = (pr >= 0) & (pr_avail < c)  # NaT compares False
+        d["pr"] = np.where(pr_ok, pr, -1)
+        d["pr_seen"] = np.where(pr_ok, (c - pr_avail) / one_day, np.nan)
+        if k == "issue_comment":  # comment on a PR: the PR node is the object
+            d.loc[pr_ok, "entity"] = d.pr.values[pr_ok]
+            d.loc[pr_ok, "seen"] = d.pr_seen.values[pr_ok]
+            d.loc[pr_ok, "otype"] = 1
+        own = d.owner.values
+        okeep = np.zeros(len(d), bool)
+        okeep[own >= 0] = keep[own[own >= 0]]
+        d["rec"] = ((own >= 0) & (own != d.uid.values) & okeep & (e.avail.values[m] < c_rec)
+                    & (e.entity_avail.values[m] < c_rec) & (e.t.values[m] < c_rec))
+        vis.append(d)
+    allv = pd.concat(vis, ignore_index=True)
+    used = pd.concat([d.sort_values(["uid", "age"], kind="stable").pipe(
+        lambda d: d[d.groupby("uid", sort=False).cumcount().values < max_events]) for d in vis], ignore_index=True)
+    n_ev = len(used)
+    eid = np.arange(n_ev)
+    is_push = used.rel.values == EVENT_COLS.index("push")
+    push_pr = is_push & (used.pr.values >= 0)
+
+    ids = [None,
+           np.unique(np.concatenate([used.entity.values[used.otype.values == 1], used.pr.values[push_pr]])),
+           np.unique(used.entity.values[used.otype.values == 2]),
+           np.unique(used.repo.values.astype(np.int64))]
+    # Object features, counted over every visible event (before the cap), as hetero_graph.
+    x = [None]
+    obj_repo, obj_seen = [None], [None]
+    links = pd.DataFrame({"entity": used.pr.values[push_pr], "repo": used.repo.values[push_pr],
+                          "seen": used.pr_seen.values[push_pr], "uid": used.uid.values[push_pr]})
+    for t in (1, 2):
+        a = allv[(allv.otype.values == t) & np.isin(allv.entity.values, ids[t])]
+        n_t = len(ids[t])
+        idx = np.searchsorted(ids[t], a.entity.values)
+        cnt = np.bincount(idx * nk + a.rel.values, minlength=n_t * nk).reshape(n_t, nk)
+        meta = pd.concat([a[["entity", "uid", "seen", "repo"]]] + ([links] if t == 1 else []), ignore_index=True)
+        by = meta.assign(idx=np.searchsorted(ids[t], meta.entity.values)).groupby("idx")
+        users = by.uid.nunique().reindex(range(n_t), fill_value=0).values
+        seen = by.seen.max().reindex(range(n_t)).values
+        if max_seen is not None:
+            seen = np.minimum(seen, max_seen)
+        obj_repo.append(np.searchsorted(ids[3], by.repo.first().reindex(range(n_t)).values.astype(np.int64)))
+        obj_seen.append(seen)
+        x.append(np.concatenate([np.log1p(cnt), np.log1p(users)[:, None], np.log1p(seen)[:, None]], 1))
+    a = allv[np.isin(allv.repo.values, ids[3])]
+    n_r = len(ids[3])
+    idx = np.searchsorted(ids[3], a.repo.values)
+    cnt = np.bincount(idx * (nk + 1) + a.rel.values, minlength=n_r * (nk + 1)).reshape(n_r, nk + 1)
+    cnt[:, nk] = np.bincount(idx[a.rec.values], minlength=n_r)
+    users = pd.Series(a.uid.values).groupby(idx).nunique().reindex(range(n_r), fill_value=0).values
+    x.append(np.concatenate([np.log1p(cnt), np.log1p(users)[:, None], repo_is_org[ids[3]][:, None]], 1))
+    # Event features.
+    own = (used.owner.values == used.uid.values) & (used.owner.values >= 0)
+    rc = used.rel.values == EVENT_COLS.index("pr_review_comment")
+    rv = used.rel.values == EVENT_COLS.index("pr_review")
+    rev_of = pd.Series(eid[rv], index=used.rid.values[rv])
+    rev_of = rev_of[~rev_of.index.duplicated()]
+    in_rev = np.where(rc & (used.rid.values >= 0), rev_of.reindex(used.rid.values).fillna(-1).values, -1).astype(np.int64)
+    com_of = pd.Series(eid[rc], index=used.cid.values[rc])
+    com_of = com_of[~com_of.index.duplicated()]
+    reply = np.where(rc & (used.reply.values >= 0), com_of.reindex(used.reply.values).fillna(-1).values,
+                     -1).astype(np.int64)
+    ic_pr = (used.rel.values == EVENT_COLS.index("issue_comment")) & (used.otype.values == 1)
+    linked = ic_pr | push_pr | (in_rev >= 0)
+    x.append(np.concatenate([np.eye(nk)[used.rel.values], np.log1p(used.age.values)[:, None], own[:, None],
+                             linked[:, None]], 1))
+    x = [None] + [v.astype(np.float32) for v in x[1:]]
+
+    def obj_index(t, ent):
+        return np.searchsorted(ids[t], ent)
+
+    edges = []
+    for rel, k in enumerate(EVENT_COLS):  # user -> event
+        m = used.rel.values == rel
+        edges.append((new_id[used.uid.values[m]], eid[m], used.age.values[m]))
+    for rel, k in enumerate(EVENT_COLS):  # event -> object
+        m = (used.rel.values == rel) & ~ic_pr
+        t = HET_OBJ_TYPE[k]
+        dst = obj_index(3, used.repo.values[m]) if t == 3 else obj_index(t, used.entity.values[m])
+        edges.append((eid[m], dst, used.age.values[m]))
+    edges.append((eid[ic_pr], obj_index(1, used.entity.values[ic_pr]), used.age.values[ic_pr]))
+    edges.append((eid[push_pr], obj_index(1, used.pr.values[push_pr]), used.age.values[push_pr]))
+    order = np.lexsort((used.t.values, used.uid.values))  # each user's events in time order
+    a_, b_ = order[:-1], order[1:]
+    same_u = used.uid.values[a_] == used.uid.values[b_]
+    a_, b_ = a_[same_u], b_[same_u]
+    gap = lambda i, j: np.abs(used.t.values[j] - used.t.values[i]) / one_day  # noqa: E731
+    edges.append((a_, b_, gap(a_, b_)))
+    m = in_rev >= 0
+    edges.append((eid[m], in_rev[m], gap(eid[m], in_rev[m])))
+    m = reply >= 0
+    edges.append((eid[m], reply[m], gap(eid[m], reply[m])))
+    m = used.rec.values
+    edges.append((eid[m], new_id[used.owner.values[m]], (c_rec - used.t.values[m]) / one_day))
+    for t in (1, 2):
+        edges.append((np.arange(len(ids[t])), obj_repo[t], obj_seen[t]))
+    edges = [(src.astype(np.int64), dst.astype(np.int64), np.asarray(age, np.float32)) for src, dst, age in edges]
+    for (name, *_), (_, _, age) in zip(EV_RELS, edges):
+        assert (age > 0).all() if name in EV_POSITIVE else (age >= 0).all(), f"bad age on {name} edges"
+    return {"x": x, "ent": ids + [None], "edges": edges}
+
+
 class FuncTimeEncoder(nn.Module):
     """Learned functional time encoding cos(w log(1 + days) + b) (TGAT's Bochner encoding, on the log
     age); w starts at log-spaced frequencies as EgoTimeEncoder."""
@@ -884,9 +1100,8 @@ class TemporalHeteroLayer(nn.Module):
     attention a_r . LeakyReLU(Q_dst h_dst + m) softmaxed over the incoming edges of r of each node; the
     relations are summed per node type, then h = LN(h + drop(relu(U [h, agg]))) per type."""
 
-    def __init__(self, d, time_dim, n_rel, dropout):
+    def __init__(self, d, time_dim, n_rel, dropout, nt=len(HET_TYPES)):
         super().__init__()
-        nt = len(HET_TYPES)
         self.msg = nn.ModuleList(nn.Linear(d + time_dim, d) for _ in range(n_rel))
         self.att = nn.Parameter(torch.randn(n_rel, d) / np.sqrt(d))
         self.q = nn.ModuleList(nn.Linear(d, d, bias=False) for _ in range(nt))
@@ -911,28 +1126,31 @@ class TemporalHeteroLayer(nn.Module):
 class TemporalHeteroGNN(nn.Module):
     """--graph-structure hetero: an MLP encoder per node type (plus, with n_entities, a learned entity
     embedding of PRs / issues / repos), `layers` rounds of TemporalHeteroLayer over HET_RELS in both
-    directions, then a head on the user nodes. use_time=False feeds zeros instead of the time encoding."""
+    directions, then a head on the user nodes. use_time=False feeds zeros instead of the time encoding.
+    rels / n_families: the relations and time-encoder families of the graph (EV_RELS for --het-graph event)."""
 
-    def __init__(self, dims, n_out, d=64, layers=2, dropout=0.1, time_dim=16, use_time=True, n_entities=0):
+    def __init__(self, dims, n_out, d=64, layers=2, dropout=0.1, time_dim=16, use_time=True, n_entities=0,
+                 rels=HET_RELS, n_families=HET_N_FAMILIES):
         super().__init__()
+        self.rels = rels
 
         def enc(i):
             return nn.Sequential(nn.Linear(i, d), nn.ReLU(), nn.Dropout(dropout), nn.Linear(d, d))
 
         self.enc = nn.ModuleList(enc(i) for i in dims)
         self.entity = nn.Embedding(n_entities, d) if n_entities else None
-        self.time = nn.ModuleList(FuncTimeEncoder(time_dim) for _ in range(HET_N_FAMILIES))
+        self.time = nn.ModuleList(FuncTimeEncoder(time_dim) for _ in range(n_families))
         self.time_dim, self.use_time = time_dim, use_time
-        self.layers = nn.ModuleList(TemporalHeteroLayer(d, time_dim, 2 * len(HET_RELS), dropout)
+        self.layers = nn.ModuleList(TemporalHeteroLayer(d, time_dim, 2 * len(rels), dropout, nt=len(dims))
                                     for _ in range(layers))
         self.head = nn.Sequential(nn.Linear(d, d), nn.ReLU(), nn.Dropout(dropout), nn.Linear(d, n_out))
 
     def forward(self, g):
         h = [enc(x) for enc, x in zip(self.enc, g["x"])]
         if self.entity is not None:
-            h = [h[0]] + [x + self.entity(e) for x, e in zip(h[1:], g["ent"][1:])]
+            h = [x if e is None else x + self.entity(e) for x, e in zip(h, g["ent"])]
         edges = []
-        for (_, st, dt, fam), (src, dst, age) in zip(HET_RELS, g["edges"]):
+        for (_, st, dt, fam), (src, dst, age) in zip(self.rels, g["edges"]):
             phi = self.time[fam](age) if self.use_time else age.new_zeros(len(age), self.time_dim)
             edges += [(st, dt, src, dst, phi), (dt, st, dst, src, phi)]
         for layer in self.layers:
@@ -945,15 +1163,23 @@ def hetero_stages(args, tables, feats, train_weeks, cohort, ev, lags, sel, repo_
     weeks (full-graph fit, as user-repo) and predict one week (one value per row of its table)."""
     ent_ev, n_entities, repo_offset = load_entity_events(cohort)
     window = args.history_days or 90
-    raw = {w: hetero_graph(ent_ev, ev, w, lags, sel[w], window, args.het_max_events, repo_is_org,
-                           max_seen=args.history_days)
-           for w in tqdm(list(tables), desc="hetero graphs", unit="week", dynamic_ncols=True, **PROGRESS)}
+    event = args.het_graph == "event"
+    types, rels = (EV_TYPES, EV_RELS) if event else (HET_TYPES, HET_RELS)
+
+    def build(w):
+        if event:
+            return hetero_event_graph(ent_ev, w, lags, sel[w], window, args.het_max_events, repo_is_org,
+                                      max_seen=args.history_days)
+        return hetero_graph(ent_ev, ev, w, lags, sel[w], window, args.het_max_events, repo_is_org,
+                            max_seen=args.history_days)
+
+    raw = {w: build(w) for w in tqdm(list(tables), desc="hetero graphs", unit="week", dynamic_ncols=True, **PROGRESS)}
     for w, t in tables.items():
         raw[w]["x"][0] = np.log1p(t[feats].values).astype(np.float32)
         raw[w]["ent"][3] = raw[w]["ent"][3] + repo_offset  # repo ids -> entity ids, for --het-entity-emb
     # Standardise every node type with statistics of the training weeks only.
     stats = []
-    for i in range(len(HET_TYPES)):
+    for i in range(len(types)):
         xt = np.concatenate([raw[w]["x"][i] for w in train_weeks])
         stats.append((xt.mean(0), xt.std(0) + 1e-6))
 
@@ -964,15 +1190,15 @@ def hetero_stages(args, tables, feats, train_weeks, cohort, ev, lags, sel, repo_
              else np.full((len(t), len(labels)), np.nan))
         graphs[w] = {
             "x": [torch.tensor((x - mu) / sd, dtype=torch.float32, device=device) for x, (mu, sd) in zip(g["x"], stats)],
-            "ent": [None] + [torch.tensor(e, device=device) for e in g["ent"][1:]],
+            "ent": [None if e is None else torch.tensor(e, device=device) for e in g["ent"]],
             "edges": [tuple(torch.tensor(a, device=device) for a in e) for e in g["edges"]],
             "y": torch.tensor(y, dtype=torch.float32, device=device),
             "mask": torch.tensor(t.eligible.values, device=device),
         }
     gt = raw[base.TEST_START]
     print(f"hetero graph of the test week ({window:g}-day window, <= {args.het_max_events} events per user "
-          f"and relation): " + ", ".join(f"{len(x):,} {name}" for name, x in zip(HET_TYPES, gt["x"])) + "; edges "
-          + ", ".join(f"{r[0]} {len(e[0]):,}" for r, e in zip(HET_RELS, gt["edges"])))
+          f"and relation, {args.het_graph} graph): " + ", ".join(f"{len(x):,} {name}" for name, x in zip(types, gt["x"]))
+          + "; edges " + ", ".join(f"{r[0]} {len(e[0]):,}" for r, e in zip(rels, gt["edges"])))
     print(f"edges per week: mean {np.mean([sum(len(e[0]) for e in g['edges']) for g in raw.values()]):,.0f}"
           + (f", GPU memory {torch.cuda.memory_allocated() / 2**30:.2f} GiB" if device == "cuda" else ""))
     dims = [x.shape[1] for x in gt["x"]]
@@ -980,7 +1206,8 @@ def hetero_stages(args, tables, feats, train_weeks, cohort, ev, lags, sel, repo_
     def make_model():
         return TemporalHeteroGNN(dims, len(labels), d=args.het_dim, layers=args.het_layers, dropout=args.het_dropout,
                                  time_dim=args.het_time_dim, use_time=args.het_time == "func",
-                                 n_entities=n_entities if args.het_entity_emb else 0).to(device)
+                                 n_entities=n_entities if args.het_entity_emb else 0, rels=rels,
+                                 n_families=EV_N_FAMILIES if event else HET_N_FAMILIES).to(device)
 
     def train(fit_weeks, epochs, val_weeks=None):
         return fit(graphs, fit_weeks, make_model, epochs, args.seed, val_weeks=val_weeks, lr=args.lr)
@@ -1166,7 +1393,13 @@ def main():
                          "graph of experiments/relgt, one token subgraph per example")
     hg = ap.add_argument_group("--graph-structure hetero")
     hg.add_argument("--het-dim", type=int, default=64)
-    hg.add_argument("--het-layers", type=int, default=2, help="message passing rounds")
+    hg.add_argument("--het-graph", choices=["object", "event"], default="object",
+                    help="object: users, PRs, issues, repos, one edge per event; event: also one node per "
+                         "event, with the links between events (order, review comment -> review, push -> PR, "
+                         "received -> the exact PR / issue)")
+    hg.add_argument("--het-layers", type=int, default=None,
+                    help="message passing rounds (default 2; 4 with --het-graph event, which needs 4 hops "
+                         "for user -> event -> object -> event -> other user)")
     hg.add_argument("--het-dropout", type=float, default=0.1)
     hg.add_argument("--het-max-events", type=int, default=32,
                     help="latest event edges kept per user and relation (default 32)")
@@ -1226,6 +1459,8 @@ def main():
         ap.error("--time-enc is for the user-repo graph (the ego and chain tokens already encode their time)")
     if args.time_enc != "none" and (args.time_dim < 2 or args.time_dim % 2):
         ap.error("--time-dim must be an even number >= 2")
+    if het and args.het_layers is None:
+        args.het_layers = 4 if args.het_graph == "event" else 2
     if het and (args.het_max_events < 1 or args.het_time_dim < 1 or args.het_layers < 1):
         ap.error("--het-max-events, --het-time-dim and --het-layers must be >= 1")
     time_dim = args.time_dim if args.time_enc == "edge" else 0
@@ -1260,7 +1495,10 @@ def main():
                     + ("_ftime" if chain and args.chain_time == "func" else "")
                     + ("_ego" if ego else "") + ("_uf" if ego and args.user_features else "")
                     + ({"func": "_ftime", "none": "_notime"}.get(args.ego_time, "") if ego else "")
-                    + ("_het" if het else "") + ("_notime" if het and args.het_time == "none" else "")
+                    + ("_het" if het else "") + ("_ev" if het and args.het_graph == "event" else "")
+                    + (f"_l{args.het_layers}" if het and args.het_layers != (4 if args.het_graph == "event" else 2)
+                       else "")
+                    + ("_notime" if het and args.het_time == "none" else "")
                     + (("_seg" + (str(args.active_min_events) if args.active_min_events != 1 else ""))
                        if ego and args.segment != "none" else "")
                     + ("_qprev" if ego and args.quiet_rule == "prev-week" else "")

@@ -9,6 +9,7 @@
 # list the processes on a card, so memory in use is the test. If no GPU is free it waits and checks
 # again every GPU_WAIT seconds (default 60). GPU=<index> skips the check and uses that card.
 # CONFIGS picks the configs to run, e.g.  CONFIGS="het user_repo" bash script_ho0927.sh
+# het_ev / het_ev_notime (--het-graph event) use ~11 GB of a 12 GB card: one per GPU, nothing else on it.
 # Output folders are named <cfg>_ho0926_s<seed>: the suffix is the UTC start date of the scored week.
 HO_WEEK=${HO_WEEK:-"2026-09-26 16:00"}   # UTC start of the scored week (Saturday 16:00)
 SUF=ho$(echo "$HO_WEEK" | cut -c6-10 | tr -d -)
@@ -22,13 +23,15 @@ GPU_WAIT=${GPU_WAIT:-60}
 declare -A CFG=(
   [het]="--graph-structure hetero --task all"
   [het_notime]="--graph-structure hetero --task all --het-time none"
+  [het_ev]="--graph-structure hetero --het-graph event --task all"
+  [het_ev_notime]="--graph-structure hetero --het-graph event --task all --het-time none"
   [all_ego_uf]="--user-features"
   [all_ego_uf_pprev]="--user-features --push-share prev-week"
   [all_ego_uf_rel]="--user-features --relative-features"
   [all_ego_uf_rel_pprev]="--user-features --relative-features --push-share prev-week"
   [user_repo]="--graph-structure user-repo"
 )
-ALL="het het_notime all_ego_uf all_ego_uf_pprev all_ego_uf_rel all_ego_uf_rel_pprev user_repo"
+ALL="het het_notime het_ev het_ev_notime all_ego_uf all_ego_uf_pprev all_ego_uf_rel all_ego_uf_rel_pprev user_repo"
 CONFIGS=${CONFIGS:-"het het_notime all_ego_uf user_repo"}
 jobs=(); for c in $CONFIGS; do for s in 0 1 2; do jobs+=("$c $s"); done; done
 

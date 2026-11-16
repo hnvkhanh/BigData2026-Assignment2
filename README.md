@@ -939,6 +939,60 @@ Mean holdout F1 per activity:
   smaller.
 - Best epochs are early and uneven (4-12). One holdout week, 3 seeds.
 
+### Event graph: links between actions (`--het-graph event`)
+
+The graph above only joins actions where their edges meet at the same user or object. Nothing
+records that a review comment belongs to a review, that a push updated a PR, or which action
+came after which. `--het-graph event` (`hetero_event_graph`) makes every kept event a node of
+its own: the same latest 32 per user and activity, under the same visibility rules. Events can
+then link to each other directly. Week 2026-09-26 has 9,000 users, 20k PRs, 13k issues,
+29k repos and 177k events, with about 550k edges:
+
+| Relation | From → to | Edge age | Edges (09-26) |
+|---|---|---|---|
+| `<activity>` (6) | user → own event | days before the cutoff | 177k |
+| `<activity>_on` (6) | event → PR / issue / repo | days before the cutoff | 175k |
+| `issue_comment_on_pr` | issue comment on a PR → the PR node | days before the cutoff | 1.8k |
+| `push_to_pr` | push → the PR it likely updates | days before the cutoff | 6.7k |
+| `next` | a user's event → that user's next event | gap (days) | 170k |
+| `in_review` | review comment → its review | gap (days) | 2.5k |
+| `reply_to` | review comment → the comment it answers | gap (days) | 77 |
+| `received` | another user's event on my PR / issue → me | days before the `received` cutoff | 80 |
+| `pr_in`, `issue_in` | PR / issue → its repo | days since first seen | 33k |
+
+- **Where the links come from.**
+  - `in_review` comes from `PRReviewComments.pull_request_review_id`, and `reply_to` from
+    `in_reply_to_id`. Both need the two events in the graph.
+  - An issue comment on a PR moves to the PR node when `Issues.pull_request_id` names the PR
+    (about a third of PR issues do).
+  - Text is masked in the data, so `push_to_pr` is a heuristic: a same-repo PR by the pusher
+    whose masked head branch equals the pushed branch and that is open at the push. It links
+    9% of pushes, and 37% of those links are ambiguous (the closest PR is taken).
+- **Not linked.** An issue and the PR that fixes it can't be joined: PR bodies are masked
+  (`#000`) and there is no closing-reference column.
+- **Event node features.** One-hot activity, log age, whether it is on the user's own PR or
+  issue, and whether it has a link (moved to its PR, linked to a PR, or part of a kept review).
+- **Model.** Same `TemporalHeteroGNN` as above, with a fourth time-encoder family for gaps
+  between events. It uses **4 layers** by default, because user → event → PR → event → other
+  user is 4 hops. `--het-layers N` overrides this, and the folder name gets `_l<N>`.
+- **Memory.** About 11 GB of a 12 GB card, so run one job per GPU.
+
+```bash
+# one run (holdout week 09-27 -> 10-04, all 6 activities, push included) -> outputs/all_het_ev_ho0926/
+python experiments/gnn/run.py --graph-structure hetero --het-graph event --holdout --holdout-week "2026-09-26 16:00"
+# ablation without the time embedding -> outputs/all_het_ev_notime_ho0926/
+python experiments/gnn/run.py --graph-structure hetero --het-graph event --het-time none --holdout --holdout-week "2026-09-26 16:00"
+# 3 seeds each, next to the object graph; prints the summary table at the end
+CONFIGS="het_ev het_ev_notime" bash script_ho0927.sh   # -> outputs/het_ev[_notime]_ho0926_s{0,1,2}/
+# both GPUs at once: one config per card
+GPU=0 CONFIGS="het_ev" bash script_ho0927.sh &  GPU=1 CONFIGS="het_ev_notime" bash script_ho0927.sh
+# draw one user's 4-hop field (event-to-event links dashed)
+python model_graph.py --model hetero-event --week "2026-09-26 16:00"          # app at http://127.0.0.1:8052
+python model_graph.py --html --model hetero-event --week "2026-09-26 16:00"   # -> figures/graph_hetero-event_<login>_<date>.html
+```
+
+Compare with `het` (52.77) and `het_notime` (52.34) in the 09-27 table above. Results: not run yet.
+
 ## Experiment: ego GNN with the hetero model's time encoding (`--ego-time func`)
 
 The ego GNN encodes time inside each token: a fixed sinusoidal encoding of the log age, mixed

@@ -13,6 +13,9 @@
              (latest 32 per user and activity), repo -> user "received", PR / issue -> its repo. Every
              relation also runs reversed, so the 2-layer model sees the 2-hop neighbourhood drawn here.
              Parallel events between the same two nodes are drawn as one edge (hover: count, ages).
+  hetero-event  --graph-structure hetero --het-graph event: hetero_event_graph(); also one node per event,
+             with the links between events (dashed: next in time, review comment -> review, reply).
+             Shown: the 4-hop field of its 4 layers.
   chain      --graph-structure chain (RowGNN): the K = 100 tokens of experiments/relgt's chain row graph
              (sample_walk) and the edges among them (subgraph_edges), as the GNN uses them.
   relgt      experiments/relgt/run.py: the same tokens on --relgt-graph fk (default, sample_tokens: 1- and
@@ -326,24 +329,33 @@ def user_repo_graph(ctx, u):
     return nodes, edges, title, {1: "hop 1: repos", 2: "hop 2: other cohort users"}, "ring", ["hop", "kind", "name"]
 
 
-def hetero_graph(ctx, u):
-    """--graph-structure hetero: hetero_graph() of the whole week, cut to the user's 2-hop field."""
+def hetero_graph(ctx, u, event=False):
+    """--graph-structure hetero: hetero_graph() of the whole week, cut to the user's 2-hop field; with
+    event (--het-graph event), hetero_event_graph() cut to the 4-hop field of its 4 layers."""
     ent_ev, _, repo_offset = ctx.entity_events()
     window = ctx.args.history_days or 90
-    g = G.hetero_graph(ent_ev, ctx.ev, ctx.s, ctx.lags, np.ones(ctx.n, bool), window, ctx.args.het_max_events,
-                       ctx.repo_is_org, max_seen=ctx.args.history_days)
-    tname = G.HET_TYPES
+    keep = np.ones(ctx.n, bool)
+    if event:
+        g = G.hetero_event_graph(ent_ev, ctx.s, ctx.lags, keep, window, ctx.args.het_max_events, ctx.repo_is_org,
+                                 max_seen=ctx.args.history_days)
+        tname, rels, hops = G.EV_TYPES, G.EV_RELS, 4
+    else:
+        g = G.hetero_graph(ent_ev, ctx.ev, ctx.s, ctx.lags, keep, window, ctx.args.het_max_events,
+                           ctx.repo_is_org, max_seen=ctx.args.history_days)
+        tname, rels, hops = G.HET_TYPES, G.HET_RELS, 2
     agg = {}
-    for (rel, st, dt, _), (src, dst, age) in zip(G.HET_RELS, g["edges"]):
+    for (rel, st, dt, _), (src, dst, age) in zip(rels, g["edges"]):
         for a, b, ag in zip(src, dst, age):
             key = ((tname[st], int(a)), (tname[dt], int(b)), rel)
             agg.setdefault(key, []).append(float(ag))
     all_edges = []
     for (a, b, rel), ag in agg.items():
-        what = "age" if rel.endswith("_in") else "event ages"
+        what = ("age" if rel.endswith("_in") else "gap" if rel in ("next", "in_review", "reply_to")
+                else "event ages")
         all_edges.append(edge(a, b, rel, f"{len(ag)} edge(s), {what} (days): "
-                              + ", ".join(f"{x:.1f}" for x in sorted(ag)[:8]) + (" ..." if len(ag) > 8 else "")))
-    hop_of, dropped = keep_neighbourhood(("user", u), all_edges, 2, ctx.args.max_per_hop)
+                              + ", ".join(f"{x:.1f}" for x in sorted(ag)[:8]) + (" ..." if len(ag) > 8 else ""),
+                              dash=rel in ("next", "in_review", "reply_to")))
+    hop_of, dropped = keep_neighbourhood(("user", u), all_edges, hops, ctx.args.max_per_hop)
     feat = {1: [f"{k} events" for k in G.EVENT_COLS] + ["users", "days since first seen"],
             2: [f"{k} events" for k in G.EVENT_COLS] + ["users", "days since first seen"],
             3: [f"{k} events" for k in G.EVENT_COLS] + ["received", "users", "org"]}
@@ -355,6 +367,15 @@ def hetero_graph(ctx, u):
             nodes.append(node(key, "user" if h == 0 else "other user", h, login,
                               f"user {login} · hop {h}<br>node features: the baseline's 60 user features"))
             continue
+        if tname[t] == "event":
+            x = g["x"][t][key[1]]
+            act = G.EVENT_COLS[int(np.argmax(x[:len(G.EVENT_COLS)]))]
+            age = np.expm1(x[len(G.EVENT_COLS)])
+            flags = [f for f, v in zip(["on own PR / issue", "linked"], x[-2:]) if v > 0]
+            nodes.append(node(key, f"event: {act}", h, f"{act} {age:.1f}d",
+                              f"event <b>{act}</b> · hop {h}<br>{age:.1f} days before its cutoff"
+                              + "".join(f"<br>{f}" for f in flags), size=7))
+            continue
         e = int(g["ent"][t][key[1]])
         name, title = (entity_name(ctx.names, e, t, ctx.n_prs, repo_offset) if t < 3
                        else (ctx.names.repo_name(e), ""))
@@ -364,10 +385,13 @@ def hetero_graph(ctx, u):
         nodes.append(node(key, kind, h, name, f"{kind} <b>{name}</b> · hop {h}" + (f"<br>{title[:80]}" if title else "")
                           + "<br>" + "<br>".join(vals)))
     login = ctx.login(u)
-    title = (f"<b>hetero</b> GNN · {login} · week {ctx.s:%Y-%m-%d %H:%M} UTC · {window}-day window, latest "
-             f"{ctx.args.het_max_events} events per user and activity · {len(hop_of) - 1} nodes within 2 hops"
-             + (f" (dropped {dropped[0]} / {dropped[1]} by --max-per-hop)" if any(dropped) else ""))
-    rings = {1: "hop 1: the user's PRs, issues, repos", 2: "hop 2: their repos, other users"}
+    title = (f"<b>hetero{' (event graph)' if event else ''}</b> GNN · {login} · week {ctx.s:%Y-%m-%d %H:%M} UTC · "
+             f"{window}-day window, latest {ctx.args.het_max_events} events per user and activity · "
+             f"{len(hop_of) - 1} nodes within {hops} hops"
+             + (f" (dropped {' / '.join(map(str, dropped))} by --max-per-hop)" if any(dropped) else ""))
+    rings = ({1: "hop 1: the user's events", 2: "hop 2: PRs, issues, repos, linked events",
+              3: "hop 3: their repos, other users' events", 4: "hop 4: other users"} if event else
+             {1: "hop 1: the user's PRs, issues, repos", 2: "hop 2: their repos, other users"})
     return nodes, all_edges, title, rings, "ring", ["hop", "kind", "name"]
 
 
@@ -500,11 +524,13 @@ class Context:
 
 
 BUILDERS = {"ego": ego_graph, "user-repo": user_repo_graph, "hetero": hetero_graph,
+            "hetero-event": lambda ctx, u: hetero_graph(ctx, u, event=True),
             "chain": lambda ctx, u: token_graph(ctx, u, "chain"),
             "relgt": lambda ctx, u: token_graph(ctx, u, ctx.args.relgt_graph)}
 TOKEN_OPTS = ["num_neighbors", "max_hops", "chain_seed", "num_seeds", "lookback_days", "exclude_push", "seed"]
 MODEL_OPTS = {"ego": ["ego_lookback"], "user-repo": ["history_days", "max_per_hop"],
-              "hetero": ["history_days", "het_max_events", "max_per_hop"], "chain": TOKEN_OPTS,
+              "hetero": ["history_days", "het_max_events", "max_per_hop"],
+              "hetero-event": ["history_days", "het_max_events", "max_per_hop"], "chain": TOKEN_OPTS,
               "relgt": ["relgt_graph"] + TOKEN_OPTS}
 
 
