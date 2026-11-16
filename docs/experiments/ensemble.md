@@ -59,21 +59,97 @@ ensembles write `experiments/ensemble/outputs/<members>_ens0926[_options]/metric
 
 ## Results
 
-Pending: `runs/ensemble_ho0927.sh` was smoke-tested and launched in full on 2026-11-16 15:55 (console log
-`experiments/ensemble/outputs/ens0926_full.log`); fill in the table from its summary
-(`python scripts/summarize_runs.py --suffix ens0926 all_ego_uf het relgt_chain relgt_chain_hist` and the
-`metrics.json` of each ensemble).
+Run on 2026-11-16 (`runs/ensemble_ho0927.sh`, console log `experiments/ensemble/outputs/ens0926_full.log`,
+training ~2.5 h on two GPUs; ensembles and summary re-run on CPU into `ens0926_summary.log`). 4 configs x
+seeds 0-2, holdout week 09-26 16:00 UTC (6,064 users). All numbers are the official 6-activity score.
+
+Provenance note: a first attempt at the summary step started without `SKIP_RUNS` taking effect and retrained
+`all_ego_uf_ens0926_s0` (holdout 53.18 -> 53.41, same config, GPU nondeterminism) before it was stopped.
+The tables below use the retrained s0, so they differ slightly from the figures in `ens0926_full.log`
+(e.g. `bag:all_ego_uf` 53.25 here). The `s0` and `s1` training logs of `all_ego_uf` were overwritten; the saved
+results of `s1` were not touched.
+
+### Single configs, mean of 3 seeds (the runs' own decisions)
+
+| Config | Mean score (min-max) |
+|---|---|
+| all_ego_uf | 53.23 (52.97-53.41) |
+| het | 52.71 (52.28-53.38) |
+| relgt_chain, validation model | 52.05 (52.00-52.14) |
+| relgt_chain, final model | 52.59 (51.72-53.04) |
+| relgt_chain_hist, validation model | 51.80 (49.92-52.91) |
+| relgt_chain_hist, final model | 53.09 (52.42-53.47) |
+
+### Ensembles of all four configs (push share from the tune week, ranks averaged)
 
 | Variant | Score | open_pr | open_issue | issue_comment | pr_review | pr_review_comment | push | vs reference [95% CI] |
 |---|---|---|---|---|---|---|---|---|
-| | | | | | | | | |
+| own:all_ego_uf | 53.23 | 0.436 | 0.428 | 0.417 | 0.481 | 0.459 | 0.676 | |
+| own:het | 52.71 | 0.413 | 0.440 | 0.423 | 0.483 | 0.450 | 0.671 | |
+| own:relgt_chain | 52.59 | 0.402 | 0.462 | 0.407 | 0.447 | 0.443 | 0.681 | |
+| own:relgt_chain_hist | 53.09 | 0.414 | 0.451 | 0.407 | 0.475 | 0.435 | 0.683 | |
+| bag:all_ego_uf | 53.25 | 0.444 | 0.429 | 0.401 | 0.470 | 0.468 | 0.677 | -0.16 [-1.15, +0.77] |
+| bag:het | 52.81 | 0.405 | 0.441 | 0.423 | 0.490 | 0.474 | 0.666 | -0.61 [-1.58, +0.43] |
+| bag:relgt_chain | **54.42** | 0.434 | 0.481 | 0.461 | 0.502 | 0.454 | 0.684 | +1.00 [+0.12, +1.94] |
+| bag:relgt_chain_hist (reference) | 53.42 | 0.445 | 0.447 | 0.430 | 0.453 | 0.451 | 0.683 | 0 |
+| mean | 53.82 | 0.442 | 0.459 | 0.421 | 0.471 | 0.462 | 0.682 | +0.40 [-0.30, +1.16] |
+| select | 52.89 | 0.444 | 0.429 | 0.401 | 0.453 | 0.451 | 0.684 | -0.53 [-1.24, +0.18] |
 
-What to read from it:
-- `bag:<cfg>` against `own:<cfg>`: how much seed bagging alone is worth.
-- `mean` against the best bag: whether mixing models adds to bagging. The bootstrap interval says
-  whether the one week supports it; the seed ranges in the other docs do not resolve differences
-  under about 1 point.
-- `select` against `mean`: whether picking per activity beats averaging (it uses the tune week twice,
-  so it can overfit that week).
-- `bag:relgt_chain_hist` against `bag:relgt_chain`: whether the history features help the chain model.
-- The `--push-rule prev-week` run is the number comparable with the submission pipeline.
+Tune-week scores of the same variants: bag:all_ego_uf 52.21, het 51.70, relgt_chain 51.63, relgt_chain_hist
+52.39, mean 52.92, select 53.01.
+
+### Other combinations (score; 95% CI against each table's reference)
+
+| Ensemble | bag:all_ego_uf | bag:het | bag:relgt_chain | bag:relgt_chain_hist | mean | select |
+|---|---|---|---|---|---|---|
+| 4 configs, `--push-rule prev-week` (submission rule) | 51.94 | 52.27 | 53.73 | 52.81 | 53.08 (+0.27 [-0.47, +1.02]) | 52.16 |
+| 4 configs, `--rule joint` | 53.05 | 53.51 | 53.06 | 53.88 | **54.07** (+0.20 [-0.54, +0.89]) | 52.93 |
+| 3 documented configs (no hist) | 53.25 | 52.81 | 54.42 | - | 53.62 (+0.37 [-0.20, +1.01]) | 53.51 |
+| relgt_chain + relgt_chain_hist, validation models | - | - | 53.19 | 52.92 | 53.11 (+0.18 [-0.41, +0.79]) | 52.80 |
+
+References: 4 configs bag:relgt_chain_hist; 3 documented configs bag:all_ego_uf; chain pair
+bag:relgt_chain_hist. Selected per activity (4 configs): open_pr, open_issue, issue_comment <- all_ego_uf;
+pr_review, pr_review_comment <- relgt_chain_hist; push <- relgt_chain. The official scorer reproduces the
+`mean` scores (53.82, 53.08, 54.07, 53.62, 53.11).
+
+### Reading
+
+- **Seed bagging** is worth most for RelGT on the chain graph: `bag:relgt_chain` 54.42 against 52.59
+  (final model) / 52.05 (validation model) for the single runs, the only variant whose interval excludes 0
+  against the reference (+1.00 [+0.12, +1.94]). For the ego GNN (53.25 vs 53.23) and het (52.81 vs 52.71)
+  bagging adds nothing. The 54.42 is one week and one bag of three seeds, and its tune-week score (51.63) is
+  the lowest, so the tune week did not predict it.
+- **Mixing models**: `mean` is 53.6-54.1 across the settings, +0.2 to +0.4 over the reference bag, with
+  intervals that include 0. On this week it does not beat `bag:relgt_chain` (54.42), and the one week does
+  not separate them. The best number overall is `mean --rule joint` (54.07), also within noise of the rest.
+- **`select`** is never better than `mean` (52.89 vs 53.82); it picks by tune week and loses on the holdout.
+- **History features**: `bag:relgt_chain_hist` 53.42 against `bag:relgt_chain` 54.42, so no gain on this
+  week; it is better on open_pr and push, worse on open_issue, issue_comment and pr_review. Per run the final
+  model improves with history (53.09 vs 52.59) and the validation model does not (51.80 vs 52.05), so the
+  effect is inside the seed range.
+- **Submission push rule**: with `--push-rule prev-week` every variant drops 0.7-1.3 (`mean` 53.08 against
+  53.82) because the previous-week push share (0.392) is below the tune-week share (about 0.46-0.50); the push
+  F1 falls from about 0.68 to 0.65-0.67. Against single runs under the same rule (all_ego_uf 51.98, het 51.89
+  by `summarize_runs.py`), the ensemble `mean` (53.08) and `bag:relgt_chain` (53.73) are about 1-2 points
+  higher, in line with the tune-rule comparison.
+- Conclusion: nothing here justifies changing the README results table. The ensemble gain is at most about
+  1 point, supported only for bagging RelGT seeds, and not measured on a second week.
+
+## Current stage (2026-11-16)
+
+Done: the ensemble experiment on the holdout week 09-26 16:00 UTC (4 configs x 3 seeds, runs `*_ens0926_s*`,
+ensembles in `experiments/ensemble/outputs/*_ens0926*/`). The results above are complete for that week.
+
+Supported by this week: seed-bagging RelGT on the chain graph (+1.00 [+0.12, +1.94]); `select` overfits the
+tune week; the push rule moves the score by about 1 point (`prev-week` is the submission-comparable one).
+Not supported: that mixing models beats the best bag, and that history features help (intervals include 0).
+
+Not done:
+- No second holdout week. The older holdout runs saved only `metrics.json`, so a second week means
+  retraining (`HO_WEEK="<UTC start of scored week>" bash runs/ensemble_ho0927.sh`, ~2.5 h on two GPUs; for the
+  bagging check alone `CONFIGS="relgt_chain" QUEUE_A="relgt_chain" QUEUE_B=""`, ~30 min a seed). The week
+  still has to be chosen and checked for enough labelled data and outage handling.
+- The README results table and the submission pipeline are unchanged: they do not use seed bagging or an
+  ensemble.
+- `all_ego_uf_ens0926_s0` was retrained by mistake (see the provenance note), so the original `s0` numbers
+  are gone; the `ens0926_full.log` figures differ slightly from the tables.
