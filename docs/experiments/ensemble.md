@@ -79,6 +79,24 @@ results of `s1` were not touched.
 | relgt_chain, final model | 52.59 (51.72-53.04) |
 | relgt_chain_hist, validation model | 51.80 (49.92-52.91) |
 | relgt_chain_hist, final model | 53.09 (52.42-53.47) |
+| relgt_chain_recent, validation model | 52.33 (51.95-52.73) |
+| relgt_chain_recent, final model | 53.41 (52.63-53.90) |
+
+`python scripts/summarize_runs.py --suffix ens0926 relgt_chain relgt_chain_recent` (n=3 seeds each; per-activity
+F1 in the order open_pr, open_issue, issue_comment, pr_review, pr_review_comment, push; best epochs by seed 0-2):
+
+| Config / model | Score (min-max) | Best epochs | open_pr | open_issue | issue_comment | pr_review | pr_review_comment | push |
+|---|---|---|---|---|---|---|---|---|
+| relgt_chain, validation | 52.05 (52.00-52.14) | 11, 8, 12 | 0.404 | 0.426 | 0.391 | 0.451 | 0.446 | 0.675 |
+| relgt_chain, final | 52.59 (51.72-53.04) | 11, 8, 12 | 0.402 | 0.462 | 0.407 | 0.447 | 0.443 | 0.681 |
+| relgt_chain_recent, validation | 52.33 (51.95-52.73) | 7, 12, 10 | 0.380 | 0.432 | 0.405 | 0.455 | 0.441 | 0.679 |
+| relgt_chain_recent, final | 53.41 (52.63-53.90) | 7, 12, 10 | 0.419 | 0.451 | 0.442 | 0.467 | 0.430 | 0.683 |
+
+For single runs `recent` helps the final model by 0.8 points (53.41 vs 52.59, mostly issue_comment 0.442 vs 0.407
+and open_pr 0.419 vs 0.402) and the validation model by 0.3; both gaps are inside the seed ranges (0.9-1.3
+points for the final models). Retraining through the tune week (final vs validation) adds 0.5 (chain) and 1.1
+(chain_recent), mainly on open_issue, issue_comment and open_pr. These means are the `own:` rows of the RelGT-only
+table below.
 
 ### Ensembles of all four configs (push share from the tune week, ranks averaged)
 
