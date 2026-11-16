@@ -110,6 +110,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import torch  # after numpy: importing torch first trips a duplicate-OpenMP error on this machine
+import torch.utils.checkpoint
 from torch import nn
 from tqdm import tqdm
 
@@ -297,6 +298,8 @@ def fit(graphs, weeks, make_model, epochs, seed, val_weeks=None, patience=5, lr=
         if bad >= patience:
             break
     bar.close()
+    if torch.cuda.is_available():
+        tqdm.write(f"peak GPU memory {torch.cuda.max_memory_allocated() / 2**30:.2f} GiB")
     if best_state is not None:
         model.load_state_dict(best_state)
     return model, best_epoch
@@ -1130,9 +1133,9 @@ class TemporalHeteroGNN(nn.Module):
     rels / n_families: the relations and time-encoder families of the graph (EV_RELS for --het-graph event)."""
 
     def __init__(self, dims, n_out, d=64, layers=2, dropout=0.1, time_dim=16, use_time=True, n_entities=0,
-                 rels=HET_RELS, n_families=HET_N_FAMILIES):
+                 rels=HET_RELS, n_families=HET_N_FAMILIES, checkpoint=False):
         super().__init__()
-        self.rels = rels
+        self.rels, self.checkpoint = rels, checkpoint
 
         def enc(i):
             return nn.Sequential(nn.Linear(i, d), nn.ReLU(), nn.Dropout(dropout), nn.Linear(d, d))
@@ -1154,7 +1157,11 @@ class TemporalHeteroGNN(nn.Module):
             phi = self.time[fam](age) if self.use_time else age.new_zeros(len(age), self.time_dim)
             edges += [(st, dt, src, dst, phi), (dt, st, dst, src, phi)]
         for layer in self.layers:
-            h = layer(h, edges)
+            if self.checkpoint and self.training:
+                # keep only the layer's input, recompute its per-edge activations in backward (same RNG)
+                h = torch.utils.checkpoint.checkpoint(layer, h, edges, use_reentrant=False)
+            else:
+                h = layer(h, edges)
         return self.head(h[0])
 
 
@@ -1207,7 +1214,8 @@ def hetero_stages(args, tables, feats, train_weeks, cohort, ev, lags, sel, repo_
         return TemporalHeteroGNN(dims, len(labels), d=args.het_dim, layers=args.het_layers, dropout=args.het_dropout,
                                  time_dim=args.het_time_dim, use_time=args.het_time == "func",
                                  n_entities=n_entities if args.het_entity_emb else 0, rels=rels,
-                                 n_families=EV_N_FAMILIES if event else HET_N_FAMILIES).to(device)
+                                 n_families=EV_N_FAMILIES if event else HET_N_FAMILIES,
+                                 checkpoint=args.het_checkpoint == "on").to(device)
 
     def train(fit_weeks, epochs, val_weeks=None):
         return fit(graphs, fit_weeks, make_model, epochs, args.seed, val_weeks=val_weeks, lr=args.lr)
@@ -1400,6 +1408,10 @@ def main():
     hg.add_argument("--het-layers", type=int, default=None,
                     help="message passing rounds (default 2; 4 with --het-graph event, which needs 4 hops "
                          "for user -> event -> object -> event -> other user)")
+    hg.add_argument("--het-checkpoint", choices=["on", "off"], default=None,
+                    help="activation checkpointing per layer: the same model, ~1 layer of activation memory "
+                         "instead of all, ~30%% slower (default on with --het-graph event, which otherwise "
+                         "needs ~12 GB, off otherwise)")
     hg.add_argument("--het-dropout", type=float, default=0.1)
     hg.add_argument("--het-max-events", type=int, default=32,
                     help="latest event edges kept per user and relation (default 32)")
@@ -1461,6 +1473,8 @@ def main():
         ap.error("--time-dim must be an even number >= 2")
     if het and args.het_layers is None:
         args.het_layers = 4 if args.het_graph == "event" else 2
+    if het and args.het_checkpoint is None:
+        args.het_checkpoint = "on" if args.het_graph == "event" else "off"
     if het and (args.het_max_events < 1 or args.het_time_dim < 1 or args.het_layers < 1):
         ap.error("--het-max-events, --het-time-dim and --het-layers must be >= 1")
     time_dim = args.time_dim if args.time_enc == "edge" else 0

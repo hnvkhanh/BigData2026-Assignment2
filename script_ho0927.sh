@@ -9,7 +9,7 @@
 # list the processes on a card, so memory in use is the test. If no GPU is free it waits and checks
 # again every GPU_WAIT seconds (default 60). GPU=<index> skips the check and uses that card.
 # CONFIGS picks the configs to run, e.g.  CONFIGS="het user_repo" bash script_ho0927.sh
-# het_ev / het_ev_notime (--het-graph event) use ~11 GB of a 12 GB card: one per GPU, nothing else on it.
+# het_ev / het_ev_notime (--het-graph event) peak at ~5.5 GB with activation checkpointing (the default): one per GPU.
 # Output folders are named <cfg>_ho0926_s<seed>: the suffix is the UTC start date of the scored week.
 HO_WEEK=${HO_WEEK:-"2026-09-26 16:00"}   # UTC start of the scored week (Saturday 16:00)
 SUF=ho$(echo "$HO_WEEK" | cut -c6-10 | tr -d -)

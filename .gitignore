@@ -7,3 +7,4 @@ experiments/*/cache/
 old_experiments/*/outputs/
 data/
 .venv/
+.venv-win/

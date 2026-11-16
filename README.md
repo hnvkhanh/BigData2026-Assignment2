@@ -652,6 +652,99 @@ copy their previous week, so the score covers all 6,064 users.
 - So the ≥ 5 filter makes the old backtest's numbers look higher, but it does not help when every
   user is scored. On the full user set, ≥ 1 event (or the model for everyone) is the better split.
 
+#### Where the score is lost: quiet vs active users (`experiments/segments/run.py`)
+
+```bash
+python experiments/segments/run.py                 # all_ego_uf_ho0926_s0-2 + the capture-drop tables -> experiments/segments/outputs/
+python experiments/segments/run.py --skip-drops --runs all_ego_uf_ho0926_s0   # error split only, any ego run
+```
+
+Quiet / active is the split above: no visible row in the 14 days before the cutoffs. The runs save
+no predictions, so the script rebuilds the hits, false alarms and misses of each group from
+`metrics.json`. Per activity it uses the overall F1, each group's F1 and positive rate
+(`holdout.per_segment`), and the number of users predicted positive (the validation share; push:
+`holdout_push.tune.share`). The rebuilt counts give back the reported scores (53.21, 53.33, 52.40).
+Then the score is recomputed with one kind of error removed: a removed miss becomes a hit, a
+removed false alarm a true negative. Only ego runs write `per_segment`, so `het` / `het_ev` can't be
+split this way.
+
+**Score if one kind of error is removed** (`all_ego_uf`, week 09-26, mean of 3 seeds):
+
+| Removed | Score | Gain |
+|---|---|---|
+| Nothing (now) | 52.98 | – |
+| Every error on quiet users (2,822) | 61.48 | +8.50 |
+| ↳ false alarms on quiet users | 53.48 | +0.50 |
+| ↳ misses on quiet users | 60.95 | +7.97 |
+| Every error on active users (3,242) | 92.85 | **+39.87** |
+| ↳ false alarms on active users | 67.65 | +14.67 |
+| ↳ misses on active users | 75.76 | +22.78 |
+
+Counts per seed, over the 6 activities: quiet users ~790 errors (~120 false alarms, ~670 misses),
+active users ~3,150 (~1,960 false alarms, ~1,190 misses).
+
+**Result: active users cost the score far more than quiet users.** They make about 80% of the
+errors.
+- **Quiet users: only push matters.** The model predicts no non-push activity for them, but they
+  have only 12–53 positives per activity (5–11% of the positives), so this costs 0.03–0.08 F1 per
+  activity. The 8.5 points are almost all push: 579 quiet users push (23% of all pushers), and
+  about 530 of them are missed.
+- **Active users, non-push:** false alarms and misses are about equal (115–310 of each per
+  activity), at F1 ~0.45. The model ranks active users poorly on these activities; the share of
+  users predicted positive is not the problem.
+- **Active users, push:** ~1,100 false alarms against ~100 misses. About 51% of all users are
+  predicted to push, nearly all of them active, so almost every active user is predicted to push,
+  including the ~40% who don't.
+- So the most room is in ranking active users on the 5 non-push activities, and in moving part of
+  the push share from active non-pushers to likely quiet pushers. A perfect fix of quiet non-push
+  is worth less than 1 point.
+
+**Which users the capture drops hit.** The EDA and the missing-data experiment show activity
+falling in the summer and again from mid-September. These are GH Archive capture losses: the
+archive drops a share of events at random (see *Experiment: handling GH Archive's missing events*). The script measures them in two ways:
+- by the model's quiet / active split, which itself moves with the capture;
+- by a fixed type from spring. A user is *heavy* with an event in at least half of the weeks
+  Feb 7 – Apr 25 (4,320 users), *light* otherwise (4,680). Spring stops before May because the cohort
+  was sampled among users active in May.
+
+Per-week activity as a fraction of spring (all 9,000 cohort users; periods: summer 07-04 → 08-22,
+Sep burst 08-29 → 09-12, recent 09-19 → 10-17, Nov 10-24 → 10-31):
+
+| Spring type | Summer | Sep burst | Recent | Nov |
+|---|---|---|---|---|
+| Heavy, non-push events | **0.05** | 0.91 | **0.22** | 0.13 |
+| Light, non-push events | 0.27 | 3.50 | 0.81 | 0.51 |
+| Heavy, push events | 0.29 | 0.10 | **0.24** | 0.04 |
+| Light, push events | 1.09 | 0.36 | 0.70 | 0.11 |
+
+The model's split, over the eligible examples of the same weeks:
+
+| | Spring | Summer | Sep burst | Recent | Nov |
+|---|---|---|---|---|---|
+| Quiet share | 18% | 40% | 54% | **46%** | 30% |
+| Quiet users who were heavy in spring | 27% | 26% | 35% | **49%** | 54% |
+| Rate of any non-push activity, active | 0.447 | 0.077 | 0.396 | 0.278 | 0.200 |
+| Rate of any non-push activity, quiet | 0.110 | 0.010 | 0.081 | 0.046 | 0.036 |
+| Push rate, active | 0.690 | 0.436 | 0.311 | 0.534 | – |
+| Push rate, quiet | 0.318 | 0.089 | 0.063 | 0.175 | – |
+
+**Result: the drops hit active users, and they turn many of them into quiet ones.**
+- Heavy users fall to 5% of their spring non-push events in the summer and to 22% recently. Light
+  users keep 27% and 81%, and their push does not drop in the summer at all. A heavy user has many
+  events for the thinning to remove; a light user had few. Only the push collapse after 10-27 hits
+  both groups (4% and 11%). Part of the gap is regression to the mean (light users were partly
+  inactive before the May sampling), but that can't explain 5% against 27%.
+- In the model's split, label rates fall in both groups, a little more for quiet users relative to
+  their spring rate, but from a much lower base. The bigger effect is that the drop moves users
+  from active to quiet: with rows missing, a heavy user's 14-day window is empty. The quiet share
+  rises from 18% to 46%, and half of the recent quiet users were heavy in spring.
+- On week 09-26, 1,308 of the 2,822 quiet users were heavy in spring. Their push rate is 0.286,
+  against 0.135 for the 1,514 light ones, and they are 374 of the 579 quiet pushers. So two thirds
+  of the quiet pushers the model misses are active users hidden by the capture loss.
+- A long-memory signal, such as spring activity or the share of past weeks with activity, could
+  find them. The 90-day and all-time user features may already carry part of it; not tested yet.
+- One holdout week for the error split, 3 seeds. The capture-drop tables cover the whole data.
+
 ### The LightGBM missing-data fixes in the GNN (`--relative-features`, `--push-share prev-week`)
 
 The two fixes that worked for LightGBM in the missing-data experiment, ported to `experiments/gnn/run.py`
@@ -975,7 +1068,10 @@ then link to each other directly. Week 2026-09-26 has 9,000 users, 20k PRs, 13k 
 - **Model.** Same `TemporalHeteroGNN` as above, with a fourth time-encoder family for gaps
   between events. It uses **4 layers** by default, because user → event → PR → event → other
   user is 4 hops. `--het-layers N` overrides this, and the folder name gets `_l<N>`.
-- **Memory.** About 11 GB of a 12 GB card, so run one job per GPU.
+- **Memory.** The 4 layers store about 12 GB of per-edge activations, which leaves no headroom on a
+  12 GB card, so `--het-checkpoint on` (the default with `--het-graph event`) keeps only each layer's
+  input and recomputes its activations in the backward pass. Same model and losses, peak 5.55 GB.
+  Run one job per GPU.
 
 ```bash
 # one run (holdout week 09-27 -> 10-04, all 6 activities, push included) -> outputs/all_het_ev_ho0926/
@@ -991,7 +1087,31 @@ python model_graph.py --model hetero-event --week "2026-09-26 16:00"          # 
 python model_graph.py --html --model hetero-event --week "2026-09-26 16:00"   # -> figures/graph_hetero-event_<login>_<date>.html
 ```
 
-Compare with `het` (52.77) and `het_notime` (52.34) in the 09-27 table above. Results: not run yet.
+**Results** (holdout week 09-27 → 10-04, all 6 activities, 3 seeds, finished 2026-11-16; score = mean, range in brackets):
+
+| Config | Score | open_pr | open_issue | issue_comment | pr_review | pr_review_comment | push | Best epochs |
+|---|---|---|---|---|---|---|---|---|
+| `het_ev` | 51.71 (50.85-52.40) | 0.410 | 0.411 | 0.422 | 0.461 | 0.445 | 0.666 | 1, 6, 12 |
+| `het_ev_notime` | 51.97 (51.45-52.26) | 0.403 | 0.434 | 0.408 | 0.459 | 0.444 | 0.668 | 1, 6, 12 |
+| `het` (object graph, for comparison) | 52.77 (52.21-53.69) | 0.411 | 0.445 | 0.425 | 0.486 | 0.461 | 0.669 | 17, 6, 16 |
+| `het_notime` | 52.34 (51.96-52.84) | 0.405 | 0.445 | 0.395 | 0.456 | 0.458 | 0.675 | 5, 12, 5 |
+
+6-activity score by push rule (`het_ev` / `het_ev_notime`): tune 51.71 / 51.97, prev_week 50.89 / 50.93,
+none 31.09 / 30.70.
+
+- **The event graph does not help.** `het_ev` is about 1 point below `het`, and `het_ev_notime` about
+  0.4 below `het_notime`. The gap to `het` is the size of the seed ranges, but the direction is the same
+  with and without the time embedding, and no activity gains clearly (pr_review is lowest, 0.461 vs 0.486).
+  Direct event links (`in_review`, `reply_to`, `push_to_pr`) cover few events (2.5k, 77, 6.7k of 177k),
+  so they add little signal for the extra size.
+- **Time embedding.** With the event graph, removing it changes the score by +0.26, within noise
+  (`het`: -0.43 the other way). No clear effect in either graph.
+- **Training is erratic.** Best epochs jump between 1 and 12, so the selected epoch is noisy.
+- **Push rule.** `tune` is best, `prev_week` loses about 0.8-1.0, and `none` falls to about 31, so push
+  carries the score here too.
+
+For the best of the other GNNs on this week, `all_ego_uf` scores 52.98, `all_ego_uf_rel` 53.06
+and `user_repo` 52.29 (3 seeds each). The top four configurations overlap within seed noise.
 
 ## Experiment: ego GNN with the hetero model's time encoding (`--ego-time func`)
 
@@ -1061,6 +1181,8 @@ Persistence in the EDA), is only partly visible. In the baseline it is counted e
 
 - `experiments/gnn/run.py --graph-structure chain`: RelGT-style chain graph for the GNN.
 - `experiments/gnn_review/`, `experiments/relations/`: see `ACTION_RELATIONSHIPS.md`.
+- `experiments/segments/run.py`: quiet vs active error split of a holdout run and the capture drops
+  by user type; see *Where the score is lost* above.
 - `scripts/download_gharchive.py` (fetch GH Archive hours), `scripts/collect_scores.py` (gather
   every metrics file into one JSON), `scripts/delete_archive_pt.py` (deletes `.pt` files and cache dirs under `results/archive_old_data`),
   `schema_graph.py` (draws `figures/schema_graph.*`), `relgt_graph.py` (draws token graphs).
