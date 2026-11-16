@@ -83,7 +83,7 @@ python experiments/relgt/run.py --graph-structure chain --chain-seed latest --nu
 The predictions are `experiments/relgt/outputs/relgt_chain_recent_test/output.csv` (one row per user of
 `assignment2/submission/test_input.csv`, six 0/1 columns). The share of users predicted positive per activity
 comes from the validation weeks (the last 3 labelled weeks by default; `--val-weeks`, `--val-start`/`--val-end`
-change that). Rename the file to `output_{studentID}.csv` and check it:
+change that). Check it:
 
 ```bash
 python assignment2/scripts/evaluate.py --pred experiments/relgt/outputs/relgt_chain_recent_test/output.csv \
