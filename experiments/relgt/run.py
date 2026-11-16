@@ -99,6 +99,12 @@ random fallback tokens.
 table's cutoff, so the tokens come from recent activity only; Users and Repositories stay visible.
 The --history / --habit seed features keep their own windows.
 
+--holdout-weeks N keeps the N newest labelled weeks out of training, validation and the final fit and
+scores them with the validation model (its thresholds) and the final model (the validation share of
+positives). holdout.npz then holds, per user, the 0/1 decisions and the probabilities of both models on
+each holdout week and the validation model's probabilities on the validation (tune) weeks, so
+experiments/ensemble/run.py can combine runs.
+
 Run from the repo root (needs PyTorch, a GPU is used if available):
     python experiments/relgt/run.py
     python experiments/relgt/run.py --habit --review-aux --name habit_aux
@@ -1446,6 +1452,14 @@ def main():
     hsel = pick(holdout_weeks, args.val_users)
     metrics["holdout"] = []
     dump = {}
+    if holdout_weeks:  # the validation model's probabilities on the tune weeks (experiments/ensemble/run.py)
+        dump["tune_weeks"] = np.array([str(w)[:10] for w in val_weeks])
+        for w in val_weeks:
+            t = tables[w]
+            m = t.eligible.values
+            dump[f"tune_{str(w)[:10]}_gids"] = cohort.github_user_id.values[m][usel[w]]
+            dump[f"tune_{str(w)[:10]}_prob"] = val_p[w].astype(np.float32)
+            dump[f"tune_{str(w)[:10]}_truth"] = t[[f"y_{k}" for k in EVENT_COLS]].values[m][usel[w]].astype(np.float32)
     for w in holdout_weeks:
         t = tables[w]
         m = t.eligible.values
@@ -1468,6 +1482,7 @@ def main():
         dump[f"{str(w)[:10]}_truth"] = t[[f"y_{k}" for k in EVENT_COLS]].values[m][hsel[w]]
         for v, cols in preds.items():
             dump[f"{str(w)[:10]}_{v.split()[0]}"] = np.stack(cols, 1)
+            dump[f"{str(w)[:10]}_prob_{v.split()[0]}"] = ph[v].astype(np.float32)
         print(f"holdout {str(w)[:10]}: " + "  ".join(f"{v} {100 * r[v]['score']:.2f}" for v in preds))
     if metrics["holdout"]:
         metrics["holdout_score_mean"] = {v: float(np.mean([r[v]["score"] for r in metrics["holdout"]]))

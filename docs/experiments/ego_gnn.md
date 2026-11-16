@@ -148,7 +148,7 @@ inside the seed spread. `--active-min-events 5` (quiet = fewer than 5 events in 
 ## Holdout week 11-07 (`--holdout`)
 
 ```bash
-python experiments/gnn/run.py --holdout --user-features --seed 0   # -> outputs/all_ego_uf_ho/metrics.json
+python experiments/gnn/run.py --holdout --user-features --seed 0   # -> outputs/all_ego_uf_ho/metrics.json (+ holdout.npz: per-user probabilities, since 2026-11-16)
 CONFIGS="all_ego all_ego_uf all_ego_seg all_ego_uf_seg user_repo" bash runs/gnn_ho1107.sh   # the 5 configs below x seeds 0-2 on 2 GPUs, logs in outputs/logs/, prints the summary
 ```
 

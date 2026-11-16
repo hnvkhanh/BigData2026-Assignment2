@@ -189,9 +189,9 @@ python experiments/segments/run.py                 # all_ego_uf_ho0926_s0-2 + th
 python experiments/segments/run.py --skip-drops --runs all_ego_uf_ho0926_s0   # error split only, any ego run
 ```
 
-Quiet / active is the split above: no visible row in the 14 days before the cutoffs. The runs save
-no predictions, so the script rebuilds the hits, false alarms and misses of each group from
-`metrics.json`. Per activity it uses the overall F1, each group's F1 and positive rate
+Quiet / active is the split above: no visible row in the 14 days before the cutoffs. These runs saved
+no predictions (holdout runs made since 2026-11-16 write `holdout.npz`, see [ensemble](ensemble.md)),
+so the script rebuilds the hits, false alarms and misses of each group from `metrics.json`. Per activity it uses the overall F1, each group's F1 and positive rate
 (`holdout.per_segment`), and the number of users predicted positive (the validation share; push:
 `holdout_push.tune.share`). The rebuilt counts give back the reported scores (53.21, 53.33, 52.40).
 Then the score is recomputed with one kind of error removed: a removed miss becomes a hit, a

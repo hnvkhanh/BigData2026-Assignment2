@@ -128,6 +128,9 @@ OUT_DIR = HERE / "outputs"
 NONPUSH = [k for k in EVENT_COLS if k != "push"]
 # --holdout: train on weeks up to 10-24, tune on 10-31, score HOLDOUT (labels to the end of the data,
 # ~2 h short of the full week; push has no data after 10-27, so only the 5 non-push activities count).
+# A holdout run writes metrics.json and holdout.npz (per eligible user: the probabilities and labels of
+# the tune and holdout weeks, the run's decisions, the previous week's push share), no output.csv.
+# experiments/ensemble/run.py combines the holdout.npz of several runs.
 HOLDOUT_TUNE = pd.Timestamp("2026-10-31 16:00")
 HOLDOUT = pd.Timestamp("2026-11-07 16:00")
 PROGRESS = {"disable": False}  # --no-progress turns the tqdm bars off
@@ -1869,8 +1872,27 @@ def main():
         metrics["holdout"] = week_result(HOLDOUT, hp, "HOLDOUT")
         if args.task == "all" and not qprev:
             metrics["holdout_push"] = holdout_push(m, q, hp)
+        # Probabilities of the tune and holdout weeks per user, so runs can be combined
+        # (experiments/ensemble/run.py). Labels are NaN where a week has none (push after 10-27).
+        t, tt = tables[HOLDOUT], tables[HOLDOUT_TUNE]
+        mt = tt.eligible.values
+        ycols = [f"y_{k}" for k in EVENT_COLS]
+        dump = {"labels": np.array(labels), "week": str(HOLDOUT), "tune_week": str(HOLDOUT_TUNE),
+                "gids": cohort.github_user_id.values[t.cidx.values[m]], "prob": q.astype(np.float32),
+                "truth": t[ycols].values[m].astype(np.float32),
+                "pred": np.stack([hp[k] if k in hp else np.zeros(int(m.sum()), bool) for k in EVENT_COLS], 1),
+                "tune_gids": cohort.github_user_id.values[tt.cidx.values[mt]],
+                "tune_prob": val_p[HOLDOUT_TUNE][mt].astype(np.float32),
+                "tune_truth": tt[ycols].values[mt].astype(np.float32),
+                "push_prev_week_share": observed_push_share(HOLDOUT, np.flatnonzero(m)),
+                "tune_push_prev_week_share": observed_push_share(HOLDOUT_TUNE, np.flatnonzero(mt))}
+        if "y_raw_push" in t:
+            dump["truth_raw_push"] = t["y_raw_push"].values[m].astype(np.float32)
+        if seg is not None:
+            dump["segment"] = seg
+        np.savez(out_dir / "holdout.npz", **dump)
         (out_dir / "metrics.json").write_text(json.dumps(metrics, indent=2, default=str))
-        print(f"wrote {out_dir / 'metrics.json'} (--holdout: no final model, no output csv)")
+        print(f"wrote {out_dir / 'metrics.json'} and holdout.npz (--holdout: no final model, no output csv)")
     else:
         # Final model: all labelled weeks for the early-stopped number of epochs; the validation
         # share of predicted positives is reused as the decision rule (as in the baseline).

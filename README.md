@@ -27,6 +27,7 @@ experiments/<name>/      one experiment per folder, run as python experiments/<n
   relgt/                 Relational Graph Transformer (README.md: its design)
   missing_data/          ways of handling GH Archive's missing events
   segments/              quiet vs active error split, capture drops by user type
+  ensemble/              combines the saved probabilities of holdout runs (seed bagging, model mean, per-activity pick)
 runs/                    multi-seed / multi-GPU run scripts; lib.sh holds their shared setup
 analysis/                Dash apps and figure scripts (EDA, missing events, model graphs, schema)
 scripts/                 utilities: download GH Archive, collect / summarize scores, clean archived runs
@@ -75,6 +76,7 @@ Most scripts run configs × seeds 0–2 one run at a time on a free GPU (`GPU=<i
 | `runs/qprev_ho0927.sh` | ego GNN, quiet users copy their previous week | 09-27 → 10-04 |
 | `runs/chain_ho0927.sh` | RelGT and GNN on the chain graph | 09-27 → 10-04 |
 | `runs/chain_ftime_ho0927.sh` | the same with a learned time embedding | 09-27 → 10-04 |
+| `runs/ensemble_ho0927.sh` | ego, hetero, chain and chain + history reruns that save probabilities, then their ensembles (`SMOKE=1` for a quick check) | 09-27 → 10-04 |
 | `runs/gnn_ho1107.sh` | ego, user–repo and hetero GNNs, two GPUs at once | 11-07 (no push labels) |
 | `runs/h14_ho1107.sh` | hetero GNN that sees only the last 14 days | 11-07 |
 | `runs/ego_time_ho1107.sh` | ego GNN with the hetero model's time encoding | 11-07 |
@@ -125,6 +127,7 @@ GNN with time encoding on the same week, with its own setup.
 | [docs/experiments/hetero_gnn.md](docs/experiments/hetero_gnn.md) | temporal heterogeneous GNN, 14-day window, event graph |
 | [docs/experiments/ego_time.md](docs/experiments/ego_time.md) | ego GNN with the hetero model's time encoding |
 | [docs/experiments/relgt.md](docs/experiments/relgt.md) | Relational Graph Transformer results |
+| [docs/experiments/ensemble.md](docs/experiments/ensemble.md) | ensemble of the tied graph models and the chain model with history features (`experiments/ensemble/run.py`) |
 | [experiments/relgt/README.md](experiments/relgt/README.md) | RelGT design: node set, chain graph, visibility, token sampling |
 | [docs/action_relationships.md](docs/action_relationships.md) | how the actions and tables relate (`experiments/gnn_review/`, `experiments/relations/`) |
 | [docs/requirement_for_task.pdf](docs/requirement_for_task.pdf) | the assignment |

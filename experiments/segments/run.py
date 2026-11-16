@@ -3,7 +3,8 @@
 Quiet = an example (eligible user, week) with no visible row in the 14 days before the per-table
 cutoffs, the split of experiments/gnn/run.py (`--segment activity`, `holdout.per_segment`).
 
-1. Error split. No predictions are saved, so the per-segment confusion counts are rebuilt from a
+1. Error split. The runs analysed saved no predictions (holdout runs since 2026-11-16 also write
+   holdout.npz with per-user probabilities), so the per-segment confusion counts are rebuilt from a
    run's metrics.json: per activity, the overall F1, the F1 and positive rate of each segment, and
    the number of users predicted positive (validation share x users; push: holdout_push.tune.share).
    With TP = F1 * (predicted + positives) / 2 for each segment and for both together, the

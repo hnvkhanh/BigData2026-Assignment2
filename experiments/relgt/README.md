@@ -140,6 +140,10 @@ python experiments/relgt/run.py --graph-structure fk --epochs 15 --end 2026-06-0
 python experiments/relgt/run.py --graph-structure fk --epochs 15 --end 2026-06-01     --exclude-push --name fk_exp2_nopush
 ```
 
-Each run writes `output.csv`, `metrics.json` (all args are stored in it) and `holdout.npz` to
-`experiments/relgt/outputs/<name>/`. Tokens are cached in `experiments/relgt/cache/`.
+Each run writes `output.csv`, `metrics.json` (all args are stored in it) and, with `--holdout-weeks`,
+`holdout.npz` to `experiments/relgt/outputs/<name>/`. The npz has, per holdout week `<date>`, the user ids
+(`<date>_gids`), labels (`<date>_truth`), the decisions and probabilities of the final and validation
+models (`<date>_final`, `<date>_prob_final`, `<date>_validation`, `<date>_prob_validation`), and for each
+tune week `tune_<date>_{gids,prob,truth}` (validation model; since 2026-11-16, for
+`experiments/ensemble/run.py`). Tokens are cached in `experiments/relgt/cache/`.
 `python analysis/relgt_graph.py --interactive` draws the graph for a given user and week.
