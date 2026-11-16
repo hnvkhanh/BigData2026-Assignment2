@@ -103,8 +103,7 @@ It does the following; run the steps by hand if you prefer.
 3. **Checks the format** with `assignment2/scripts/evaluate.py` (below).
 
 **The result.** The file is `experiments/relgt/outputs/relgt_chain_recent_bag/output.csv` (one
-row per user of `assignment2/submission/test_input.csv`, six 0/1 columns). Rename it to
-`output_{studentID}.csv` (or pass `-StudentId`). The format check by hand:
+row per user of `assignment2/submission/test_input.csv`, six 0/1 columns). The format check by hand:
 
 ```bash
 python assignment2/scripts/evaluate.py --pred experiments/relgt/outputs/relgt_chain_recent_bag/output.csv \
