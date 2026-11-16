@@ -1,6 +1,7 @@
 """Holdout scores of multi-seed runs, one row per config (mean over seeds, range in brackets).
 
-Reads experiments/gnn/outputs/<cfg>_<suffix>_s<seed>/metrics.json and, for RelGT runs,
+Reads experiments/gnn/outputs/<cfg>_<suffix>_s<seed>/metrics.json (a second row for the final model of
+--holdout-final runs; best_ep then lists their final-fit epochs) and, for RelGT runs,
 experiments/relgt/outputs/<cfg>_<suffix>_s<seed>/metrics.json (two rows: its validation model and
 its final model). A config name may contain * to match several configs. Used by the scripts in runs/.
 
@@ -64,6 +65,11 @@ def rows(cfg, suffix, segments):
                 for o in hps[0] if isinstance(hps[0][o], dict))
         out.append((cfg, [100 * h["score"] for h in hs], [m.get("best_epoch") for m in ms],
                     {k: np.mean([h["f1"][k] for h in hs]) for k in hs[0]["f1"]}, extra, push))
+        fs = [m for m in ms if "score" in m.get("holdout_final", {})]  # --holdout-final: the refit model
+        if fs:
+            hf = [m["holdout_final"] for m in fs]
+            out.append((f"{cfg} (final model)", [100 * h["score"] for h in hf], [m.get("final_epochs") for m in fs],
+                        {k: np.mean([h["f1"][k] for h in hf]) for k in hf[0]["f1"]}, "", None))
     rel = [m for m in runs("relgt", cfg, suffix) if isinstance(m.get("holdout"), list) and m["holdout"]]
     for v in RELGT_VARIANTS if rel else ():
         hs = [m["holdout"][0][v] for m in rel]

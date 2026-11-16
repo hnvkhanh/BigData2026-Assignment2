@@ -135,10 +135,58 @@ pr_review, pr_review_comment <- relgt_chain_hist; push <- relgt_chain. The offic
 - Conclusion: nothing here justifies changing the README results table. The ensemble gain is at most about
   1 point, supported only for bagging RelGT seeds, and not measured on a second week.
 
+### RelGT-only ensemble (chain / fk graph, with and without `recent`)
+
+Same decision rule, same week (holdout 09-26: 6,064 users; tune week 09-19: 6,412 users), 4 RelGT configs x
+seeds 0-2 (`<cfg>_ens0926_s<seed>`), combined without the ego GNN and het:
+
+```bash
+python experiments/ensemble/run.py --suffix ens0926 relgt_chain relgt_chain_recent relgt_fk relgt_fk_recent
+```
+
+Output: `experiments/ensemble/outputs/relgt_chain+relgt_chain_recent+relgt_fk+relgt_fk_recent_ens0926/metrics.json`.
+Official 6-activity score. The reference for the bootstrap is `bag:relgt_chain_recent` (best tune-week score).
+
+| Variant | Score | Tune | open_pr | open_issue | issue_comment | pr_review | pr_review_comment | push | vs reference [95% CI] |
+|---|---|---|---|---|---|---|---|---|---|
+| own:relgt_chain | 52.59 | - | 0.402 | 0.462 | 0.407 | 0.447 | 0.443 | 0.681 | |
+| own:relgt_chain_recent | 53.41 | - | 0.419 | 0.451 | 0.442 | 0.467 | 0.430 | 0.683 | |
+| own:relgt_fk | 50.25 | - | 0.367 | 0.410 | 0.372 | 0.433 | 0.398 | 0.672 | |
+| own:relgt_fk_recent | 52.44 | - | 0.414 | 0.444 | 0.411 | 0.448 | 0.413 | 0.679 | |
+| bag:relgt_chain | **54.42** | 51.63 | 0.434 | 0.481 | 0.461 | 0.502 | 0.454 | 0.684 | +0.36 [-0.44, +1.13] |
+| bag:relgt_chain_recent (reference) | 54.06 | 52.56 | 0.447 | 0.459 | 0.408 | 0.510 | 0.460 | 0.683 | 0 |
+| bag:relgt_fk | 52.66 | 50.67 | 0.426 | 0.446 | 0.441 | 0.472 | 0.393 | 0.681 | -1.40 [-2.49, -0.32] |
+| bag:relgt_fk_recent | 54.10 | 52.45 | 0.422 | 0.464 | 0.433 | 0.487 | 0.461 | 0.685 | +0.04 [-0.90, +0.97] |
+| mean | 53.37 | 53.03 | 0.440 | 0.453 | 0.433 | 0.437 | 0.470 | 0.681 | -0.69 [-1.47, +0.12] |
+| select | 54.32 | 52.74 | 0.422 | 0.459 | 0.461 | 0.510 | 0.460 | 0.684 | +0.26 [-0.32, +0.83] |
+
+The official scorer on `mean` gives 53.37 (matches). `select` picked: open_pr <- relgt_fk_recent, open_issue,
+pr_review, pr_review_comment <- relgt_chain_recent, issue_comment, push <- relgt_chain.
+
+Single seeds (score / tune-week score): chain 53.85/51.01, 53.01/51.53, 51.72/51.42; chain_recent 52.91/52.40,
+53.71/52.43, 53.47/51.79; fk 49.83/49.13, 50.61/48.94, 49.86/48.89; fk_recent 52.13/52.05, 52.07/51.78,
+52.60/52.17 (seeds 0, 1, 2 in that order).
+
+Reading:
+- **Bagging** beats the mean of the three single seeds (same pipeline) for every config: chain 52.86 -> 54.42
+  (+1.6), chain_recent 53.36 -> 54.06 (+0.7), fk 50.10 -> 52.66 (+2.6), fk_recent 52.27 -> 54.10 (+1.8). Seed
+  ranges are 2.1 (chain), 0.8, 0.8 and 0.5 points, so the gain is clearest where the seeds disagree most.
+- **`recent`** raises the weaker graph the most: fk 52.66 -> 54.10 as bags and 49.8-50.6 -> 52.1-52.6 per seed.
+  On the chain graph the bags are 54.42 vs 54.06, a tie. The only interval that excludes 0 is `bag:relgt_fk`
+  (worse, -1.40 [-2.49, -0.32]).
+- **`mean` does not beat its best member** (53.37 vs 54.06-54.42; the interval to the reference, -0.69
+  [-1.47, +0.12], includes 0) although it has the best tune-week score (53.03). `select` (54.32) is level with
+  the best bag, not above it. As in the four-config table, picking or mixing by tune week does not carry to
+  the holdout; the tune week ranks the bags wrongly (chain has the lowest tune score of the three good bags and
+  the highest holdout score).
+- Conclusion: among the RelGT variants only fk without `recent` is worse; chain, chain_recent and fk_recent
+  tie at 54.1-54.4 as bags. No change to the README table.
+
 ## Current stage (2026-11-16)
 
 Done: the ensemble experiment on the holdout week 09-26 16:00 UTC (4 configs x 3 seeds, runs `*_ens0926_s*`,
-ensembles in `experiments/ensemble/outputs/*_ens0926*/`). The results above are complete for that week.
+ensembles in `experiments/ensemble/outputs/*_ens0926*/`), and the RelGT-only ensemble of chain / chain_recent /
+fk / fk_recent. The results above are complete for that week.
 
 Supported by this week: seed-bagging RelGT on the chain graph (+1.00 [+0.12, +1.94]); `select` overfits the
 tune week; the push rule moves the score by about 1 point (`prev-week` is the submission-comparable one).

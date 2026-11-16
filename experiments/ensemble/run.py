@@ -60,12 +60,15 @@ class Run:
             setattr(self, k, v)
 
 
-def load_gnn(path, name):
+def load_gnn(path, name, variant="validation"):
     d = np.load(path)
     labels = [str(x) for x in d["labels"]]
     if labels != EVENT_COLS:
         raise SystemExit(f"{name}: an all-activity run is needed (labels {labels})")
-    return Run(name, "gnn", gids=d["gids"], prob=d["prob"].astype(np.float64), truth=d["truth"], pred=d["pred"],
+    if variant == "final" and "prob_final" not in d.files:
+        raise SystemExit(f"{name}: no final model in {path} (run experiments/gnn/run.py with --holdout-final)")
+    prob, pred = (d["prob_final"], d["pred_final"]) if variant == "final" else (d["prob"], d["pred"])
+    return Run(name, "gnn", gids=d["gids"], prob=prob.astype(np.float64), truth=d["truth"], pred=pred,
                tune_gids=d["tune_gids"], tune_prob=d["tune_prob"].astype(np.float64), tune_truth=d["tune_truth"],
                push_prev=float(d["push_prev_week_share"]), tune_push_prev=float(d["tune_push_prev_week_share"]),
                week=str(d["week"]), tune_week=str(d["tune_week"]))
@@ -88,13 +91,13 @@ def load_relgt(path, name, variant):
                tune_truth=d[f"tune_{tw[0]}_truth"], push_prev=None, tune_push_prev=None, week=w, tune_week=tw[0])
 
 
-def find_runs(cfg, suffix, variant):
+def find_runs(cfg, suffix, variant, gnn_variant="validation"):
     out = []
     for model, d in OUTPUTS.items():
         for f in sorted(glob.glob(str(d / f"{glob.escape(cfg)}_{suffix}_s*" / "holdout.npz"))):
             name = Path(f).parent.name
             if re.fullmatch(rf"{re.escape(cfg)}_{re.escape(suffix)}_s\d+", name):
-                out.append(load_gnn(f, name) if model == "gnn" else load_relgt(f, name, variant))
+                out.append(load_gnn(f, name, gnn_variant) if model == "gnn" else load_relgt(f, name, variant))
     if not out:
         raise SystemExit(f"no holdout.npz for {cfg}_{suffix}_s* (runs made before probabilities were saved "
                          f"have only metrics.json: rerun them, e.g. bash runs/ensemble_ho0927.sh)")
@@ -168,6 +171,10 @@ def main():
     ap.add_argument("--push-rule", choices=["tune", "prev-week"], default="tune")
     ap.add_argument("--relgt-variant", choices=["final", "validation"], default="final",
                     help="which RelGT model's holdout probabilities to use")
+    ap.add_argument("--gnn-variant", choices=["validation", "final"], default="validation",
+                    help="which GNN model's holdout probabilities to use: the one trained to the tune week "
+                         "(validation), or the refit through it (final; runs made with --holdout-final). The "
+                         "tune-week probabilities are always the validation model's")
     ap.add_argument("--bootstrap", type=int, default=2000, help="paired bootstrap resamples (0: none)")
     ap.add_argument("--name", default=None)
     args = ap.parse_args()
@@ -177,11 +184,12 @@ def main():
     weights = weights / weights.sum()
     name = args.name or ("+".join(args.configs) + f"_{args.suffix}" + ("" if args.normalize == "rank" else "_prob")
                          + ("" if args.rule == "f1" else "_joint") + ("" if args.push_rule == "tune" else "_pprev")
-                         + ("" if args.relgt_variant == "final" else "_val"))
+                         + ("" if args.relgt_variant == "final" else "_val")
+                         + ("" if args.gnn_variant == "validation" else "_gfinal"))
     out_dir = OUT / name
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    members = {c: find_runs(c, args.suffix, args.relgt_variant) for c in args.configs}
+    members = {c: find_runs(c, args.suffix, args.relgt_variant, args.gnn_variant) for c in args.configs}
     runs = [r for rs in members.values() for r in rs]
     weeks = {(r.week[:10], r.tune_week[:10]) for r in runs}
     if len(weeks) != 1:

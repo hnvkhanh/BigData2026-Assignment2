@@ -74,6 +74,12 @@ history features. Weeks, labels, --actions, --users, thresholds and output are t
 --layers should reach the tokens: a message travels one hop per layer. The token time is relgt's
 TimeEncoder (fixed sinusoids + linear); --chain-time func uses relgt's LearnedTimeEncoder instead
 (learned cos(w log(1 + days) + b) + linear). Results go to outputs/<task>_chain[_ftime]/.
+--graph-structure fk is the same with relgt's plain foreign-key row graph (every row linked to its user)
+and its tokens: the user and K - 1 rows sampled from its 1- and 2-hop neighbours. Results go to
+outputs/<task>_fk/.
+--token-model relgnn (chain or fk) replaces RowGNN by RelGNN (experiments/relgnn: composite message passing
+over the schema's atomic routes, read out at the user token by default, --relgnn-readout); same tokens,
+protocol and outputs. Results go to outputs/<task>_chain_relgnn/ or <task>_fk_relgnn/.
 
 --time-enc edge (user-repo graph): the days since the last and the first event of each user-repo
 edge (within the 90 days before the cutoff) go through relgt's sinusoidal PositionalEncoding and a
@@ -100,12 +106,15 @@ Run from the repo root:
     python experiments/gnn/run.py --graph-structure hetero --holdout              # -> outputs/all_het_ho/
     python experiments/gnn/run.py --graph-structure hetero --het-time none --holdout
     python experiments/gnn/run.py --graph-structure chain --chain-seed latest --num-seeds 16 --exclude-push
+    python experiments/gnn/run.py --graph-structure chain --chain-seed latest --num-seeds 16 --token-model relgnn
+    python experiments/gnn/run.py --graph-structure fk --token-model relgnn
 """
 import argparse
 import functools
 import importlib
 import json
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
@@ -332,6 +341,7 @@ def train_batched(make_model, batch, ids, fit_weeks, epochs, val_weeks, lr, seed
         n_steps = min(n_steps, max_steps)
     for epoch in range(1, epochs + 1):
         model.train()
+        t0 = time.time()
         perm = rng.permutation(examples)
         bar = tqdm(range(n_steps), desc=f"epoch {epoch}/{epochs}", unit="batch", dynamic_ncols=True,
                    leave=False, **PROGRESS)
@@ -361,7 +371,8 @@ def train_batched(make_model, batch, ids, fit_weeks, epochs, val_weeks, lr, seed
                 if not torch.isnan(yw).all():
                     vl.append(masked_bce(lw, yw, torch.ones(len(yw), dtype=torch.bool, device=yw.device)).item())
         vl = float(np.mean(vl))
-        tqdm.write(f"  epoch {epoch:2d}  train loss {run_loss:.4f}  val loss {vl:.4f}")
+        tqdm.write(f"  epoch {epoch:2d}  train loss {run_loss:.4f}  val loss {vl:.4f}  "
+                   f"{n_steps} steps + validation {time.time() - t0:.0f}s")
         if vl < best - 1e-4:
             best, best_epoch, bad = vl, epoch, 0
             best_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
@@ -369,6 +380,8 @@ def train_batched(make_model, batch, ids, fit_weeks, epochs, val_weeks, lr, seed
             bad += 1
             if bad >= patience:
                 break
+    if torch.cuda.is_available():
+        tqdm.write(f"peak GPU memory {torch.cuda.max_memory_allocated() / 2**30:.2f} GiB")
     if best_state is not None:
         model.load_state_dict(best_state)
     return model, best_epoch
@@ -1270,6 +1283,12 @@ def load_relgt():
     return importlib.import_module("experiments.relgt.run")
 
 
+@functools.cache
+def load_relgnn():
+    """experiments/relgnn/model.py (--token-model relgnn); it imports relgt, so it is loaded the same way."""
+    return importlib.import_module("experiments.relgnn.model")
+
+
 def merge_repeated_tokens(nodes, edges, n_rel):
     """Tokens repeat when a walk does not fill K. Moves the edges to each node's first token, once, so
     a repeated row does not count twice in the mean aggregation; the repeats are left without edges."""
@@ -1290,7 +1309,7 @@ def merge_repeated_tokens(nodes, edges, n_rel):
 
 
 def token_stages(args, tables, feats, weeks, train_weeks, cohort, lags, test, labels, device):
-    """--graph-structure chain: the tokens of every example, and the functions that train on weeks and
+    """--graph-structure chain / fk: the tokens of every example, and the functions that train on weeks and
     predict one week (one value per row of its table; NaN for users without an example)."""
     relgt = load_relgt()
     all_weeks = weeks + [base.TEST_START]
@@ -1305,8 +1324,9 @@ def token_stages(args, tables, feats, weeks, train_weeks, cohort, lags, test, la
     rows[base.TEST_START] = pd.Series(np.arange(len(tt)), index=cohort.github_user_id.values[tt.cidx.values]
                                       ).loc[test.UserID].values
     cidx = [tables[w].cidx.values[rows[w]] for w in all_weeks]
-    G = relgt.Graph("chain")
-    seeds = [G.offset[relgt.TABLES.index("Users")] + cohort.user_id.values[c] for c in cidx]
+    G = relgt.Graph(args.graph_structure)
+    user_node = G.offset[relgt.TABLES.index("Users")] + cohort.user_id.values  # per cohort index
+    seeds = [user_node[c] for c in cidx]
     nodes, hops, paths, edges = relgt.tokenize(G, seeds, cutoffs, args.num_neighbors, args.seed, "uniform", "random",
                                                "none", args.lookback_days, args.max_hops, args.chain_seed,
                                                args.exclude_push, args.num_seeds)
@@ -1326,10 +1346,28 @@ def token_stages(args, tables, feats, weeks, train_weeks, cohort, lags, test, la
           f"share of tokens within {args.layers} hops of a seed: {(hops <= args.layers).mean():.0%}")
 
     def make_model():
+        if args.token_model == "relgnn":
+            # Table encoders with torch_frame ResNet's dropout (0.2), as relbench's HeteroEncoder.
+            return load_relgnn().RelGNN(relgt.RowEncoder(G, cutoffs, week_day, args.channels, 0.2), user_node,
+                                        seed_x.shape[1], len(labels), chain=args.graph_structure == "chain",
+                                        d=args.channels, layers=args.layers, heads=args.relgnn_heads,
+                                        readout=args.relgnn_readout).to(device)
         return RowGNN(relgt.RowEncoder(G, cutoffs, week_day, args.channels, 0.1),
                       relgt.TIME_ENCODERS[args.chain_time](args.channels),
                       len(relgt.TABLES) + 1, args.max_hops + 3, relgt.N_ALL_REL, seed_x.shape[1], len(labels),
                       d=args.channels, layers=args.layers).to(device)
+
+    if args.token_model == "relgnn":
+        has_user = (nodes == user_node[np.concatenate(cidx)][:, None]).any(1)
+        m = make_model()
+        kinds = [r.kind for r in m.routes]
+        print(f"RelGNN: {len(kinds)} atomic routes ({kinds.count('dim-fact-dim')} dim-fact-dim, "
+              f"{kinds.count('dim-dim')} dim-dim), {args.layers} layers, {args.channels} channels, "
+              f"{args.relgnn_heads} heads, readout {args.relgnn_readout}, "
+              f"{sum(p.numel() for p in m.parameters()):,} parameters; user token in {has_user.mean():.2%} of examples")
+        del m
+        if args.relgnn_readout == "user" and not has_user.all():
+            raise SystemExit("--relgnn-readout user: some examples have no token of their user")
 
     def train(fit_weeks, epochs, val_weeks=None):
         return train_batched(make_model, S.batch, ids, fit_weeks, epochs, val_weeks, args.lr, args.seed,
@@ -1378,6 +1416,12 @@ def main():
                     help="with --holdout: score this week instead of 11-07 (UTC start, Saturday 16:00, e.g. "
                          "'2026-09-26 16:00'); the tune week is the week before. A week that is fully "
                          "labelled (push included) is scored on all the activities; run name gets _ho<MMDD>")
+    ap.add_argument("--holdout-final", action="store_true",
+                    help="with --holdout: also refit a final model on every labelled week through the tune "
+                         "week (as RelGT's final model) and score it on the holdout week with the same "
+                         "decision rule (the tune week's shares); saved as holdout_final / prob_final")
+    ap.add_argument("--final-epochs", type=int, default=None,
+                    help="epochs of the final fit (default: the best epoch of the validation stage)")
     ap.add_argument("--no-progress", action="store_true", help="turn off the tqdm progress bars")
     ap.add_argument("--time-enc", choices=["none", "edge"], default="none",
                     help="user-repo graph: edge = add a learned sinusoidal encoding of the days since the "
@@ -1385,7 +1429,7 @@ def main():
     ap.add_argument("--time-dim", type=int, default=16, help="size of each time encoding (--time-enc edge)")
     ap.add_argument("--history-days", type=int, default=None,
                     help="the model only sees rows of the last N days before each cutoff (user features, "
-                         "graph edges and repo features; with --graph-structure chain, the tokens), in "
+                         "graph edges and repo features; with --graph-structure chain / fk, the tokens), in "
                          "training, validation and test alike (default: all, edges 90 days)")
     ap.add_argument("--relative-features", action="store_true",
                     help="user features: each count divided by the cohort mean of the same week, plus log cohort "
@@ -1395,12 +1439,13 @@ def main():
                     help="share of users predicted to push on a new week: tune = the validation share (default); "
                          "prev-week = the share of those users with a push in the last 7 days of push data "
                          "before the week (push capture fell to ~1-7%% after 10-27)")
-    ap.add_argument("--graph-structure", choices=["ego", "user-repo", "hetero", "chain"], default="ego",
+    ap.add_argument("--graph-structure", choices=["ego", "user-repo", "hetero", "chain", "fk"], default="ego",
                     help="ego: one star graph per example, the user and its recent PRs / issues / repos "
                          "(archive/old_experiments/relgt_inspired GNN). user-repo: one user <-> repository graph "
                          "per week (HeteroSAGE). hetero: one user / PR / issue / repo graph per week, one "
                          "edge per event with a time encoding and time-aware attention. chain: the row "
-                         "graph of experiments/relgt, one token subgraph per example")
+                         "graph of experiments/relgt, one token subgraph per example. fk: relgt's plain "
+                         "foreign-key row graph and its 1- / 2-hop token sample")
     hg = ap.add_argument_group("--graph-structure hetero")
     hg.add_argument("--het-dim", type=int, default=64)
     hg.add_argument("--het-graph", choices=["object", "event"], default="object",
@@ -1445,30 +1490,52 @@ def main():
     eg.add_argument("--active-min-events", type=int, default=1,
                     help="an example is active with >= N visible activity rows in the ego window "
                          "(default 1 = any token; 5 = the old experiment's selection)")
-    g = ap.add_argument_group("--graph-structure chain (same meaning as in experiments/relgt)")
-    g.add_argument("--max-hops", type=int, default=50, help="how far the walk may go from the seed")
+    g = ap.add_argument_group("--graph-structure chain / fk (same meaning as in experiments/relgt)")
+    g.add_argument("--max-hops", type=int, default=50, help="chain: how far the walk may go from the seed")
     g.add_argument("--chain-seed", choices=["user", "latest"], default="user",
-                   help="where the walk starts and the readout is taken: the user, or its latest visible action")
+                   help="chain: where the walk starts and the readout is taken: the user, or its latest visible action")
     g.add_argument("--num-seeds", type=int, default=1,
-                   help="with --chain-seed latest: the N latest visible actions are the seeds")
+                   help="chain with --chain-seed latest: the N latest visible actions are the seeds")
     g.add_argument("--exclude-push", action="store_true", help="hide all Pushes rows from the graph")
     g.add_argument("--lookback-days", type=float, default=None, help="only activity rows of the last N days are visible")
     g.add_argument("--num-neighbors", type=int, default=100, help="K tokens per example")
-    g.add_argument("--layers", type=int, default=3, help="message passing rounds")
-    g.add_argument("--channels", type=int, default=64)
+    g.add_argument("--token-model", choices=["rowgnn", "relgnn"], default="rowgnn",
+                   help="message passing over the tokens: rowgnn = relation-typed GraphSAGE (RowGNN), relgnn = "
+                        "RelGNN's composite message passing over atomic routes (experiments/relgnn)")
+    g.add_argument("--layers", type=int, default=None, help="message passing rounds (default: rowgnn 3, relgnn 2)")
+    g.add_argument("--channels", type=int, default=None, help="default: rowgnn 64, relgnn 128")
     g.add_argument("--chain-time", choices=["sin", "func"], default="sin",
-                   help="token age encoding: sin = relgt's fixed sinusoids + linear, func = learned "
+                   help="rowgnn token age encoding: sin = relgt's fixed sinusoids + linear, func = learned "
                         "cos(w log(1 + days) + b) + linear")
+    g.add_argument("--relgnn-heads", type=int, default=4, help="relgnn: attention heads of every route")
+    g.add_argument("--relgnn-readout", choices=["user", "seeds"], default="user",
+                   help="relgnn: the head reads the user token (the entity, as RelGNN), or the mean of the hop-0 "
+                        "tokens (RowGNN's readout; the same as user except with --chain-seed latest)")
     args = ap.parse_args()
-    chain, ego = args.graph_structure == "chain", args.graph_structure == "ego"
-    het = args.graph_structure == "hetero"
-    args.lr = args.lr or {"ego": 1e-3, "user-repo": 2e-3, "hetero": 2e-3, "chain": 3e-4}[args.graph_structure]
+    ego, het = args.graph_structure == "ego", args.graph_structure == "hetero"
+    tok = args.graph_structure in ("chain", "fk")  # token subgraphs of relgt's row graph (token_stages)
+    relgnn = tok and args.token_model == "relgnn"
+    args.lr = args.lr or {"ego": 1e-3, "user-repo": 2e-3, "hetero": 2e-3, "chain": 3e-4,
+                          "fk": 3e-4}[args.graph_structure]
     args.epochs = args.epochs or (40 if args.graph_structure in ("user-repo", "hetero") else 20)
     args.batch_size = args.batch_size or (256 if ego else 512)
-    for group, needed in [(g, "chain"), (eg, "ego"), (hg, "hetero")]:
+    for group, needed in [(g, ("chain", "fk")), (eg, ("ego",)), (hg, ("hetero",))]:
         changed = [a.option_strings[0] for a in group._group_actions if ap.get_default(a.dest) != getattr(args, a.dest)]
-        if args.graph_structure != needed and changed:
-            ap.error(f"these options need --graph-structure {needed}: " + ", ".join(changed))
+        if args.graph_structure not in needed and changed:
+            ap.error(f"these options need --graph-structure {' or '.join(needed)}: " + ", ".join(changed))
+    only = [("chain", {"max_hops", "chain_seed", "num_seeds"}), ("relgnn", {"relgnn_heads", "relgnn_readout"}),
+            ("rowgnn", {"chain_time"})]
+    for what, dests in only:
+        changed = [a.option_strings[0] for a in g._group_actions
+                   if a.dest in dests and ap.get_default(a.dest) != getattr(args, a.dest)]
+        if changed and what != (args.graph_structure if what == "chain" else args.token_model):
+            ap.error(f"these options need {'--graph-structure' if what == 'chain' else '--token-model'} {what}: "
+                     + ", ".join(changed))
+    if tok:
+        args.layers = args.layers or (2 if relgnn else 3)
+        args.channels = args.channels or (128 if relgnn else 64)
+    if relgnn and (args.relgnn_heads < 1 or args.layers < 1):
+        ap.error("--relgnn-heads and --layers must be >= 1")
     if args.graph_structure != "user-repo" and args.time_enc != "none":
         ap.error("--time-enc is for the user-repo graph (the ego and chain tokens already encode their time)")
     if args.time_enc != "none" and (args.time_dim < 2 or args.time_dim % 2):
@@ -1483,7 +1550,7 @@ def main():
     hist = args.history_days
     if hist is not None and not 8 <= hist <= 90:
         ap.error("--history-days must be in 8..90")
-    if hist and chain:
+    if hist and tok:
         if args.lookback_days not in (None, hist):
             ap.error("--history-days and --lookback-days disagree")
         args.lookback_days = float(hist)
@@ -1507,8 +1574,9 @@ def main():
     labels = [k for k in EVENT_COLS if k in labels]  # canonical order, no duplicates
     args.task = "all" if labels == list(EVENT_COLS) else "+".join(labels)
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    default_name = ((args.task if args.users == "all" else f"{args.task}_{args.users}") + ("_chain" if chain else "")
-                    + ("_ftime" if chain and args.chain_time == "func" else "")
+    default_name = ((args.task if args.users == "all" else f"{args.task}_{args.users}")
+                    + (f"_{args.graph_structure}" if tok else "")
+                    + ("_ftime" if tok and args.chain_time == "func" else "") + ("_relgnn" if relgnn else "")
                     + ("_ego" if ego else "") + ("_uf" if ego and args.user_features else "")
                     + ({"func": "_ftime", "none": "_notime"}.get(args.ego_time, "") if ego else "")
                     + ("_het" if het else "") + ("_ev" if het and args.het_graph == "event" else "")
@@ -1529,6 +1597,8 @@ def main():
                  "and --segment none")
     if args.holdout_week and not args.holdout:
         ap.error("--holdout-week needs --holdout")
+    if args.holdout_final and not args.holdout:
+        ap.error("--holdout-final needs --holdout")
     if args.holdout:
         if args.holdout_week:
             HOLDOUT = pd.Timestamp(args.holdout_week)
@@ -1622,7 +1692,7 @@ def main():
     elif het:
         train, predict_week = hetero_stages(args, tables, feats, train_weeks, cohort, ev, lags, sel, repo_is_org,
                                             labels, device)
-    elif chain:
+    elif tok:
         train, predict_week = token_stages(args, tables, feats, weeks, train_weeks, cohort, lags, test, labels, device)
     else:
         raw_graphs = {w: week_graph(ev, w, lags, repo_is_org, sel[w], times=True, window=hist or 90) for w in tables}
@@ -1678,8 +1748,8 @@ def main():
         metrics["active_min_events"] = args.active_min_events
     if het:
         metrics["graph"] = {a.dest: getattr(args, a.dest) for a in hg._group_actions}
-    if chain or ego:
-        metrics["graph"] = {a.dest: getattr(args, a.dest) for a in (g if chain else eg)._group_actions}
+    if tok or ego:
+        metrics["graph"] = {a.dest: getattr(args, a.dest) for a in (g if tok else eg)._group_actions}
         metrics["graph"].update(batch_size=args.batch_size, max_steps_per_epoch=args.max_steps_per_epoch)
     val_p = {w: predict_week(model, w) for w in val_weeks}
     rates, seg_rates = {}, {}
@@ -1861,14 +1931,17 @@ def main():
         metrics["holdout_protocol"] = {"train_last": str(train_weeks[-1]), "tune": str(HOLDOUT_TUNE),
                                        "holdout": str(HOLDOUT), "scored": scored,
                                        "label_end": str(min(data_end[k] for k in scored))}
-        if qprev:  # the tune week's share of active users predicted positive, applied to the active users
-            act = seg == 1
-            hp = {}
-            for k in scored:
-                hp[k] = np.zeros(len(q), bool)
-                hp[k][act] = decide(q[act, labels.index(k)], None, k, HOLDOUT, np.flatnonzero(m)[act])
-        else:
-            hp = {k: decide(q[:, labels.index(k)], seg, k, HOLDOUT, np.flatnonzero(m)) for k in scored}
+        def holdout_decisions(q):
+            if qprev:  # the tune week's share of active users predicted positive, applied to the active users
+                act = seg == 1
+                hp = {}
+                for k in scored:
+                    hp[k] = np.zeros(len(q), bool)
+                    hp[k][act] = decide(q[act, labels.index(k)], None, k, HOLDOUT, np.flatnonzero(m)[act])
+                return hp
+            return {k: decide(q[:, labels.index(k)], seg, k, HOLDOUT, np.flatnonzero(m)) for k in scored}
+
+        hp = holdout_decisions(q)
         metrics["holdout"] = week_result(HOLDOUT, hp, "HOLDOUT")
         if args.task == "all" and not qprev:
             metrics["holdout_push"] = holdout_push(m, q, hp)
@@ -1890,9 +1963,23 @@ def main():
             dump["truth_raw_push"] = t["y_raw_push"].values[m].astype(np.float32)
         if seg is not None:
             dump["segment"] = seg
+        if args.holdout_final:
+            # Final model: every labelled week through the tune week (final_weeks; the holdout week is in
+            # none of the splits), refit from scratch; the decision rule stays the tune week's shares.
+            final_ep = args.final_epochs or best_epoch
+            print(f"final fit: {len(final_weeks)} weeks through {str(final_weeks[-1])[:10]}, {final_ep} epoch(s)")
+            final, _ = train(final_weeks, final_ep)
+            qf = predict_week(final, HOLDOUT)[m]
+            hpf = holdout_decisions(qf)
+            metrics["final_epochs"] = final_ep
+            metrics["holdout_final"] = week_result(HOLDOUT, hpf, "HOLDOUT_FINAL")
+            dump["prob_final"] = qf.astype(np.float32)
+            dump["pred_final"] = np.stack([hpf[k] if k in hpf else np.zeros(int(m.sum()), bool)
+                                           for k in EVENT_COLS], 1)
         np.savez(out_dir / "holdout.npz", **dump)
         (out_dir / "metrics.json").write_text(json.dumps(metrics, indent=2, default=str))
-        print(f"wrote {out_dir / 'metrics.json'} and holdout.npz (--holdout: no final model, no output csv)")
+        print(f"wrote {out_dir / 'metrics.json'} and holdout.npz (--holdout: no output csv"
+              + ("" if args.holdout_final else ", no final model") + ")")
     else:
         # Final model: all labelled weeks for the early-stopped number of epochs; the validation
         # share of predicted positives is reused as the decision rule (as in the baseline).
@@ -1920,10 +2007,13 @@ def main():
     print(f"  {'average':18s} {np.mean([metrics['per_label'][k]['val_f1'] for k in scored]):10.4f} "
           f"{np.mean([metrics['val_f1_mean'][k] for k in scored]):15.4f}")
     if args.holdout:
-        h = metrics["holdout"]
-        print(f"\nHOLDOUT {str(HOLDOUT)[:10]} ({h['users']:,} users, {len(scored)} activities): "
-              + (f"score {100 * h['score']:.2f}  " if "score" in h else "")
-              + "  ".join(f"{k} {v:.4f}" for k, v in h["f1"].items()))
+        for tag, key in [("HOLDOUT", "holdout"), ("HOLDOUT_FINAL", "holdout_final")]:
+            if key not in metrics:
+                continue
+            h = metrics[key]
+            print(f"\n{tag} {str(HOLDOUT)[:10]} ({h['users']:,} users, {len(scored)} activities): "
+                  + (f"score {100 * h['score']:.2f}  " if "score" in h else "")
+                  + "  ".join(f"{k} {v:.4f}" for k, v in h["f1"].items()))
 
 
 if __name__ == "__main__":

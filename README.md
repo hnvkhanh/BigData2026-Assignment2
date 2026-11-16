@@ -21,10 +21,11 @@ hour files (`scripts/download_gharchive.py --out data/gharchive --cohort-only` f
 ghactivity/              shared library: data loading, per-week features and labels, outages, data periods, scoring
 experiments/<name>/      one experiment per folder, run as python experiments/<name>/run.py; outputs/ next to it (not committed)
   baseline/              LightGBM baseline; writes the submission file
-  gnn/                   GNNs: ego graph (default), user-repo, temporal hetero, chain graph
+  gnn/                   GNNs: ego graph (default), user-repo, temporal hetero, chain / fk row graph (RowGNN or RelGNN)
   gnn_review/            hetero GNN using the review / review-comment link
   relations/             cross-table feature groups screened with LightGBM
   relgt/                 Relational Graph Transformer (README.md: its design)
+  relgnn/                RelGNN model (atomic routes, composite message passing), trained by gnn/run.py --token-model relgnn
   missing_data/          ways of handling GH Archive's missing events
   segments/              quiet vs active error split, capture drops by user type
   ensemble/              combines the saved probabilities of holdout runs (seed bagging, model mean, per-activity pick)
@@ -77,6 +78,10 @@ Most scripts run configs × seeds 0–2 one run at a time on a free GPU (`GPU=<i
 | `runs/chain_ho0927.sh` | RelGT and GNN on the chain graph | 09-27 → 10-04 |
 | `runs/chain_ftime_ho0927.sh` | the same with a learned time embedding | 09-27 → 10-04 |
 | `runs/ensemble_ho0927.sh` | ego, hetero, chain and chain + history reruns that save probabilities, then their ensembles (`SMOKE=1` for a quick check) | 09-27 → 10-04 |
+| `runs/gnn_chain_bag_ho0927.ps1` | chain GNN, seeds 0-2, validation and final (refit) stages at the recorded best epoch, then its bag and its mean with `relgt_chain` | 09-27 → 10-04 |
+| `runs/sampling_ho0927.ps1` | RelGT token sampling: chain vs fk graph x `--fk-order` random vs recent, seeds 0-2 on several GPUs, then their summaries and bags | 09-27 → 10-04 |
+| `runs/test_users_ho0927.ps1` | chain RelGT trained on the test users only, one seed, scored against `relgt_chain` on the same users | 09-27 → 10-04 |
+| `runs/relgnn_ho0927.ps1` | RelGNN on the chain graph (user or seed readout) and the fk graph, seeds 0-2 on several GPUs, validation and final stages, then summaries and bags with `gnn_chain` and `relgt_chain` | 09-27 → 10-04 |
 | `runs/gnn_ho1107.sh` | ego, user–repo and hetero GNNs, two GPUs at once | 11-07 (no push labels) |
 | `runs/h14_ho1107.sh` | hetero GNN that sees only the last 14 days | 11-07 |
 | `runs/ego_time_ho1107.sh` | ego GNN with the hetero model's time encoding | 11-07 |
@@ -95,6 +100,7 @@ users predicted positive, and the holdout week is used for nothing else.
 
 | Config | Model | Score | Write-up |
 |---|---|---|---|
+| `gnn_chain` (final model) | GNN on the chain graph, 1 epoch, retrained through the tuning week | 53.22 (52.73–53.52) | [gnn_chain_bag](docs/experiments/gnn_chain_bag.md) |
 | `relgt_chain` (final model) | RelGT on the chain graph, retrained through the tuning week | 53.12 (52.72–53.59) | [holdout_0927](docs/experiments/holdout_0927.md) |
 | `ego_uf_qprev` | ego GNN + user features, quiet users copy their previous week\* | 53.08 (52.63–53.70) | [holdout_0927](docs/experiments/holdout_0927.md) |
 | `all_ego_uf_rel` | ego GNN + user features + relative (capture-independent) features | 53.06 (52.85–53.47) | [gnn_missing_data_fixes](docs/experiments/gnn_missing_data_fixes.md) |
@@ -109,7 +115,10 @@ users predicted positive, and the holdout week is used for nothing else.
 \* An upper bound: quiet users get their real labels of the previous week, which the test week
 cannot see.
 
-The seed ranges of the top configs overlap, so this one week does not rank them. For reference, the course README reports 49.61 for *copy last week* and 54.82 for its
+The seed ranges of the top configs overlap, so this one week does not rank them. Averaging the
+three seeds of `relgt_chain` scores 54.42, +1.27 [+0.29, +2.30] over the same bag of `gnn_chain`
+(53.15), which gains nothing from bagging ([gnn_chain_bag](docs/experiments/gnn_chain_bag.md),
+[ensemble](docs/experiments/ensemble.md)). For reference, the course README reports 49.61 for *copy last week* and 54.82 for its
 GNN with time encoding on the same week, with its own setup.
 
 ## Documentation
@@ -128,7 +137,12 @@ GNN with time encoding on the same week, with its own setup.
 | [docs/experiments/ego_time.md](docs/experiments/ego_time.md) | ego GNN with the hetero model's time encoding |
 | [docs/experiments/relgt.md](docs/experiments/relgt.md) | Relational Graph Transformer results |
 | [docs/experiments/ensemble.md](docs/experiments/ensemble.md) | ensemble of the tied graph models and the chain model with history features (`experiments/ensemble/run.py`) |
+| [docs/experiments/gnn_chain_bag.md](docs/experiments/gnn_chain_bag.md) | seed bagging of the chain GNN, with a final (refit) stage (`runs/gnn_chain_bag_ho0927.ps1`) |
+| [docs/experiments/sampling.md](docs/experiments/sampling.md) | RelGT token sampling: graph structure x `--fk-order` (`runs/sampling_ho0927.ps1`) |
+| [docs/experiments/test_users.md](docs/experiments/test_users.md) | the chain RelGT trained on the test users only (`runs/test_users_ho0927.ps1`) |
 | [experiments/relgt/README.md](experiments/relgt/README.md) | RelGT design: node set, chain graph, visibility, token sampling |
+| [docs/experiments/relgnn.md](docs/experiments/relgnn.md) | RelGNN on the chain and fk graphs vs `gnn_chain` / `relgt_chain` (`runs/relgnn_ho0927.ps1`) |
+| [experiments/relgnn/README.md](experiments/relgnn/README.md) | RelGNN design: atomic routes of this schema, composite message passing, differences from the official code |
 | [docs/action_relationships.md](docs/action_relationships.md) | how the actions and tables relate (`experiments/gnn_review/`, `experiments/relations/`) |
 | [docs/requirement_for_task.pdf](docs/requirement_for_task.pdf) | the assignment |
 
