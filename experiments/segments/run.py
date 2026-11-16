@@ -145,7 +145,7 @@ def error_split(runs):
 # --- 2-3. Capture drops by user type ---------------------------------------------------------
 
 def drops(quiet_week):
-    import eda  # loads the data once (~5 s): the models' examples, cutoffs and labels
+    from analysis import eda  # loads the data once (~5 s): the models' examples, cutoffs and labels
 
     D = eda.Data()
     ws, w = D.week_starts, D.n_weeks

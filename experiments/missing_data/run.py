@@ -36,8 +36,8 @@ Run from the repo root (~13 min with 8 LightGBM threads):
     python experiments/missing_data/run.py --approaches baseline thin --seeds 0
 """
 import argparse
-import importlib.util
 import json
+import sys
 import time
 from pathlib import Path
 
@@ -46,9 +46,10 @@ import numpy as np
 import pandas as pd
 
 HERE = Path(__file__).resolve().parent
-_spec = importlib.util.spec_from_file_location("baseline_run", HERE.parent / "baseline" / "run.py")
-B = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(B)
+ROOT = HERE.parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+import ghactivity as B  # noqa: E402
 
 EVENT_COLS, WEEK = B.EVENT_COLS, B.WEEK
 NONPUSH = [k for k in EVENT_COLS if k != "push"]
@@ -165,8 +166,7 @@ def week_weights(rule, data, weeks, lags):
         for k in EVENT_COLS:
             w[k][(wk < RECENT_START).values] = 0
     elif rule and rule.startswith("gaps:"):
-        B.GAPS = NEW_GAPS
-        ww = B.training_weights(rule.split(":")[1], weeks, lags, 0.2)
+        ww = B.training_weights(rule.split(":")[1], weeks, lags, 0.2, gaps=NEW_GAPS)
         for k in EVENT_COLS:
             w[k] = wk.map(ww[k]).values.astype(float)
     return w

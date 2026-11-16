@@ -1,6 +1,6 @@
 """GNNs over the relational data, on the weeks, lags, eligibility, split and thresholds of the baseline.
 
---graph-structure ego (default) is the relation-aware ego-graph GNN of old_experiments/relgt_inspired
+--graph-structure ego (default) is the relation-aware ego-graph GNN of archive/old_experiments/relgt_inspired
 (gnn_model.py), ported to the current protocol. Each example (eligible user, week) is a star graph:
   * a learned user node (with --user-features, plus an MLP of the baseline's 60 history features);
   * 48 tokens from the last --ego-lookback days (14) before each table's cutoff s - lag: the 4 latest
@@ -103,8 +103,9 @@ Run from the repo root:
 """
 import argparse
 import functools
-import importlib.util
+import importlib
 import json
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -115,9 +116,10 @@ from torch import nn
 from tqdm import tqdm
 
 HERE = Path(__file__).resolve().parent
-_spec = importlib.util.spec_from_file_location("baseline_run", HERE.parent / "baseline" / "run.py")
-base = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(base)
+ROOT = HERE.parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+import ghactivity as base  # noqa: E402
 
 EVENT_COLS, WEEK, DAY = base.EVENT_COLS, base.WEEK, base.DAY
 EDGE_TYPES = EVENT_COLS + ["received"]
@@ -377,7 +379,7 @@ def batched_logits(model, batch, examples, batch_size):
 
 # ---------------------------------------------------------------------------------------------------
 # --graph-structure ego (default): the relation-aware ego-graph GNN of
-# old_experiments/relgt_inspired (gnn_model.py, model.py, data.py), on the current weeks and protocol.
+# archive/old_experiments/relgt_inspired (gnn_model.py, model.py, data.py), on the current weeks and protocol.
 
 EGO_OBJECTS_PER_REL = 4                                   # hop-1 objects kept per relation
 EGO_OBJECT_SLOTS = len(EVENT_COLS) * EGO_OBJECTS_PER_REL  # 24
@@ -1261,11 +1263,8 @@ class RowGNN(nn.Module):
 
 @functools.cache
 def load_relgt():
-    """experiments/relgt/run.py; loaded only when used, as relgt itself imports this file."""
-    spec = importlib.util.spec_from_file_location("relgt_run", HERE.parent / "relgt" / "run.py")
-    relgt = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(relgt)
-    return relgt
+    """experiments/relgt/run.py; imported only when used, as relgt itself imports this file."""
+    return importlib.import_module("experiments.relgt.run")
 
 
 def merge_repeated_tokens(nodes, edges, n_rel):
@@ -1395,7 +1394,7 @@ def main():
                          "before the week (push capture fell to ~1-7%% after 10-27)")
     ap.add_argument("--graph-structure", choices=["ego", "user-repo", "hetero", "chain"], default="ego",
                     help="ego: one star graph per example, the user and its recent PRs / issues / repos "
-                         "(old_experiments/relgt_inspired GNN). user-repo: one user <-> repository graph "
+                         "(archive/old_experiments/relgt_inspired GNN). user-repo: one user <-> repository graph "
                          "per week (HeteroSAGE). hetero: one user / PR / issue / repo graph per week, one "
                          "edge per event with a time encoding and time-aware attention. chain: the row "
                          "graph of experiments/relgt, one token subgraph per example")

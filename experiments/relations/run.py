@@ -26,8 +26,8 @@ Run from the repo root:
     python experiments/relations/run.py --groups own_pr demand --seeds 0 1 2
 """
 import argparse
-import importlib.util
 import json
+import sys
 from pathlib import Path
 
 import lightgbm as lgb
@@ -35,17 +35,11 @@ import numpy as np
 import pandas as pd
 
 HERE = Path(__file__).resolve().parent
-
-
-def _load(name, path):
-    spec = importlib.util.spec_from_file_location(name, path)
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
-
-
-base = _load("baseline_run", HERE.parent / "baseline" / "run.py")
-gnn_review = _load("gnn_review_run", HERE.parent / "gnn_review" / "run.py")
+ROOT = HERE.parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+import ghactivity as base  # noqa: E402
+from experiments.gnn_review import run as gnn_review  # noqa: E402
 
 EVENT_COLS, DAY, DB = base.EVENT_COLS, base.DAY, base.DB
 NONPUSH = [k for k in EVENT_COLS if k != "push"]

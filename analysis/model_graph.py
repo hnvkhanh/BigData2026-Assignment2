@@ -26,27 +26,27 @@ The week graphs can be large: --max-per-hop keeps the nodes with the most edges 
 graph lists every node.
 
 Run from the repo root:
-    python model_graph.py                  # interactive app at http://127.0.0.1:8052: switch model, user,
+    python analysis/model_graph.py                  # interactive app at http://127.0.0.1:8052: switch model, user,
                                            # week and the token options in the page
-    python model_graph.py --html --model hetero --user <login or GitHub id> --week "2026-09-26 16:00"
-    python model_graph.py --html --model chain --chain-seed latest --num-seeds 16  # as script_chain_ho0927.sh
-    python model_graph.py --html --model relgt --relgt-graph chain --chain-seed latest --num-seeds 16
+    python analysis/model_graph.py --html --model hetero --user <login or GitHub id> --week "2026-09-26 16:00"
+    python analysis/model_graph.py --html --model chain --chain-seed latest --num-seeds 16  # as runs/chain_ho0927.sh
+    python analysis/model_graph.py --html --model relgt --relgt-graph chain --chain-seed latest --num-seeds 16
 --html writes one static file, figures/graph_<model>_<login>_<date>.html, instead of serving the app.
 In the app the command-line options are the starting values; graphs already built are cached.
 """
 import argparse
 import copy
-import importlib.util
+import sys
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 
-ROOT = Path(__file__).resolve().parent
-_spec = importlib.util.spec_from_file_location("gnn_run", ROOT / "experiments" / "gnn" / "run.py")
-G = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(G)
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+from experiments.gnn import run as G  # noqa: E402
 base = G.base
 
 PALETTE = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300", "#6250d6", "#e34948",

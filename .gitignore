@@ -1,10 +1,15 @@
 __pycache__/
-assignment2/
-experiments/*/outputs/
 .pytest_cache/
-results/
-experiments/*/cache/
-old_experiments/*/outputs/
-data/
+.DS_Store
 .venv/
 .venv-win/
+
+# course material and data (see README: Setup)
+assignment2/
+data/
+
+# run outputs, caches and collected scores
+experiments/*/outputs/
+experiments/*/cache/
+archive/old_experiments/*/outputs/
+results/

@@ -5,8 +5,8 @@ the activity happened (`created_at`, `submitted_at` for reviews), for the 9,000 
 Weeks are aligned to the test week (Saturday 16:00 UTC), as in experiments/baseline/run.py.
 
 Run from the repo root:
-    python eda.py                    # then open http://127.0.0.1:8050
-    python eda.py --port 8051 --debug
+    python analysis/eda.py                    # then open http://127.0.0.1:8050
+    python analysis/eda.py --port 8051 --debug
 """
 import argparse
 import sys
@@ -21,15 +21,12 @@ import plotly.io as pio
 from dash import Dash, Input, Output, dash_table, dcc, html
 from plotly.subplots import make_subplots
 
-ROOT = Path(__file__).resolve().parent
-DB = ROOT / "data" / "db"
-EVAL_DIR = ROOT / "assignment2" / "scripts"
-TEST_INPUT = ROOT / "assignment2" / "submission" / "test_input.csv"
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+from ghactivity import DB, EVENT_COLS, TEST_INPUT  # noqa: E402
 
-sys.path.insert(0, str(EVAL_DIR))
-from evaluate import EVENT_COLS  # noqa: E402
-
-# Same constants as experiments/baseline/run.py.
+# Same constants as ghactivity/config.py.
 TEST_START = pd.Timestamp("2026-11-21 16:00")      # 2026-11-22 00:00 Taiwan time
 SELECTION_TIME = pd.Timestamp("2026-11-04 12:00")  # test users: >= 3 records in the 90 days before
 DATA_START = pd.Timestamp("2025-12-01")  # placeholder; Data() resets it to the first hour of the data

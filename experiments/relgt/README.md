@@ -120,7 +120,7 @@ Notes:
 
 ## 7. Decision log
 
-* **Training uses the same chain graph as `relgt_graph.py --interactive`** (user links to the latest
+* **Training uses the same chain graph as `analysis/relgt_graph.py --interactive`** (user links to the latest
   visible row per table; another user's sampled row brings that user in as a token).
 * **Self-assigned issues keep their FK link to the user** (`Issues.assignee_id`), drawn as a plain
   FK even though they may be older rows. Assignment is a different relationship from authorship;
@@ -142,4 +142,4 @@ python experiments/relgt/run.py --graph-structure fk --epochs 15 --end 2026-06-0
 
 Each run writes `output.csv`, `metrics.json` (all args are stored in it) and `holdout.npz` to
 `experiments/relgt/outputs/<name>/`. Tokens are cached in `experiments/relgt/cache/`.
-`python relgt_graph.py --interactive` draws the graph for a given user and week.
+`python analysis/relgt_graph.py --interactive` draws the graph for a given user and week.

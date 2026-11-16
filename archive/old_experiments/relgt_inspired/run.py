@@ -35,7 +35,7 @@ from .model import RelGTInspired
 from .gnn_model import RelationalGNN
 
 
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = Path(__file__).resolve().parents[3]  # archive/old_experiments/relgt_inspired/run.py
 DEFAULT_DB_DIR = ROOT / "data" / "db"
 DEFAULT_TEST_INPUT = ROOT / "assignment2" / "submission" / "test_input.csv"
 DEFAULT_OUTPUT_ROOT = Path(__file__).resolve().parent / "outputs"

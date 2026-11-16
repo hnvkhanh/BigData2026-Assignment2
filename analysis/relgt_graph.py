@@ -25,14 +25,14 @@ each table visible up to its usual data lag before it. Actions can be coloured b
 from the cut-off date to the row, the same clock as the model's relative time.
 
 Run from the repo root:
-    python relgt_graph.py                                   # figures/relgt_token_graph.png
-    python relgt_graph.py --action-edges both --lookback-days 90
+    python analysis/relgt_graph.py                                   # figures/relgt_token_graph.png
+    python analysis/relgt_graph.py --action-edges both --lookback-days 90
                                                             # figures/relgt_token_graph_both_lb90.png
-    python relgt_graph.py --graph-structure chain           # figures/relgt_token_graph_chain.png
-    python relgt_graph.py --interactive                     # http://127.0.0.1:8051
+    python analysis/relgt_graph.py --graph-structure chain           # figures/relgt_token_graph_chain.png
+    python analysis/relgt_graph.py --interactive                     # http://127.0.0.1:8051
 """
 import argparse
-import importlib.util
+import sys
 from functools import lru_cache
 from pathlib import Path
 
@@ -43,10 +43,10 @@ import networkx as nx
 import plotly.graph_objects as go
 from dash import Dash, Input, Output, dcc, html, no_update
 
-ROOT = Path(__file__).resolve().parent
-_spec = importlib.util.spec_from_file_location("relgt_run", ROOT / "experiments" / "relgt" / "run.py")
-R = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(R)
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+from experiments.relgt import run as R  # noqa: E402
 base, TABLES = R.base, R.TABLES
 OUT = ROOT / "figures" / "relgt_token_graph.png"
 K = 100

@@ -108,9 +108,9 @@ Run from the repo root (needs PyTorch, a GPU is used if available):
 import argparse
 import os
 import hashlib
-import importlib.util
 import json
 import math
+import sys
 import time
 from pathlib import Path
 
@@ -122,12 +122,11 @@ import torch.nn.functional as F
 from torch import nn
 
 HERE = Path(__file__).resolve().parent
-_spec = importlib.util.spec_from_file_location("baseline_run", HERE.parent / "baseline" / "run.py")
-base = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(base)
-_spec = importlib.util.spec_from_file_location("gnn_review_run", HERE.parent / "gnn_review" / "run.py")
-review = importlib.util.module_from_spec(_spec)  # habit features, joint thresholds
-_spec.loader.exec_module(review)
+ROOT = HERE.parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+import ghactivity as base  # noqa: E402
+from experiments.gnn_review import run as review  # noqa: E402  (habit features, joint thresholds)
 
 EVENT_COLS, WEEK, DAY = base.EVENT_COLS, base.WEEK, base.DAY
 IR, IC = review.IR, review.IC

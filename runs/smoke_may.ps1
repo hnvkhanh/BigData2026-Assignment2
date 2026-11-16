@@ -3,7 +3,7 @@
 #   relgt_chain 53.12 (final model) | ego_uf_qprev 53.08 | all_ego_uf_rel 53.06 | all_ego_uf 52.98
 #   het 52.77 | gnn_chain 52.48 | het_notime 52.34 | user_repo 52.29 | ego_uf_qprev5 52.25
 #   all_ego_uf_rel_pprev 52.19
-# Same commands as script_ho0927.sh, script_chain_ho0927.sh and script_qprev_ho0927.sh, on another week.
+# Same commands as runs/ho0927.sh, runs/chain_ho0927.sh and runs/qprev_ho0927.sh, on another week.
 # Holdout week 2026-05-23 16:00 UTC (05-24 -> 05-31 Taiwan time), tune week 05-16, so training labels
 # end by 05-16 and features / tuning never see June or later (relgt_chain's "final model" is also
 # retrained on the tune week, labels to 05-23). The week is fully labelled, so it is scored on all 6
@@ -23,13 +23,13 @@
 # Smoke test (default): -Epochs 2, batched jobs (ego, chain, relgt) capped at -Steps 30 batches per
 # epoch; scores only check that the pipeline runs, they are not comparable to full runs.
 # Full training: -Epochs 0 -Steps 0 -Prefix full  (0 epochs = the model's default: ego / chain 20,
-# hetero / user-repo 40, with early stopping; relgt_chain 15 as in script_chain_ho0927.sh; 0 steps = full
-# epochs)
-#   .\script_smoke_may.ps1                                            # smoke test on GPUs 0 and 1
-#   .\script_smoke_may.ps1 -Epochs 0 -Steps 0 -Prefix full            # full training on GPUs 0 and 1
-#   .\script_smoke_may.ps1 -Epochs 0 -Steps 0 -Prefix full -Seeds 0,1,2
-#   .\script_smoke_may.ps1 -Gpus 1 -Configs het                       # one GPU, one config
-#   .\script_smoke_may.ps1 -Configs relgt_chain,ego_uf_qprev,all_ego_uf_rel    # a subset
+# hetero / user-repo 40, with early stopping; relgt_chain 15 as in runs/chain_ho0927.sh; 0 steps = full
+# epochs). The script runs from the repo root whatever the current folder is.
+#   .\runs\smoke_may.ps1                                            # smoke test on GPUs 0 and 1
+#   .\runs\smoke_may.ps1 -Epochs 0 -Steps 0 -Prefix full            # full training on GPUs 0 and 1
+#   .\runs\smoke_may.ps1 -Epochs 0 -Steps 0 -Prefix full -Seeds 0,1,2
+#   .\runs\smoke_may.ps1 -Gpus 1 -Configs het                       # one GPU, one config
+#   .\runs\smoke_may.ps1 -Configs relgt_chain,ego_uf_qprev,all_ego_uf_rel    # a subset
 param(
     [int[]]$Gpus = @(0, 1),
     [int[]]$Seeds = @(42),
@@ -45,14 +45,15 @@ param(
     [switch]$NoBars              # text status lines only, no progress bars
 )
 $ErrorActionPreference = "Stop"
-Set-Location $PSScriptRoot
+$root = Split-Path $PSScriptRoot -Parent   # the repo root: this script is in runs\
+Set-Location $root
 
 $suf = "ho" + $HoWeek.Substring(5, 5).Replace("-", "")
 # relgt takes the weeks as a data period: tune week = the week before, data end = a week after
 $hoT = [datetime]::ParseExact($HoWeek, "yyyy-MM-dd HH:mm", [Globalization.CultureInfo]::InvariantCulture)
 $tune = $hoT.AddDays(-7).ToString("yyyy-MM-dd HH:mm")
 $hoEnd = $hoT.AddDays(7).ToString("yyyy-MM-dd HH:mm")
-$logDir = Join-Path $PSScriptRoot "experiments\gnn\outputs\logs"
+$logDir = Join-Path $root "experiments\gnn\outputs\logs"
 New-Item -ItemType Directory -Force $logDir | Out-Null
 $env:PYTHONUNBUFFERED = "1"
 $env:PYTHONUTF8 = "1"                  # UTF-8 output and open()
@@ -112,7 +113,7 @@ function Start-Run($job, [int]$gpu) {
     if ($job.Epochs -gt 0) { $runArgs += @("--epochs", "$($job.Epochs)") }
     $env:CUDA_VISIBLE_DEVICES = "$gpu"   # inherited by the new process
     $p = Start-Process -FilePath $pyExe -ArgumentList (($runArgs | ForEach-Object { Quote $_ }) -join " ") `
-        -WorkingDirectory $PSScriptRoot -RedirectStandardOutput $log -RedirectStandardError $err `
+        -WorkingDirectory $root -RedirectStandardOutput $log -RedirectStandardError $err `
         -NoNewWindow -PassThru
     $null = $p.Handle                    # keep a handle, or ExitCode stays empty after the process ends
     Write-Host "$(Now) [gpu$gpu $($job.Name)] START ($script:started/$total, pid $($p.Id)) -> $log"
@@ -266,20 +267,6 @@ try {
 }
 Write-Host "$(Now) all $total jobs finished"
 
-# summary of every <Prefix> run of this week, best score first (the code goes in on stdin: no quoting
-# problems). relgt_chain gives two rows: its final model and its validation model.
-$summary = @"
-import json, glob, os
-rows = []
-for f in glob.glob('experiments/gnn/outputs/${Prefix}_*_${suf}_s*/metrics.json'):
-    m = json.load(open(f)); h = m['holdout']
-    rows.append((os.path.basename(os.path.dirname(f)), h['score'], m.get('best_epoch'), h['f1']))
-for f in glob.glob('experiments/relgt/outputs/${Prefix}_*_${suf}_s*/metrics.json'):
-    m = json.load(open(f))
-    for v in ('final model', 'validation model'):
-        h = m['holdout'][0][v]
-        rows.append((os.path.basename(os.path.dirname(f)) + ' (' + v.split()[0] + ')', h['score'], m.get('best_epoch'), h['per_event']))
-for name, s, ep, f1 in sorted(rows, key=lambda r: -r[1]):
-    print(f"{name:44s} score {100*s:.2f}  best_ep {ep}  " + '  '.join(f'{k} {v:.3f}' for k, v in f1.items()))
-"@
-$summary | & $pyExe -
+# summary of every <Prefix> config of this week, mean over seeds, best score first. relgt_chain gives two
+# rows: its validation model and its final model.
+& $pyExe scripts\summarize_runs.py --suffix $suf --sort "${Prefix}_*"

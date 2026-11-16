@@ -21,18 +21,19 @@ Run from the repo root:
     python experiments/gnn_review/run.py --no-habit --no-chain   # only 3 and 4
 """
 import argparse
-import importlib.util
 import json
+import sys
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
 HERE = Path(__file__).resolve().parent
-_spec = importlib.util.spec_from_file_location("gnn_run", HERE.parent / "gnn" / "run.py")
-gnn = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(gnn)
-base = gnn.base
+ROOT = HERE.parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+import ghactivity as base  # noqa: E402
+from experiments.gnn import run as gnn  # noqa: E402
 
 import torch  # noqa: E402  (after numpy, see experiments/gnn)
 from torch import nn  # noqa: E402

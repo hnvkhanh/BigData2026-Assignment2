@@ -48,7 +48,7 @@ def collect(root):
             "users": [r["users"] for r in m["validation"]]}
     for f, m in load("experiments/two_model/outputs/*/metrics.json"):
         out[f"two_model/{f.parent.name}"] = {"holdout": m.get("holdout_score_mean")}
-    for pattern, tag in [("old_experiments/relgt_inspired/outputs/*/backtest_metrics.json", "relgt_inspired"),
+    for pattern, tag in [("archive/old_experiments/relgt_inspired/outputs/*/backtest_metrics.json", "relgt_inspired"),
                          ("experiments/relgt/outputs/*/backtest_metrics.json", "relgt_backtest")]:
         for f, m in load(pattern):
             out[f"{tag}/{f.parent.name}"] = {"score": m["score"], "model": m["temporal_model"], "split": m["split"]}

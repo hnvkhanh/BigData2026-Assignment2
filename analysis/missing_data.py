@@ -1,6 +1,6 @@
 """Interactive explorer for GH Archive's missing events (Dash + Plotly).
 
-    python missing_data.py          # then open http://127.0.0.1:8051 (startup ~15 s)
+    python analysis/missing_data.py          # then open http://127.0.0.1:8051 (startup ~15 s)
 
 Every hour file exists, but many hours are *thinned*: they hold only part of the events. The tabs
 answer one question each:
@@ -25,9 +25,9 @@ Activity definitions, cohort and the test-user selection rule come from experime
 """
 import argparse
 import gzip
-import importlib.util
 import json
 import os
+import sys
 from functools import lru_cache
 from pathlib import Path
 
@@ -37,10 +37,10 @@ import plotly.graph_objects as go
 from dash import Dash, Input, Output, State, dash_table, dcc, html
 from plotly.subplots import make_subplots
 
-ROOT = Path(__file__).resolve().parent
-_spec = importlib.util.spec_from_file_location("baseline_run", ROOT / "experiments" / "baseline" / "run.py")
-B = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(B)
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+import ghactivity as B  # noqa: E402
 
 ACTS = list(B.EVENT_COLS)
 NONPUSH = [k for k in ACTS if k != "push"]
