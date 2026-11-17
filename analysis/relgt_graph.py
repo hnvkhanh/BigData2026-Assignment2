@@ -207,7 +207,7 @@ def serve(args, G, lags, test, seeds, nodes, hops, example):
         """R.sample_walk for one test user: size tokens, seeds first."""
         n, h, _ = R.sample_walk(G, seeds[i:i + 1], cutoff, size, rng, args.max_hops, cap1=cap1,
                                 lookback=args.lookback_days, start=mode, exclude_push=args.exclude_push, num_seeds=k,
-                                fk_order=fk_order)
+                                fk_order=fk_order, related=args.related_rows)
         return n[0], h[0]
 
     def tokens_of(G, i, mode, k, roots, cutoff, s, visible, fk_order, tables):
@@ -412,6 +412,8 @@ def main():
     ap.add_argument("--max-hops", type=int, default=50)
     ap.add_argument("--chain-seed", choices=["user", "latest"], default="user")
     ap.add_argument("--num-seeds", type=int, default=1, help="with --graph-structure chain --chain-seed latest")
+    ap.add_argument("--related-rows", type=int, default=0,
+                    help="with --graph-structure chain and latest seeds: related rows per seed action (run.py)")
     ap.add_argument("--action-edges", choices=list(R.ACTION_CHAINS), default="none")
     ap.add_argument("--lookback-days", type=float, default=None)
     ap.add_argument("--exclude-push", action="store_true")
@@ -426,7 +428,8 @@ def main():
         ap.error("--num-seeds needs --graph-structure chain --chain-seed latest")
     suffix = (("" if args.num_seeds == 1 else f"_s{args.num_seeds}") + ("_chain" if chain else "") + ("_latest" if chain and args.chain_seed == "latest" else "") + ("" if args.action_edges == "none" else f"_{args.action_edges}")
               + ("" if not args.lookback_days else f"_lb{args.lookback_days:g}")
-              + ("_nopush" if args.exclude_push else "") + ("_recent" if args.fk_order == "recent" else ""))
+              + ("_nopush" if args.exclude_push else "") + ("_recent" if args.fk_order == "recent" else "")
+              + ("" if not args.related_rows else f"_rel{args.related_rows}"))
     out = OUT.with_name(OUT.stem + suffix + OUT.suffix)
 
     cohort, ev, own, data_end = base.load()
@@ -442,7 +445,7 @@ def main():
     if chain:
         nodes, hops, _ = R.sample_walk(G, seeds, cutoff, K, rng, args.max_hops, lookback=args.lookback_days,
                                     start=args.chain_seed, exclude_push=args.exclude_push,
-                                    num_seeds=args.num_seeds, fk_order=args.fk_order)
+                                    num_seeds=args.num_seeds, fk_order=args.fk_order, related=args.related_rows)
     else:
         nodes, hops, _ = R.sample_tokens(G, seeds, cutoff, K, rng, lookback=args.lookback_days,
                                          exclude_push=args.exclude_push, fk_order=args.fk_order)

@@ -5,7 +5,9 @@ FK columns; the remaining columns are only counted. Keys follow assignment2/SCHE
 
 Run from the repo root (needs `pip install graphviz` and the Graphviz `dot` binary on PATH):
     python analysis/schema_graph.py               # writes figures/schema_graph.{dot,png,svg}
+    python analysis/schema_graph.py --all-columns # every column listed -> figures/schema_graph_full.*
 """
+import argparse
 import os
 import shutil
 from pathlib import Path
@@ -43,8 +45,9 @@ SCHEMA = {
 HEADER, PK_FILL, FK_FILL, MUTED = "#2a78d6", "#fdf3d8", "#e8f1fc", "#898781"
 
 
-def node_label(table, pk, fks, n_cols, n_rows):
-    """HTML-like table: header, PK row, one row per FK (with a port for edges), other columns."""
+def node_label(table, pk, fks, n_cols, n_rows, others=None):
+    """HTML-like table: header, PK row, one row per FK (with a port for edges), other columns.
+    others: optional [(name, type)] of the remaining columns; listed one per row instead of counted."""
     rows = [f'<tr><td bgcolor="{HEADER}" colspan="2"><font color="white"><b>{table}</b></font></td></tr>',
             f'<tr><td colspan="2"><font point-size="9" color="{MUTED}">{n_rows:,} rows</font></td></tr>',
             f'<tr><td bgcolor="{PK_FILL}" port="{pk}" align="left"><b>PK</b></td>'
@@ -52,13 +55,18 @@ def node_label(table, pk, fks, n_cols, n_rows):
     for col, ref in fks.items():
         rows.append(f'<tr><td bgcolor="{FK_FILL}" align="left"><b>FK</b></td>'
                     f'<td bgcolor="{FK_FILL}" port="{col}" align="left"><i>{col}</i> → {ref}</td></tr>')
-    rest = n_cols - 1 - len(fks)
-    rows.append(f'<tr><td colspan="2"><font point-size="9" color="{MUTED}">+ {rest} other columns'
-                f'</font></td></tr>')
+    if others is None:
+        rest = n_cols - 1 - len(fks)
+        rows.append(f'<tr><td colspan="2"><font point-size="9" color="{MUTED}">+ {rest} other columns'
+                    f'</font></td></tr>')
+    else:
+        for name, typ in others:
+            rows.append(f'<tr><td align="left"><font color="{MUTED}">{typ}</font></td>'
+                        f'<td align="left">{name}</td></tr>')
     return f'<<table border="0" cellborder="1" cellspacing="0" cellpadding="5">{"".join(rows)}</table>>'
 
 
-def build():
+def build(all_columns=False):
     g = graphviz.Digraph("schema", graph_attr=dict(rankdir="LR", splines="spline", nodesep="0.5",
                                                    ranksep="1.4", fontname="Helvetica", labelloc="t",
                                                    label="GitHub activity database: schema graph\n"
@@ -67,8 +75,13 @@ def build():
                          node_attr=dict(shape="plaintext", fontname="Helvetica", fontsize="11"),
                          edge_attr=dict(color="#52514e", arrowsize="0.8"))
     for table, (pk, fks) in SCHEMA.items():
-        meta = pq.read_metadata(DB / f"{table}.parquet")
-        g.node(table, node_label(table, pk, fks, meta.num_columns, meta.num_rows))
+        path = DB / f"{table}.parquet"
+        meta = pq.read_metadata(path)
+        others = None
+        if all_columns:
+            key_cols = {pk, *fks}
+            others = [(f.name, str(f.type)) for f in pq.read_schema(path) if f.name not in key_cols]
+        g.node(table, node_label(table, pk, fks, meta.num_columns, meta.num_rows, others))
     for table, (_, fks) in SCHEMA.items():
         for col, ref in fks.items():
             ref_pk = SCHEMA[ref][0]
@@ -84,12 +97,17 @@ def build():
 
 
 def main():
-    g = build()
-    OUT.parent.mkdir(exist_ok=True)
-    OUT.with_suffix(".dot").write_text(g.source, encoding="utf-8")
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("--all-columns", action="store_true",
+                    help="list every column of every table (name and type); writes figures/schema_graph_full.*")
+    args = ap.parse_args()
+    g = build(args.all_columns)
+    out = OUT.with_name(OUT.name + "_full") if args.all_columns else OUT
+    out.parent.mkdir(exist_ok=True)
+    out.with_suffix(".dot").write_text(g.source, encoding="utf-8")
     for fmt in ["png", "svg"]:
-        g.render(OUT, format=fmt, cleanup=True, engine="dot")
-        print(f"Wrote {OUT.with_suffix('.' + fmt)}")
+        g.render(out, format=fmt, cleanup=True, engine="dot")
+        print(f"Wrote {out.with_suffix('.' + fmt)}")
     n_edges = sum(len(fks) for _, fks in SCHEMA.values())
     print(f"{len(SCHEMA)} tables, {n_edges} foreign keys")
 

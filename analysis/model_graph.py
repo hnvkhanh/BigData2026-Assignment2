@@ -20,7 +20,10 @@
              (sample_walk) and the edges among them (subgraph_edges), as the GNN uses them.
   relgt      experiments/relgt/run.py: the same tokens on --relgt-graph fk (default, sample_tokens: 1- and
              2-hop FK neighbours) or chain (sample_walk). RelGT attends over all K tokens; the edges
-             drawn are the subgraph its GIN positional encoding sees.
+             drawn are the subgraph its GIN positional encoding sees. --fk-order and, on the chain graph,
+             --related-rows as in relgt (every issue / comment / review token comes with its FK-related
+             rows); a related row's hover and table row name the tokens it is related to, and a related
+             row 2 FK steps away (e.g. another comment on the same issue) gets a dashed edge to them.
 The week graphs can be large: --max-per-hop keeps the nodes with the most edges to the previous hop
 (the title says how many were dropped). Hover any node or edge for its features; a table below the
 graph lists every node.
@@ -31,6 +34,8 @@ Run from the repo root:
     python analysis/model_graph.py --html --model hetero --user <login or GitHub id> --week "2026-09-26 16:00"
     python analysis/model_graph.py --html --model chain --chain-seed latest --num-seeds 16  # as runs/chain_ho0927.sh
     python analysis/model_graph.py --html --model relgt --relgt-graph chain --chain-seed latest --num-seeds 16
+    python analysis/model_graph.py --html --model relgt --relgt-graph chain --chain-seed latest --num-seeds 16 \
+        --fk-order recent --related-rows 5          # as relgt_chain_recent_related (runs/related_ho0927.ps1)
 --html writes one static file, figures/graph_<model>_<login>_<date>.html, instead of serving the app.
 In the app the command-line options are the starting values; graphs already built are cached.
 """
@@ -406,16 +411,36 @@ def token_graph(ctx, u, structure):
     users_t = R.TABLES.index("Users")
     seed = np.array([Gr.offset[users_t] + int(ctx.cohort.user_id.values[u])])
     rng = np.random.default_rng(a.seed)
+    relgt = a.model == "relgt"  # the chain GNN samples with the defaults (random order, no related rows)
+    fk_order = a.fk_order if relgt else "random"
+    related = a.related_rows if relgt and structure == "chain" else 0
     if structure == "chain":
         nodes_, hops, _ = R.sample_walk(Gr, seed, cutoff, a.num_neighbors, rng, a.max_hops, lookback=a.lookback_days,
-                                        start=a.chain_seed, exclude_push=a.exclude_push, num_seeds=a.num_seeds)
+                                        start=a.chain_seed, exclude_push=a.exclude_push, num_seeds=a.num_seeds,
+                                        fk_order=fk_order, related=related)
         fallback = a.max_hops + 1
     else:
         nodes_, hops, _ = R.sample_tokens(Gr, seed, cutoff, a.num_neighbors, rng, lookback=a.lookback_days,
-                                          exclude_push=a.exclude_push)
+                                          exclude_push=a.exclude_push, fk_order=fk_order)
         fallback = R.MAX_HOP
     visible = R.visible_nodes(Gr, cutoff, a.lookback_days, a.exclude_push)
     tok, hp = nodes_[0], hops[0]
+    # --related-rows: for every issue / comment / review token, its related rows that are tokens
+    # (R.related_rows with the same cap, each source on its own). 2-step ones get a dashed edge.
+    related_to, rel_edges = {}, []
+    if related:
+        src = np.unique(tok[(hp <= a.max_hops) & np.isin(Gr.ntype[tok], [R.TABLES.index(t) for t in R.RELATED])])
+        in_tok = set(tok.tolist())
+        for sv in src:
+            _, rv, step, _, _ = R.related_rows(Gr, np.zeros(1, np.int64), np.array([sv]), np.zeros(1, np.int64),
+                                               visible, related, np.random.default_rng(0), np.array([sv]))
+            for v, st in zip(rv.tolist(), step.tolist()):
+                if v in in_tok:
+                    related_to.setdefault(v, []).append(int(sv))
+                    if st == 2:
+                        rel_edges.append(edge(int(sv), v, "related row (2 FK steps)",
+                                              f"{R.TABLES[Gr.ntype[v]]} related to {R.TABLES[Gr.ntype[sv]]}",
+                                              dash=True))
     _, ei, ej, rel = R.subgraph_edges(Gr, nodes_, "none", seed, visible)
     actor_rels = set(Gr.actor_rel.tolist())
     pair_rel = {}
@@ -430,40 +455,49 @@ def token_graph(ctx, u, structure):
             name = f"{t}.{col}" + (" (owner)" if structure == "chain" and r % R.N_REL in actor_rels else "")
         pair_rel.setdefault(tuple(sorted((va, vb))), name)
     edges = [edge(a_, b_, r, f"{r}") for (a_, b_), r in pair_rel.items()]
+    edges += [e for e in rel_edges if tuple(sorted((e["a"], e["b"]))) not in pair_rel]
 
     hop_of = {}
     for v, h in zip(tok[::-1], hp[::-1]):  # the first (smallest index) occurrence wins
         hop_of[int(v)] = int(h)
+    def name_of(v):
+        t = R.TABLES[Gr.ntype[v]]
+        row = v - int(Gr.offset[Gr.ntype[v]])
+        if t == "Users":
+            return ctx.names.user(row), ""
+        if t == "Repositories":
+            return ctx.names.repo_name(row), ""
+        if t == "PullRequests":
+            return ctx.names.pr_name(row)
+        if t == "Issues":
+            return ctx.names.issue_name(row)
+        rp = int(Gr.repo[v])
+        return f"{t} row {row}" + (f" in {ctx.names.repo_name(rp - int(Gr.offset[1]))}" if rp >= 0 else ""), ""
+
+    names = {v: name_of(v) for v in hop_of}
     nodes = []
     for v, h in hop_of.items():
         t = R.TABLES[Gr.ntype[v]]
-        row = v - int(Gr.offset[Gr.ntype[v]])
-        title = ""
-        if t == "Users":
-            name = ctx.names.user(row)
-        elif t == "Repositories":
-            name = ctx.names.repo_name(row)
-        elif t == "PullRequests":
-            name, title = ctx.names.pr_name(row)
-        elif t == "Issues":
-            name, title = ctx.names.issue_name(row)
-        else:
-            rp = int(Gr.repo[v])
-            name = f"{t} row {row}" + (f" in {ctx.names.repo_name(rp - int(Gr.offset[1]))}" if rp >= 0 else "")
+        name, title = names[v]
         age = cutoff[Gr.ntype[v]] - Gr.time[v]
         hop_txt = "seed" if h == 0 else ("random fallback" if h == fallback else f"hop {h}")
+        rel_txt = "; ".join(names[s][0] for s in related_to.get(v, []))
         hover = (f"{t} · {hop_txt}<br><b>{name}</b>" + (f"<br>{title[:80]}" if title else "")
-                 + (f"<br>{age:.1f} days before its table's cutoff" if np.isfinite(age) else ""))
+                 + (f"<br>{age:.1f} days before its table's cutoff" if np.isfinite(age) else "")
+                 + (f"<br>related row of: {rel_txt[:160]}" if rel_txt else ""))
         nodes.append(dict(node(v, t, min(h, fallback), name, hover, 9), table=t,
-                          age=round(float(age), 1) if np.isfinite(age) else ""))
+                          age=round(float(age), 1) if np.isfinite(age) else "", related_to=rel_txt))
     login = ctx.login(u)
     model = "chain GNN (RowGNN)" if a.model == "chain" else f"RelGT, {structure} graph"
     seed_txt = "user" if a.chain_seed == "user" or structure == "fk" else f"{a.num_seeds} latest actions"
     title = (f"<b>{model}</b> · {login} · week {ctx.s:%Y-%m-%d %H:%M} UTC · K = {a.num_neighbors} tokens, "
              f"{len(hop_of)} distinct · seed: {seed_txt}"
              + (f" · max hops {a.max_hops}" if structure == "chain" else " · 1- and 2-hop FK neighbours")
-             + (f" · lookback {a.lookback_days:g} d" if a.lookback_days else ""))
-    return nodes, edges, title, {}, "spring", ["hop", "table", "name", "age"]
+             + (f" · lookback {a.lookback_days:g} d" if a.lookback_days else "")
+             + (" · fk-order recent" if fk_order == "recent" else "")
+             + (f" · related rows {related} ({len(related_to)} tokens)" if related else ""))
+    cols = ["hop", "table", "name", "age"] + (["related_to"] if related else [])
+    return nodes, edges, title, {}, "spring", cols
 
 
 # --- Main ----------------------------------------------------------------------------------------
@@ -531,7 +565,7 @@ TOKEN_OPTS = ["num_neighbors", "max_hops", "chain_seed", "num_seeds", "lookback_
 MODEL_OPTS = {"ego": ["ego_lookback"], "user-repo": ["history_days", "max_per_hop"],
               "hetero": ["history_days", "het_max_events", "max_per_hop"],
               "hetero-event": ["history_days", "het_max_events", "max_per_hop"], "chain": TOKEN_OPTS,
-              "relgt": ["relgt_graph"] + TOKEN_OPTS}
+              "relgt": ["relgt_graph"] + TOKEN_OPTS + ["fk_order", "related_rows"]}
 
 
 def build(ctx, args, u):
@@ -590,6 +624,9 @@ def serve(ctx, args, u0, host, port):
             field("token lookback (d)", dcc.Input(id="lookback_days", value=args.lookback_days, min=1, **num)),
             field("", dcc.Checklist(id="exclude_push", options=[{"label": " exclude push", "value": "x"}],
                                     value=["x"] if args.exclude_push else [])),
+            field("fk order (relgt)", dcc.RadioItems(id="fk_order", options=["random", "recent"], value=args.fk_order,
+                                                     inline=True, labelStyle={"marginRight": 8})),
+            field("related rows (relgt chain)", dcc.Input(id="related_rows", value=args.related_rows, min=0, **num)),
         ]),
         html.Div(id="status", style={"fontSize": 13, "color": MUTED, "minHeight": 18}),
         dcc.Loading(dcc.Graph(id="graph", style={"height": "82vh"}, config={"scrollZoom": True})),
@@ -604,8 +641,9 @@ def serve(ctx, args, u0, host, port):
                   Input("model", "value"), Input("user", "value"), Input("week", "value"),
                   Input("ego_lookback", "value"), Input("history_days", "value"), Input("max_per_hop", "value"),
                   Input("num_neighbors", "value"), Input("chain_seed", "value"), Input("num_seeds", "value"),
-                  Input("lookback_days", "value"), Input("exclude_push", "value"))
-    def update(model, u, week, ego_lb, hist, mph, k, chain_seed, num_seeds, tok_lb, nopush):
+                  Input("lookback_days", "value"), Input("exclude_push", "value"), Input("fk_order", "value"),
+                  Input("related_rows", "value"))
+    def update(model, u, week, ego_lb, hist, mph, k, chain_seed, num_seeds, tok_lb, nopush, fk_order, related_rows):
         a = copy.copy(args)
         a.model, a.relgt_graph = (model.split("-")[0], model.split("-")[1]) if model.startswith("relgt") \
             else (model, args.relgt_graph)
@@ -616,12 +654,17 @@ def serve(ctx, args, u0, host, port):
         a.lookback_days, a.exclude_push = (float(tok_lb) if tok_lb else None), bool(nopush)
         if a.num_seeds > 1 and a.chain_seed != "latest":
             a.num_seeds = 1
+        a.fk_order, a.related_rows = fk_order, max(int(related_rows or 0), 0)
+        if a.relgt_graph != "chain":
+            a.related_rows = 0
         fig, t, n_nodes, n_edges = build(ctx, a, int(u))
         fig = go.Figure(fig).update_layout(width=None, height=None, autosize=True, margin=dict(l=10, r=10, t=60, b=10))
         used = ", ".join(o.replace("_", " ") for o in MODEL_OPTS[a.model])
         status = (f"{n_nodes} nodes, {n_edges} edges · options used by this model: {used}"
                   + (" · num seeds needs chain seed = latest" if int(num_seeds or 1) > 1 and chain_seed != "latest"
-                     and a.model in ("chain", "relgt") else ""))
+                     and a.model in ("chain", "relgt") else "")
+                  + (" · related rows need RelGT, chain graph" if int(related_rows or 0) > 0
+                     and not (a.model == "relgt" and a.relgt_graph == "chain") else ""))
         cols = [{"name": c, "id": c} for c in t.columns]
         return fig, t.astype(str).to_dict("records"), cols, status
 
@@ -649,6 +692,9 @@ def main():
     g.add_argument("--lookback-days", type=float, default=None, help="chain / relgt")
     g.add_argument("--exclude-push", action="store_true", help="chain / relgt")
     g.add_argument("--seed", type=int, default=0, help="chain / relgt token sampling")
+    g.add_argument("--fk-order", choices=["random", "recent"], default="random", help="relgt")
+    g.add_argument("--related-rows", type=int, default=0,
+                   help="relgt chain graph: related rows per issue / comment / review token (0 = off)")
     ap.add_argument("--html", action="store_true", help="write one static HTML file instead of serving the app")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8052)
@@ -669,6 +715,8 @@ def main():
     with pd.option_context("display.max_rows", 40, "display.width", 200, "display.max_colwidth", 50):
         print(table)
     tag = args.model + (f"_{args.relgt_graph}" if args.model == "relgt" else "")
+    if args.model == "relgt":
+        tag += ("_recent" if args.fk_order == "recent" else "") + (f"_rel{args.related_rows}" if args.related_rows else "")
     out = args.out or ROOT / "figures" / f"graph_{tag}_{login}_{ctx.s:%Y%m%d}.html"
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(f"<!doctype html><html><head><meta charset='utf-8'><title>{tag} graph {login}</title></head>"

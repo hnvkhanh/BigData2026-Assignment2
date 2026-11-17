@@ -87,6 +87,11 @@ K = 100 tokens per example (`--num-neighbors`).
 
 Because the newest actions are nearest, the walk goes **back in time** along each chain.
 
+**`--related-rows N`** (off by default): every issue, issue comment, PR review or PR review comment token
+comes with up to N rows related to it through its foreign keys: its issue, PR or review, the other
+comments in the thread, replies, and a review's line comments (`RELATED`). A walk row is taken only if its
+related rows fit too. See [docs/experiments/related_rows.md](../../docs/experiments/related_rows.md).
+
 ## 5. Model
 
 Per token: node type, hop, relative time to `s`, row features (per-table residual MLP), and a GIN

@@ -84,6 +84,15 @@ seed token carries how long ago the user was last active. --num-seeds N makes th
 the seeds (all hop 0, part of the K tokens, fewer if the user has fewer): the walk starts from all of
 them, the readout and the codebook query use the mean of the seed tokens, the other tokens are
 attention-weighted on that mean, and --history / --habit features join every seed token.
+--related-rows N (chain only, off by default) samples the context of every token that is an issue,
+issue comment, PR review or PR review comment: up to N rows per such token reached through its foreign
+keys (RELATED: an issue's comments and PR, a comment's issue and the other comments on it, a review's
+PR, line comments and the PR's other reviews, a review comment's PR, review, the comment it replies
+to, its replies and the PR's other review comments), nearest first, newest first. The seeds' related
+rows are taken before the walk, within half of the budget left after the seeds. In the walk a row's
+related rows add to its cost, so it is taken only if they fit too, and they come right after its hop.
+Related rows are tokens at their source's hop + their FK steps, bring in their owners as walk rows do,
+have their own related rows taken while budget is left, and the walk goes on from them.
 --recency-attn (off by default) makes the model attend more to recent actions without changing the
 tokens: the attention weight of an action D days older than the example's newest action token is
 multiplied by (1 + D / --recency-days) ^ -decay, in the local attention and in the readout. Decay is
@@ -185,6 +194,22 @@ N_ACTION_REL = 2  # next action, next action in the same repository
 # --graph-structure chain: "next action of the same type by the same actor", then its reverse.
 CHAIN_REL = 2 * N_REL + 2 * N_ACTION_REL
 N_ALL_REL = CHAIN_REL + 2  # relation ids with every option on
+# --related-rows: the rows that give a seed action its context, as FK paths of 1-2 steps
+# (table, column, +1 = follow the FK to the referenced row, -1 = to the rows referencing it).
+RELATED = {
+    "Issues": [[("IssueComments", "issue_id", -1)],                       # comments on the issue
+               [("Issues", "pull_request_id", 1)]],                       # its PR
+    "IssueComments": [[("IssueComments", "issue_id", 1)],                 # the issue
+                      [("IssueComments", "issue_id", 1), ("IssueComments", "issue_id", -1)]],  # its thread
+    "PRReviews": [[("PRReviews", "pr_id", 1)],                            # the PR
+                  [("PRReviewComments", "pull_request_review_id", -1)],   # the review's line comments
+                  [("PRReviews", "pr_id", 1), ("PRReviews", "pr_id", -1)]],  # other reviews of the PR
+    "PRReviewComments": [[("PRReviewComments", "pr_id", 1)],              # the PR
+                         [("PRReviewComments", "pull_request_review_id", 1)],  # its review
+                         [("PRReviewComments", "in_reply_to_id", 1)],     # the comment it replies to
+                         [("PRReviewComments", "in_reply_to_id", -1)],    # replies to it
+                         [("PRReviewComments", "pr_id", 1), ("PRReviewComments", "pr_id", -1)]],  # PR's others
+}
 
 
 # --- Relational entity graph -----------------------------------------------------------------
@@ -317,6 +342,14 @@ class Graph:
         self.aptr, self.aadj = csr(self.actor[rows], rows, self.n)
         print(f"graph ({structure}): {self.n:,} nodes, {len(fsrc):,} edges ({time.time() - t0:.0f}s)")
 
+    def reverse(self):
+        """Reverse FK adjacency (referenced row -> referencing rows) and its relations, built once."""
+        if not hasattr(self, "rptr"):
+            src = np.repeat(np.arange(self.n), np.diff(self.fptr))
+            self.rptr, self.radj = csr(self.fadj, src, self.n)
+            self.rrel = csr(self.fadj, self.frel, self.n)[1]
+        return self.rptr, self.radj, self.rrel
+
 
 # --- Tokenisation (utils.py: gather_1_and_2_hop_with_seed_time, _process_one_seed) -----------
 
@@ -437,8 +470,57 @@ def sample_tokens(G, seeds, cutoff, K, rng, cap1=5000, cap2=1000, budget="unifor
     return nodes, hops, paths
 
 
+def related_rows(G, src_b, src_v, src_r, visible, per_row, rng, exclude, cap1=1000):
+    """--related-rows: the visible rows RELATED to each source row (example src_b, node src_v, rank src_r
+    among its example's sources, 0 first), at most per_row per source, leaving out the keys
+    (example * G.n + node) in exclude (sorted), in the order they should get the budget: the source of
+    lowest rank first, then 1 FK step before 2, then the newest row. A row related to several sources of
+    an example counts once, for its fewest steps, then lowest rank. A step reaching more than cap1 rows
+    from one node keeps the newest.
+    Returns (example, node, steps, path, source index); path as in sample_walk."""
+    rptr, radj, rrel = G.reverse()
+    out = []
+    for name, paths in RELATED.items():
+        s = np.flatnonzero(G.ntype[src_v] == TABLES.index(name))
+        if not len(s):
+            continue
+        for steps in paths:
+            idx, par, cur = s, src_v[s], src_v[s]
+            for table, col, d in steps:
+                ptr, adj, rel = (G.fptr, G.fadj, G.frel) if d > 0 else (rptr, radj, rrel)
+                i, nb = expand(ptr, adj, np.arange(len(cur)), cur)
+                r = expand(ptr, rel, np.arange(len(cur)), cur)[1]
+                m = (r == RELATIONS.index((table, col))) & visible[nb]
+                i, nb = cap(i[m], nb[m], cap1, rng, G.time)
+                idx, par, cur = idx[i], cur[i], nb
+            out.append((src_b[idx], cur, np.full(len(idx), len(steps), np.int64), par, idx))
+    if not out:
+        z = np.zeros(0, np.int64)
+        return z, z, z, z, z
+    b, v, step, par, src = (np.concatenate(x) for x in zip(*out))
+    key = b * G.n + v
+    keep = ~np.isin(key, exclude)
+    b, v, step, par, src, key = b[keep], v[keep], step[keep], par[keep], src[keep], key[keep]
+    rank = src_r[src]
+    o = np.lexsort((rank, step, key))
+    first = np.r_[True, key[o][1:] != key[o][:-1]] if len(o) else np.zeros(0, bool)
+    b, v, step, par, src, rank = (x[o][first] for x in (b, v, step, par, src, rank))
+    o = np.lexsort((rng.random(len(b)), -G.time[v], step, rank, b))
+    b, v, step, par, src = b[o], v[o], step[o], par[o], src[o]
+    g = src  # cap per source row (src is unique per (example, source))
+    o2 = np.argsort(g, kind="stable")
+    gs = g[o2]
+    start = np.r_[0, np.flatnonzero(np.diff(gs)) + 1] if len(gs) else np.zeros(0, np.int64)
+    within = np.empty(len(g), np.int64)
+    within[o2] = np.arange(len(gs)) - np.repeat(start, np.diff(np.r_[start, len(gs)]))
+    keep = within < per_row
+    b, v, step, par, src = b[keep], v[keep], step[keep], par[keep], src[keep]
+    path = np.where(step == 1, G.ntype[v], len(TABLES) * (1 + G.ntype[par]) + G.ntype[v])
+    return b, v, step, path, src
+
+
 def sample_walk(G, seeds, cutoff, K, rng, max_hops, cap1=1000, lookback=None, start="user", exclude_push=False,
-                num_seeds=1, fk_order="random"):
+                num_seeds=1, fk_order="random", related=0):
     """--graph-structure chain: K tokens per example by a breadth-first walk over the visible graph,
     nearest hops first, up to max_hops; a hop with more new nodes than the example's remaining budget
     gives a random subset. Every node reached is a token once; if they do not fill K the rest repeat
@@ -454,7 +536,16 @@ def sample_walk(G, seeds, cutoff, K, rng, max_hops, cap1=1000, lookback=None, st
     not go on from another user: their other rows are reached only through chains and shared nodes.
 
     fk_order="recent": where nodes compete (the cap on a node's neighbours, the budget of a hop, the
-    final tokens), the newer rows win instead of random ones."""
+    final tokens), the newer rows win instead of random ones.
+
+    related > 0: every token that is an issue, issue comment, PR review or PR review comment (seed, walk
+    row or related row) comes with up to related rows RELATED to it (related_rows: an issue's comments,
+    a comment's issue and thread, a review's PR and line comments, ...) that are not tokens yet, at its
+    hop + their FK steps (1 or 2). The same cost rule applies (a new owner costs one more token).
+    The seeds' related rows get up to half of the budget left after the seeds. A walk row's related rows
+    count towards its cost, so in a hop's priority order a row is taken only if it and its related rows
+    fit; they are then taken right after the hop, and theirs after them, while budget is left. The walk
+    goes on from a related row as if it had reached it at that hop."""
     visible = visible_nodes(G, cutoff, lookback, exclude_push)
     recent = G.time if fk_order == "recent" else None
     B = len(seeds)
@@ -465,6 +556,78 @@ def sample_walk(G, seeds, cutoff, K, rng, max_hops, cap1=1000, lookback=None, st
         a = G.actor[v]
         return np.where((a >= 0) & visible[a], a, -1)
 
+    def charge(b, v, room, extra_cost=None):
+        """Which rows (in priority order, grouped by example) fit in room[b]: a row costs 1, or 2 if
+        it is the first to bring in a new owner, plus extra_cost. Also returns their owners."""
+        a = owner(v)
+        with_owner = np.flatnonzero(a >= 0)
+        owner_key = b[with_owner] * G.n + a[with_owner]
+        first_of = with_owner[np.unique(owner_key, return_index=True)[1]]
+        cost = np.ones(len(b), np.int64)
+        cost[first_of[~np.isin(b[first_of] * G.n + a[first_of], seen)]] = 2
+        if extra_cost is not None:
+            cost += extra_cost
+        group = np.r_[0, np.flatnonzero(np.diff(b)) + 1]
+        spent = np.cumsum(cost) - np.repeat(np.r_[0, np.cumsum(cost)[group[1:] - 1]], np.diff(np.r_[group, len(b)]))
+        return spent <= room[b], a
+
+    def add_owners(b, v, a, hop):
+        """The owners of the rows just taken become tokens at hop + 1, unless already tokens."""
+        nonlocal seen, count
+        w = np.flatnonzero(a >= 0)
+        okey, idx = np.unique(b[w] * G.n + a[w], return_index=True)
+        new = ~np.isin(okey, seen, assume_unique=True)
+        w = w[idx[new]]
+        if len(w):
+            out_b.append(b[w])
+            out_v.append(a[w])
+            out_h.append(np.full(len(w), min(hop + 1, max_hops), np.int8))
+            out_p.append(len(TABLES) * (1 + G.ntype[v[w]]) + G.ntype[a[w]])
+            count += np.bincount(b[w], minlength=B)
+            seen = np.union1d(seen, okey[new])
+
+    def related_of(b, v, h, also_exclude=None):
+        """related_rows of the rows (b, v) at hops h, newest source first per example, leaving out
+        tokens (and also_exclude). Returns (example, node, hop, path, source index into b)."""
+        o = np.flatnonzero(np.isin(G.ntype[v], related_types))
+        o = o[np.lexsort((-G.time[v[o]], b[o]))]
+        group = np.r_[0, np.flatnonzero(np.diff(b[o])) + 1] if len(o) else np.zeros(0, np.int64)
+        rank = np.arange(len(o)) - np.repeat(group, np.diff(np.r_[group, len(o)]))
+        exclude = seen if also_exclude is None else np.union1d(seen, also_exclude)
+        rb, rv, step, rp, src = related_rows(G, b[o], v[o], rank, visible, related, rng, exclude, cap1)
+        src = o[src]
+        return rb, rv, np.minimum(h[src] + step, max_hops), rp, src
+
+    def force(b, v, h, half=False):
+        """Take the related rows of the rows (b, v, hops h) just taken, then theirs, while they fit
+        (in half of the room left on the first round if half)."""
+        nonlocal seen, count
+        while len(b):
+            rb, rv, rh, rp, _ = related_of(b, v, h)
+            if not len(rb):
+                return
+            room = K - n_seed - count
+            take, a = charge(rb, rv, room // 2 if half else room)
+            half = False
+            rb, rv, rh, rp, a = rb[take], rv[take], rh[take], rp[take], a[take]
+            if not len(rb):
+                return
+            out_b.append(rb)
+            out_v.append(rv)
+            out_h.append(rh.astype(np.int8))
+            out_p.append(rp)
+            count += np.bincount(rb, minlength=B)
+            seen = np.union1d(seen, rb * G.n + rv)
+            for h_ in np.unique(rh):  # the owner of a row at hop h is at hop h + 1, as in the walk
+                m = rh == h_
+                add_owners(rb[m], rv[m], a[m], int(h_))
+                m &= G.ntype[rv] != users
+                eb, ev = extra.get(int(h_), (np.zeros(0, np.int64), np.zeros(0, np.int64)))
+                extra[int(h_)] = (np.r_[eb, rb[m]], np.r_[ev, rv[m]])
+            b, v, h = rb, rv, rh
+
+    related_types = np.array([TABLES.index(t) for t in RELATED])
+    extra = {}  # hop -> (example, node): related rows that join the frontier after that hop
     b_, a_ = expand(G.aptr, G.aadj, np.arange(B), seeds)  # own rows by seed, table, then time
     m = visible[a_]
     b_, a_ = b_[m], a_[m]
@@ -502,6 +665,8 @@ def sample_walk(G, seeds, cutoff, K, rng, max_hops, cap1=1000, lookback=None, st
         out_v.append(seeds[own])
         out_h.append(np.ones(len(own), np.int8))
         out_p.append(G.ntype[seeds[own]])
+    if related > 0:
+        force(seed_b, seed_v, np.zeros(len(seed_b), np.int64), half=True)
     for hop in range(1, max_hops + 1):
         i, v = expand(G.ptr, G.adj, np.arange(len(fb)), fv)
         m = visible[v]
@@ -517,39 +682,31 @@ def sample_walk(G, seeds, cutoff, K, rng, max_hops, cap1=1000, lookback=None, st
         tie = rng.random(len(b))
         o = np.lexsort((tie, b) if recent is None else (tie, -recent[v], b))
         b, v, par, key = b[o], v[o], par[o], key[o]
-        # In this random order a row costs 1, or 2 if it is the first to bring in a new owner.
-        a = owner(v)
-        with_owner = np.flatnonzero(a >= 0)
-        owner_key = b[with_owner] * G.n + a[with_owner]
-        first_of = with_owner[np.unique(owner_key, return_index=True)[1]]
-        cost = np.ones(len(b), np.int64)
-        cost[first_of[~np.isin(b[first_of] * G.n + a[first_of], seen)]] = 2
-        group = np.r_[0, np.flatnonzero(np.diff(b)) + 1]
-        spent = np.cumsum(cost) - np.repeat(np.r_[0, np.cumsum(cost)[group[1:] - 1]], np.diff(np.r_[group, len(b)]))
-        take = spent <= (K - n_seed - count)[b]
+        # In this random order a row costs 1, or 2 if it is the first to bring in a new owner, plus
+        # (related) its related rows that are neither tokens nor rows of this hop.
+        bundle = None
+        if related > 0:
+            src = related_of(b, v, np.full(len(b), hop), key)[4]
+            bundle = np.bincount(src, minlength=len(b))
+        take, a = charge(b, v, K - n_seed - count, bundle)
         b, v, par, key, a = b[take], v[take], par[take], key[take], a[take]
-        if not len(b):
+        if len(b):
+            out_b.append(b)
+            out_v.append(v)
+            out_h.append(np.full(len(b), hop, np.int8))
+            out_p.append(G.ntype[v] if hop == 1 else len(TABLES) * (1 + G.ntype[par]) + G.ntype[v])
+            count += np.bincount(b, minlength=B)
+            seen = np.union1d(seen, key)
+            add_owners(b, v, a, hop)  # the owners of the rows just taken, unless already tokens
+            if related > 0:
+                force(b, v, np.full(len(b), hop))
+        elif not any(h >= hop for h in extra):
             break
-        out_b.append(b)
-        out_v.append(v)
-        out_h.append(np.full(len(b), hop, np.int8))
-        out_p.append(G.ntype[v] if hop == 1 else len(TABLES) * (1 + G.ntype[par]) + G.ntype[v])
-        count += np.bincount(b, minlength=B)
-        seen = np.union1d(seen, key)
-        # The owners of the rows just taken, unless already tokens.
-        w = np.flatnonzero(a >= 0)
-        okey, idx = np.unique(b[w] * G.n + a[w], return_index=True)
-        new = ~np.isin(okey, seen, assume_unique=True)
-        w = w[idx[new]]
-        if len(w):
-            out_b.append(b[w])
-            out_v.append(a[w])
-            out_h.append(np.full(len(w), min(hop + 1, max_hops), np.int8))
-            out_p.append(len(TABLES) * (1 + G.ntype[v[w]]) + G.ntype[a[w]])
-            count += np.bincount(b[w], minlength=B)
-            seen = np.union1d(seen, okey[new])
         go_on = G.ntype[v] != users  # the walk stops at other users
         fb, fv = b[go_on], v[go_on]
+        if hop in extra:  # related rows taken before the walk go on from this hop
+            eb, ev = extra.pop(hop)
+            fb, fv = np.r_[fb, eb], np.r_[fv, ev]
     b = np.concatenate(out_b) if out_b else np.zeros(0, np.int64)
     v, hop, path = (np.concatenate(x) if out_b else np.zeros(0, np.int64) for x in (out_v, out_h, out_p))
     tie = rng.random(len(b))
@@ -1123,15 +1280,16 @@ def fit(make_model, S, train_ids, args, epochs, val_ids=None):
 
 
 def tokenize(G, groups, cutoffs, K, seed, budget="uniform", order="random", action_edges="none", lookback=None,
-             max_hops=None, chain_seed="user", exclude_push=False, num_seeds=1, fk_order="random"):
-    """Tokens of every example, cached on disk (sampling is the slow part). max_hops is used by
-    the chain structure (sample_walk)."""
+             max_hops=None, chain_seed="user", exclude_push=False, num_seeds=1, fk_order="random", related=0):
+    """Tokens of every example, cached on disk (sampling is the slow part). max_hops and related are
+    used by the chain structure (sample_walk)."""
     mode = () if budget == "uniform" else (budget, order)
     mode += () if G.structure == "fk" else (("structure", G.structure, "latest-owner", max_hops),)
     mode += () if chain_seed == "user" else (("chain_seed", chain_seed),)
     mode += () if not exclude_push else (("exclude_push",),)
     mode += () if num_seeds == 1 else (("num_seeds", num_seeds),)
     mode += () if fk_order == "random" else (("fk_order", fk_order),)
+    mode += () if not related else (("related-all", related),)
     mode += () if action_edges == "none" else (("action_edges", action_edges),)
     mode += () if not lookback else (("lookback", lookback),)
     key = hashlib.md5(repr((K, seed, cutoffs.tolist(), [g.tolist() for g in groups], G.n) + mode)
@@ -1147,7 +1305,8 @@ def tokenize(G, groups, cutoffs, K, seed, budget="uniform", order="random", acti
     for w, seeds in enumerate(groups):
         if G.structure == "chain":
             nd, hp, pt = sample_walk(G, seeds, cutoffs[w], K, rng, max_hops, lookback=lookback, start=chain_seed,
-                                     exclude_push=exclude_push, num_seeds=num_seeds, fk_order=fk_order)
+                                     exclude_push=exclude_push, num_seeds=num_seeds, fk_order=fk_order,
+                                     related=related)
         else:
             nd, hp, pt = sample_tokens(G, seeds, cutoffs[w], K, rng, budget=budget, order=order, lookback=lookback,
                                        exclude_push=exclude_push, fk_order=fk_order)
@@ -1210,6 +1369,11 @@ def main():
     ap.add_argument("--num-seeds", type=int, default=1,
                     help="with --graph-structure chain --chain-seed latest: use the user's N latest visible "
                          "actions as seeds (fewer if the user has fewer); counts towards --num-neighbors")
+    ap.add_argument("--related-rows", type=int, default=0,
+                    help="with --graph-structure chain: every issue / issue comment / PR review / review "
+                         "comment token comes with up to N rows related to it through its foreign keys (its "
+                         "issue, PR or review, thread, replies), newest first; a walk row is taken only if they "
+                         "fit too; 0 = off")
     ap.add_argument("--recency-attn", action="store_true",
                     help="with --graph-structure chain: attend more to recent actions, in the local attention "
                          "and the readout, with a learned decay; the tokens do not change")
@@ -1259,6 +1423,10 @@ def main():
         ap.error("--chain-seed latest needs --graph-structure chain")
     if args.num_seeds != 1 and (args.graph_structure != "chain" or args.chain_seed != "latest"):
         ap.error("--num-seeds needs --graph-structure chain --chain-seed latest")
+    if args.related_rows < 0:
+        ap.error("--related-rows must be >= 0")
+    if args.related_rows and args.graph_structure != "chain":
+        ap.error("--related-rows needs --graph-structure chain")
     if args.recency_attn and args.graph_structure != "chain":
         ap.error("--recency-attn needs --graph-structure chain")
     if args.recency_days <= 0:
@@ -1319,7 +1487,8 @@ def main():
     seeds = [G.offset[TABLES.index("Users")] + cohort.user_id.values[c] for c in cidx]
     nodes, hops, paths, edges = tokenize(G, seeds, cutoffs, args.num_neighbors, args.seed, args.path_budget,
                                          args.path_order, args.action_edges, args.lookback_days, args.max_hops,
-                                         args.chain_seed, args.exclude_push, args.num_seeds, args.fk_order)
+                                         args.chain_seed, args.exclude_push, args.num_seeds, args.fk_order,
+                                         args.related_rows)
     ids = {w: np.arange(sizes[i], sizes[i + 1]) for i, w in enumerate(all_weeks)}
     is_test = np.zeros(n, bool)
     is_test[test_cidx] = True
