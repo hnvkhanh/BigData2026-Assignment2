@@ -84,6 +84,10 @@ seed token carries how long ago the user was last active. --num-seeds N makes th
 the seeds (all hop 0, part of the K tokens, fewer if the user has fewer): the walk starts from all of
 them, the readout and the codebook query use the mean of the seed tokens, the other tokens are
 attention-weighted on that mean, and --history / --habit features join every seed token.
+--chain-seed latest-per-type seeds at the latest visible action of each action type instead (PR, issue,
+issue comment, review, review comment, push: up to 6 seeds, one per type the user has, newest first), so
+a heavy pusher's seeds are not all pushes; it is handled like several seeds (mean readout), --num-seeds
+is not used with it.
 --related-rows N (chain only, off by default) samples the context of every token that is an issue,
 issue comment, PR review or PR review comment: up to N rows per such token reached through its foreign
 keys (RELATED: an issue's comments and PR, a comment's issue and the other comments on it, a review's
@@ -530,6 +534,8 @@ def sample_walk(G, seeds, cutoff, K, rng, max_hops, cap1=1000, lookback=None, st
     (the user if it has none), with num_seeds > 1 the first tokens, hop 0, are the num_seeds latest
     (fewer if it has fewer), newest first, and the user is a hop 1 token. Either way the first hop
     holds the latest visible row of each of the user's chains that is not a seed.
+    start="latest-per-type": the hop-0 seeds are the latest visible row of each of the user's chains,
+    that is one seed per activity table the user has (up to 6), newest first; num_seeds is not used.
 
     An activity row of another user brings that user in as a token, one hop further, so a sampled
     row always shows whose it is (subgraph_edges links them); the two share the budget. The walk does
@@ -635,12 +641,15 @@ def sample_walk(G, seeds, cutoff, K, rng, max_hops, cap1=1000, lookback=None, st
     anchor_b, anchor_v = b_[last], a_[last]
     roots = seeds.copy()
     seed_b, seed_v, seed_r = np.arange(B), seeds, np.zeros(B, np.int64)  # example, node, rank (0 = newest)
-    if start == "latest" and len(anchor_b):
-        o = np.lexsort((a_, G.time[a_], b_))[::-1]  # per example, newest first
-        sb, sv = b_[o], a_[o]
+    if start in ("latest", "latest-per-type") and len(anchor_b):
+        # latest: the num_seeds newest of all the user's visible actions; latest-per-type: the newest visible
+        # action of each type (the anchors), so up to one seed per activity table
+        cb, cv = (b_, a_) if start == "latest" else (anchor_b, anchor_v)
+        o = np.lexsort((cv, G.time[cv], cb))[::-1]  # per example, newest first
+        sb, sv = cb[o], cv[o]
         group = np.r_[0, np.flatnonzero(np.diff(sb)) + 1]
         rank = np.arange(len(sb)) - np.repeat(group, np.diff(np.r_[group, len(sb)]))
-        pick_seed = rank < num_seeds
+        pick_seed = rank < (num_seeds if start == "latest" else len(ACTOR_COL))
         none = np.setdiff1d(np.arange(B), sb)  # no visible action: the user stays the seed
         seed_b = np.r_[sb[pick_seed], none]
         seed_v = np.r_[sv[pick_seed], seeds[none]]
@@ -1363,9 +1372,10 @@ def main():
                          "another user's action brings that user in")
     ap.add_argument("--max-hops", type=int, default=50,
                     help="with --graph-structure chain: how far the walk may go from the user")
-    ap.add_argument("--chain-seed", choices=["user", "latest"], default="user",
+    ap.add_argument("--chain-seed", choices=["user", "latest", "latest-per-type"], default="user",
                     help="with --graph-structure chain: token 0 (where the walk starts and the readout is "
-                         "taken) is the user, or the user's latest visible action")
+                         "taken) is the user, or the user's latest visible action (--num-seeds of them), or "
+                         "latest-per-type: the latest visible action of each action type (up to 6 seeds)")
     ap.add_argument("--num-seeds", type=int, default=1,
                     help="with --graph-structure chain --chain-seed latest: use the user's N latest visible "
                          "actions as seeds (fewer if the user has fewer); counts towards --num-neighbors")
@@ -1422,7 +1432,8 @@ def main():
     if args.chain_seed != "user" and args.graph_structure != "chain":
         ap.error("--chain-seed latest needs --graph-structure chain")
     if args.num_seeds != 1 and (args.graph_structure != "chain" or args.chain_seed != "latest"):
-        ap.error("--num-seeds needs --graph-structure chain --chain-seed latest")
+        ap.error("--num-seeds needs --graph-structure chain --chain-seed latest "
+                 "(latest-per-type takes one seed per action type and no --num-seeds)")
     if args.related_rows < 0:
         ap.error("--related-rows must be >= 0")
     if args.related_rows and args.graph_structure != "chain":
@@ -1539,7 +1550,7 @@ def main():
                      rel_pe=args.rel_pe, attn_bias=args.attn_bias,
                      action_edges=args.action_edges != "none", chain=args.graph_structure == "chain",
                      max_hop=args.max_hops + 1 if args.graph_structure == "chain" else MAX_HOP,
-                     multi_seed=args.num_seeds > 1,
+                     multi_seed=args.num_seeds > 1 or args.chain_seed == "latest-per-type",
                      recency_days=args.recency_days if args.recency_attn else None,
                      time_emb=args.time_emb).to(device)
 

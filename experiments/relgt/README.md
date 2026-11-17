@@ -75,7 +75,9 @@ K = 100 tokens per example (`--num-neighbors`).
 1. **Seeds (`--chain-seed latest --num-seeds 16`).** Token 0..15 are the user's 16 latest visible
    actions (any table, newest first; fewer if the user has fewer), all hop 0. The user is a hop-1
    token. A user with no visible action keeps the user as seed. Their time is kept, so the model
-   sees how long ago the user was last active.
+   sees how long ago the user was last active. `--chain-seed latest-per-type` instead takes the latest
+   visible action of each action type as the seeds (up to 6, one per table the user has; see
+   [relgt_seedtype.md](../../docs/experiments/relgt_seedtype.md)).
 2. **Breadth-first walk** from all seeds, nearest hops first, up to `--max-hops` (50 in the exp2 and
    fk runs, 20 in exp4). Hop 1 additionally contains the latest visible row of each of the user's chains. Each
    hop's candidates are capped at 1,000 neighbours per node (random).
