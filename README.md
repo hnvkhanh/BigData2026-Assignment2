@@ -5,6 +5,11 @@ This guide runs `relgt_chain_recent`: the Relational Graph Transformer (`experim
 K = 100 slots, the newest rows win instead of random ones). The method, results and the other configs are in
 [WRITEUP.md](WRITEUP.md) and [docs/experiments/sampling.md](docs/experiments/sampling.md).
 
+## Data Source
+
+The data comes from [GH Archive](https://www.gharchive.org/), which records the public GitHub event timeline.
+We gratefully acknowledge GH Archive as the data source.
+
 ## 1. Setup
 
 ```bash
