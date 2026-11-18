@@ -306,6 +306,14 @@ class Graph:
         self.repo = np.full(self.n, -1, np.int64)  # repository node of a row, -1 if none
         self.next_row = np.full(self.n, -1, np.int64)  # chain: the actor's next row of the table
         self.actor_rel = np.full(len(TABLES), -1, np.int64)  # per table, the relation of its actor FK
+        # Parent rows, for --other-actions context: the issue of a comment, the PR of an issue / review /
+        # review comment, the assignee of an issue (-1 if none).
+        self.issue = np.full(self.n, -1, np.int64)
+        self.pr = np.full(self.n, -1, np.int64)
+        self.assignee = np.full(self.n, -1, np.int64)
+        parent = {("IssueComments", "issue_id"): self.issue, ("Issues", "pull_request_id"): self.pr,
+                  ("PRReviews", "pr_id"): self.pr, ("PRReviewComments", "pr_id"): self.pr,
+                  ("Issues", "assignee_id"): self.assignee}
         for t, name in enumerate(TABLES):
             d = frames.pop(name)
             times.append(days(d[TIME_COL[name]]))
@@ -314,6 +322,8 @@ class Graph:
                 m = ~np.isnan(v)
                 src = self.offset[t] + np.flatnonzero(m)
                 dst = self.offset[TABLES.index(ref)] + v[m].astype(np.int64)
+                if (name, col) in parent:
+                    parent[(name, col)][src] = dst
                 rel = np.full(m.sum(), RELATIONS.index((name, col)), np.int64)
                 if col == ACTOR_COL.get(name):
                     self.actor[src] = dst
@@ -523,8 +533,56 @@ def related_rows(G, src_b, src_v, src_r, visible, per_row, rng, exclude, cap1=10
     return b, v, step, path, src
 
 
+def context_filter(G, seeds, own_b, own_v, visible):
+    """--other-actions context: returns allowed(b, v), which says for each (example b, node v) whether v may be
+    a token. Rows with no actor (users, repositories) and rows of the example's own user always may. A row of
+    another user may only if it is
+      - an issue comment on an issue of the user, or on the issue of a PR of the user,
+      - a review or a review (line) comment on a PR of the user,
+      - an issue (any author) in a repository where the user has a visible push or an issue assigned to them.
+    own_b, own_v are the example's own visible activity rows (all of its chains)."""
+    n, B = G.n, len(seeds)
+    ntype = G.ntype[own_v]
+    key = lambda m: np.sort(own_b[m] * n + own_v[m])
+    own_pr = key(ntype == TABLES.index("PullRequests"))
+    own_issue = key(ntype == TABLES.index("Issues"))
+    rptr, radj, _ = G.reverse()  # rows that reference the user through a FK: the issues assigned to them
+    ab, av = expand(rptr, radj, np.arange(B), seeds)
+    m = (G.ntype[av] == TABLES.index("Issues")) & (G.assignee[av] == seeds[ab]) & visible[av]
+    ab, av = ab[m], av[m]
+    push = ntype == TABLES.index("Pushes")
+    rb = np.r_[own_b[push], ab]
+    rv = np.r_[G.repo[own_v[push]], G.repo[av]]
+    ok = rv >= 0
+    ctx_repo = np.unique(rb[ok] * n + rv[ok])
+    t_ic, t_is = TABLES.index("IssueComments"), TABLES.index("Issues")
+    t_rv, t_rc = TABLES.index("PRReviews"), TABLES.index("PRReviewComments")
+
+    def member(b, x, keys):
+        return (x >= 0) & np.isin(b * n + np.maximum(x, 0), keys)
+
+    def allowed(b, v):
+        a = G.actor[v]
+        ok = (a < 0) | (a == seeds[b])  # not an activity row, or the user's own
+        t = G.ntype[v]
+        m = ~ok & (t == t_ic)
+        if m.any():
+            issue = G.issue[v[m]]
+            pr = np.where(issue >= 0, G.pr[np.maximum(issue, 0)], -1)  # the issue's PR, if it is one
+            ok[m] = member(b[m], issue, own_issue) | member(b[m], pr, own_pr)
+        m = ~ok & ((t == t_rv) | (t == t_rc))
+        if m.any():
+            ok[m] = member(b[m], G.pr[v[m]], own_pr)
+        m = ~ok & (t == t_is)
+        if m.any():
+            ok[m] = member(b[m], G.repo[v[m]], ctx_repo)
+        return ok
+
+    return allowed
+
+
 def sample_walk(G, seeds, cutoff, K, rng, max_hops, cap1=1000, lookback=None, start="user", exclude_push=False,
-                num_seeds=1, fk_order="random", related=0):
+                num_seeds=1, fk_order="random", related=0, others="all"):
     """--graph-structure chain: K tokens per example by a breadth-first walk over the visible graph,
     nearest hops first, up to max_hops; a hop with more new nodes than the example's remaining budget
     gives a random subset. Every node reached is a token once; if they do not fill K the rest repeat
@@ -543,6 +601,13 @@ def sample_walk(G, seeds, cutoff, K, rng, max_hops, cap1=1000, lookback=None, st
 
     fk_order="recent": where nodes compete (the cap on a node's neighbours, the budget of a hop, the
     final tokens), the newer rows win instead of random ones.
+
+    others="context": an activity row of another user can be a token only if it is part of the example
+    user's own context (other_allowed): a comment (issue comment or review comment) on the user's PR or issue,
+    a review of the user's PR, or an issue opened in a repository where the user pushed or was assigned an
+    issue. Every other row of another user (pushes, PRs, other issues and comments) is left out, the walk
+    does not reach it through shared repositories or the other user's chains. Users, repositories and the
+    user's own rows are not filtered. "all": no filter.
 
     related > 0: every token that is an issue, issue comment, PR review or PR review comment (seed, walk
     row or related row) comes with up to related rows RELATED to it (related_rows: an issue's comments,
@@ -639,6 +704,8 @@ def sample_walk(G, seeds, cutoff, K, rng, max_hops, cap1=1000, lookback=None, st
     b_, a_ = b_[m], a_[m]
     last = np.r_[(b_[1:] != b_[:-1]) | (G.ntype[a_[1:]] != G.ntype[a_[:-1]]), True][:len(a_)]  # per chain
     anchor_b, anchor_v = b_[last], a_[last]
+    other_allowed = (context_filter(G, seeds, b_, a_, visible) if others == "context"
+                     else lambda b, v: np.ones(len(v), bool))
     roots = seeds.copy()
     seed_b, seed_v, seed_r = np.arange(B), seeds, np.zeros(B, np.int64)  # example, node, rank (0 = newest)
     if start in ("latest", "latest-per-type") and len(anchor_b):
@@ -679,6 +746,7 @@ def sample_walk(G, seeds, cutoff, K, rng, max_hops, cap1=1000, lookback=None, st
     for hop in range(1, max_hops + 1):
         i, v = expand(G.ptr, G.adj, np.arange(len(fb)), fv)
         m = visible[v]
+        m[m] = other_allowed(fb[i[m]], v[m])
         i, v = cap(i[m], v[m], cap1, rng, recent)
         b, par = fb[i], fv[i]
         if hop == 1:
@@ -1289,8 +1357,9 @@ def fit(make_model, S, train_ids, args, epochs, val_ids=None):
 
 
 def tokenize(G, groups, cutoffs, K, seed, budget="uniform", order="random", action_edges="none", lookback=None,
-             max_hops=None, chain_seed="user", exclude_push=False, num_seeds=1, fk_order="random", related=0):
-    """Tokens of every example, cached on disk (sampling is the slow part). max_hops and related are
+             max_hops=None, chain_seed="user", exclude_push=False, num_seeds=1, fk_order="random", related=0,
+             others="all"):
+    """Tokens of every example, cached on disk (sampling is the slow part). max_hops, related and others are
     used by the chain structure (sample_walk)."""
     mode = () if budget == "uniform" else (budget, order)
     mode += () if G.structure == "fk" else (("structure", G.structure, "latest-owner", max_hops),)
@@ -1299,6 +1368,7 @@ def tokenize(G, groups, cutoffs, K, seed, budget="uniform", order="random", acti
     mode += () if num_seeds == 1 else (("num_seeds", num_seeds),)
     mode += () if fk_order == "random" else (("fk_order", fk_order),)
     mode += () if not related else (("related-all", related),)
+    mode += () if others == "all" else (("others", others),)
     mode += () if action_edges == "none" else (("action_edges", action_edges),)
     mode += () if not lookback else (("lookback", lookback),)
     key = hashlib.md5(repr((K, seed, cutoffs.tolist(), [g.tolist() for g in groups], G.n) + mode)
@@ -1315,7 +1385,7 @@ def tokenize(G, groups, cutoffs, K, seed, budget="uniform", order="random", acti
         if G.structure == "chain":
             nd, hp, pt = sample_walk(G, seeds, cutoffs[w], K, rng, max_hops, lookback=lookback, start=chain_seed,
                                      exclude_push=exclude_push, num_seeds=num_seeds, fk_order=fk_order,
-                                     related=related)
+                                     related=related, others=others)
         else:
             nd, hp, pt = sample_tokens(G, seeds, cutoffs[w], K, rng, budget=budget, order=order, lookback=lookback,
                                        exclude_push=exclude_push, fk_order=fk_order)
@@ -1384,6 +1454,12 @@ def main():
                          "comment token comes with up to N rows related to it through its foreign keys (its "
                          "issue, PR or review, thread, replies), newest first; a walk row is taken only if they "
                          "fit too; 0 = off")
+    ap.add_argument("--other-actions", choices=["all", "context"], default="all",
+                    help="with --graph-structure chain: which activity rows of OTHER users can be tokens. all: any "
+                         "(reached through shared repositories, issues, PRs). context: only comments on the "
+                         "user's PRs / issues, reviews of the user's PRs, and issues opened in a repository where "
+                         "the user pushed or was assigned an issue; the users themselves, repositories and the "
+                         "user's own rows are not filtered")
     ap.add_argument("--recency-attn", action="store_true",
                     help="with --graph-structure chain: attend more to recent actions, in the local attention "
                          "and the readout, with a learned decay; the tokens do not change")
@@ -1438,6 +1514,10 @@ def main():
         ap.error("--related-rows must be >= 0")
     if args.related_rows and args.graph_structure != "chain":
         ap.error("--related-rows needs --graph-structure chain")
+    if args.other_actions != "all" and args.graph_structure != "chain":
+        ap.error("--other-actions context needs --graph-structure chain")
+    if args.other_actions != "all" and args.related_rows:
+        ap.error("--other-actions context does not work with --related-rows (related rows are not filtered)")
     if args.recency_attn and args.graph_structure != "chain":
         ap.error("--recency-attn needs --graph-structure chain")
     if args.recency_days <= 0:
@@ -1499,7 +1579,7 @@ def main():
     nodes, hops, paths, edges = tokenize(G, seeds, cutoffs, args.num_neighbors, args.seed, args.path_budget,
                                          args.path_order, args.action_edges, args.lookback_days, args.max_hops,
                                          args.chain_seed, args.exclude_push, args.num_seeds, args.fk_order,
-                                         args.related_rows)
+                                         args.related_rows, args.other_actions)
     ids = {w: np.arange(sizes[i], sizes[i + 1]) for i, w in enumerate(all_weeks)}
     is_test = np.zeros(n, bool)
     is_test[test_cidx] = True

@@ -94,6 +94,12 @@ comes with up to N rows related to it through its foreign keys: its issue, PR or
 comments in the thread, replies, and a review's line comments (`RELATED`). A walk row is taken only if its
 related rows fit too. See [docs/experiments/related_rows.md](../../docs/experiments/related_rows.md).
 
+**`--other-actions context`** (chain graph, default `all`): an activity row of another user can be a token
+only if it is part of the user's own context: a comment on the user's PR or issue, a review of the user's PR,
+or an issue opened in a repository where the user pushed or was assigned an issue. Pushes, PRs, other issues
+and other comments of other users are left out (`context_filter`). See
+[docs/experiments/relgt_ctx.md](../../docs/experiments/relgt_ctx.md).
+
 ## 5. Model
 
 Per token: node type, hop, relative time to `s`, row features (per-table residual MLP), and a GIN
