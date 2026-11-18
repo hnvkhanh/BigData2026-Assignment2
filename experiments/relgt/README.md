@@ -100,6 +100,9 @@ or an issue opened in a repository where the user pushed or was assigned an issu
 and other comments of other users are left out (`context_filter`). See
 [docs/experiments/relgt_ctx.md](../../docs/experiments/relgt_ctx.md).
 
+**`--max-hops`** (default 50) caps the walk depth; capping at 3, 5 or 10 did not help on one seed each. See
+[docs/experiments/relgt_hops.md](../../docs/experiments/relgt_hops.md).
+
 ## 5. Model
 
 Per token: node type, hop, relative time to `s`, row features (per-table residual MLP), and a GIN

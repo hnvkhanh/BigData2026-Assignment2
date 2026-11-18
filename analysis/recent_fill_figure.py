@@ -13,7 +13,8 @@ its age, days before its table's cut-off, on one colour scale shared by both pan
 shape is its table. Users are black stars, repositories grey hexagons.
 
 Run from the repo root:
-    python analysis/recent_fill_figure.py [--num-seeds 16] [--k 100] [--user 839357836028682] [--user-rank 0]
+    python analysis/recent_fill_figure.py [--num-seeds 16] [--k 100] [--user 839357836028682] [--user-rank 0] [--recent-days 30]
+Without --user it picks the test user with the most actions in the last --recent-days days before the cut-off.
 The output is figures/recent_fill_real.png (--out to change it). Default K is 100, as in training; the walk only
 differs between the two modes if the user has more candidates than free slots, so a user with a long history shows it.
 """
@@ -33,7 +34,7 @@ if str(ROOT) not in sys.path:
 from experiments.relgt import run as R  # noqa: E402
 from analysis.relgt_graph import table_cutoffs  # noqa: E402
 from analysis.fk_vs_chain_figures import ACTIONS, SHORT, own_rows  # noqa: E402
-from analysis.multi_seed_figure import pick_user, USER_EDGE, EDGE  # noqa: E402
+from analysis.multi_seed_figure import USER_EDGE, EDGE  # noqa: E402
 
 base, TABLES = R.base, R.TABLES
 SHAPE = dict(zip(ACTIONS, ["^", "D", "o", "P", "v", "s"]))  # one marker per activity table
@@ -50,6 +51,20 @@ def sample(G, seed, cutoff, K, num_seeds, max_hops, fk_order):
 
 def age_of(G, cutoff, v):
     return float(cutoff[G.ntype[v]] - G.time[v])
+
+
+def pick_recent_user(G, seeds, visible, cutoff, days, rank):
+    """The test user with the most non-push activity rows in the last `days` days before the cut-off.
+
+    Pushes are left out of the count: a few users have thousands, which would hide the users whose recent
+    PRs / issues / comments / reviews compete for the K slots."""
+    score = np.zeros(len(seeds))
+    for j, s in enumerate(seeds):
+        o = own_rows(G, s, visible)
+        o = o[G.ntype[o] != TABLES.index("Pushes")]
+        if len(o):
+            score[j] = (cutoff[G.ntype[o]] - G.time[o] <= days).sum() + len(o) * 1e-6
+    return int(np.argsort(-score)[rank]), score
 
 
 def layout(G, ids, hop):
@@ -104,7 +119,8 @@ def main():
     ap.add_argument("--k", type=int, default=100, help="tokens per example")
     ap.add_argument("--max-hops", type=int, default=3)
     ap.add_argument("--user", type=int, default=None, help="a test UserID; default picks one")
-    ap.add_argument("--user-rank", type=int, default=0)
+    ap.add_argument("--user-rank", type=int, default=0, help="0 = the user with the most recent actions, 1 = next...")
+    ap.add_argument("--recent-days", type=float, default=30, help="window (days before cut-off) for 'recent' when picking")
     ap.add_argument("--out", type=Path, default=ROOT / "figures" / "recent_fill_real.png")
     args = ap.parse_args()
 
@@ -116,8 +132,11 @@ def main():
     test = pd.read_csv(base.TEST_INPUT)
     cidx = pd.Series(np.arange(len(cohort)), index=cohort.github_user_id.values).loc[test.UserID].values
     seeds = G.offset[TABLES.index("Users")] + cohort.user_id.values[cidx]
-    j = (int(np.flatnonzero(test.UserID.values == args.user)[0]) if args.user
-         else pick_user(G, seeds, visible, test, args.user_rank))
+    if args.user:
+        j = int(np.flatnonzero(test.UserID.values == args.user)[0])
+    else:
+        j, score = pick_recent_user(G, seeds, visible, cutoff, args.recent_days, args.user_rank)
+        print(f"picked by most non-push rows in the last {args.recent_days} d: {int(score[j])} rows")
     seed, uid = int(seeds[j]), test.UserID.values[j]
     rows = own_rows(G, seed, visible)
     print(f"user {uid}: {len(rows)} visible activity rows")
