@@ -193,7 +193,7 @@ Mixing the four bags gives 53.37 and picking per activity 54.32, neither better 
 | [docs/experiments/gnn_chain_bag.md](docs/experiments/gnn_chain_bag.md) | seed bagging of the chain GNN, with a final (refit) stage (`runs/gnn_chain_bag_ho0927.ps1`) |
 | [docs/experiments/sampling.md](docs/experiments/sampling.md) | RelGT token sampling: graph structure x `--fk-order` (`runs/sampling_ho0927.ps1`) |
 | [docs/experiments/relgt_ablation.md](docs/experiments/relgt_ablation.md) | ablation of RelGT's sampling components: chain graph, latest seed, recent fill (`runs/relgt_ablation_ho0927.ps1`) |
-| [docs/experiments/relgt_seedtype.md](docs/experiments/relgt_seedtype.md) | RelGT seeded at the latest action of each action type (up to 6 seeds) instead of the 16 newest (`runs/relgt_seedtype_ho0927.ps1`); results pending |
+| [docs/experiments/relgt_seedtype.md](docs/experiments/relgt_seedtype.md) | RelGT seeded at the latest action of each action type (up to 6 seeds) instead of the 16 newest (`runs/relgt_seedtype_ho0927.ps1`); finished, not adopted (bag 53.6 / 52.8 vs 54.4 / 54.1 for the 16-seed pair) |
 | [docs/experiments/test_users.md](docs/experiments/test_users.md) | the chain RelGT trained on the test users only (`runs/test_users_ho0927.ps1`) |
 | [experiments/relgt/README.md](experiments/relgt/README.md) | RelGT design: node set, chain graph, visibility, token sampling |
 | [docs/experiments/relgnn.md](docs/experiments/relgnn.md) | RelGNN on the chain and fk graphs vs `gnn_chain` / `relgt_chain` (`runs/relgnn_ho0927.ps1`) |
