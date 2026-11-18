@@ -1515,6 +1515,10 @@ def main():
     ap.add_argument("--exclude-push-label", action="store_true",
                     help="do not predict push: its label is left out of the loss, validation thresholds and "
                          "AP, and the output has push = 0 for every user (the other 5 labels are unchanged)")
+    ap.add_argument("--labels", nargs="+", choices=EVENT_COLS, default=None,
+                    help="train for these labels only (one model per label, merged with "
+                         "experiments/relgt/merge_labels.py): the others are left out of the loss, validation "
+                         "thresholds and AP, and the output has them = 0; no joint thresholds")
     ap.add_argument("--history", action="store_true",
                     help="add the baseline's per-user count / recency features to the seed token")
     ap.add_argument("--review-aux", action="store_true",
@@ -1552,6 +1556,10 @@ def main():
         ap.error("--num-seeds must be in 1..num_neighbors - 1")
     if not 1 <= args.max_hops <= 120:
         ap.error("--max-hops must be in 1..120")
+    if args.labels and args.review_aux:
+        ap.error("--labels does not work with --review-aux")
+    if args.labels and args.exclude_push_label:
+        ap.error("--labels already leaves out the labels not listed; drop --exclude-push-label")
     if args.test_pre_june:
         args.train_users = args.val_users = args.final_users = "test"
         args.end = args.end or "2026-06-01"
@@ -1594,8 +1602,11 @@ def main():
     sizes = np.cumsum([0] + [len(c) for c in cidx])
     y = np.concatenate(y)
     IP = EVENT_COLS.index("push")
-    if args.exclude_push_label:  # unknown label: masked_bce and mean_ap skip it
-        y[:, IP] = np.nan
+    # Labels that are not predicted (push with --exclude-push-label, all but --labels): unknown to
+    # masked_bce and mean_ap, never above a threshold, 0 in the output.
+    off = np.array([(args.exclude_push_label and j == IP) or (args.labels is not None and k not in args.labels)
+                    for j, k in enumerate(EVENT_COLS)])
+    y[:, off] = np.nan
     if args.review_aux:  # 1 if either review label is 1, 0 if both are 0, unknown otherwise
         r, c = y[:, IR], y[:, IC]
         union = np.where((r == 1) | (c == 1), 1.0, np.where((r == 0) & (c == 0), 0.0, np.nan))
@@ -1672,12 +1683,11 @@ def main():
         print("learned recency decay: " + " ".join(f"{d:.2f}" for d in metrics["recency_decay"]))
     usel = pick(val_weeks, args.val_users)
     val_p = {w: predict(model, S, ids[w][usel[w]])[:, :len(EVENT_COLS)] for w in val_weeks}
-    if args.exclude_push_label:  # never predicted
-        for w in val_weeks:
-            val_p[w][:, IP] = -1.0
+    for w in val_weeks:  # never predicted
+        val_p[w][:, off] = -1.0
     rates, pooled, thr = {}, {}, np.zeros(len(EVENT_COLS))
     for j, k in enumerate(EVENT_COLS):
-        if args.exclude_push_label and j == IP:
+        if off[j]:
             thr[j], rates[k], pooled[k] = np.inf, 0.0, np.array([-1.0])
             metrics["per_label"][k] = {"threshold": float("inf"), "val_f1": None, "val_pred_rate": 0.0, "val_ap": None}
             print(f"{k:18s} not predicted")
@@ -1715,10 +1725,12 @@ def main():
         return tables[w][[f"y_{k}" for k in EVENT_COLS]].values[tables[w].eligible.values][usel[w]]
 
     full = [w for w in val_weeks if not np.isnan(labels(w)).any()]
-    joint, _ = review.joint_thresholds(np.concatenate([labels(w) for w in full]).astype(bool),
-                                       np.concatenate([val_p[w] for w in full]), thr, False)
-    if args.exclude_push_label:
-        joint[IP] = np.inf
+    if args.labels:  # a joint 6-label score means nothing for a single-label model
+        joint = thr.copy()
+    else:
+        joint, _ = review.joint_thresholds(np.concatenate([labels(w) for w in full]).astype(bool),
+                                           np.concatenate([val_p[w] for w in full]), thr, False)
+        joint[off] = np.inf
     metrics["variants"] = {}
     for v, t in [("per-label F1 thresholds", thr), ("joint thresholds", joint)]:
         ws = [review.score(labels(w).astype(bool), val_p[w] >= t) for w in full]
@@ -1756,7 +1768,7 @@ def main():
         truth = base.to_output(gids, {k: t[f"y_{k}"].values[m][hsel[w]] for k in EVENT_COLS})
         ph = {"final model": predict(final, S, hid)[:, :len(EVENT_COLS)],
               "validation model": predict(model, S, hid)[:, :len(EVENT_COLS)]}
-        preds = {"final model": [np.zeros(len(hid), bool) if args.exclude_push_label and j == IP else
+        preds = {"final model": [np.zeros(len(hid), bool) if off[j] else
                                  ph["final model"][:, j] >= np.quantile(ph["final model"][:, j], 1 - rates[k])
                                  for j, k in enumerate(EVENT_COLS)],
                  "validation model": [ph["validation model"][:, j] >= chosen[j] for j in range(len(EVENT_COLS))]}
@@ -1776,7 +1788,7 @@ def main():
         print("mean holdout score: " + "  ".join(f"{v} {100 * s:.2f}" for v, s in metrics["holdout_score_mean"].items()))
     out = pd.DataFrame({"UserID": test.UserID.values})
     for j, k in enumerate(EVENT_COLS):
-        if args.exclude_push_label and j == IP:
+        if off[j]:
             out[k] = 0
             continue
         out[k] = (p[:, j] >= np.quantile(p[:, j], 1 - rates[k])).astype(int)
