@@ -582,7 +582,7 @@ def context_filter(G, seeds, own_b, own_v, visible):
 
 
 def sample_walk(G, seeds, cutoff, K, rng, max_hops, cap1=1000, lookback=None, start="user", exclude_push=False,
-                num_seeds=1, fk_order="random", related=0, others="all"):
+                num_seeds=1, fk_order="random", related=0, others="all", anchors="chain"):
     """--graph-structure chain: K tokens per example by a breadth-first walk over the visible graph,
     nearest hops first, up to max_hops; a hop with more new nodes than the example's remaining budget
     gives a random subset. Every node reached is a token once; if they do not fill K the rest repeat
@@ -591,7 +591,8 @@ def sample_walk(G, seeds, cutoff, K, rng, max_hops, cap1=1000, lookback=None, st
     start="user": token 0 is the user. start="latest": token 0 is the user's latest visible action
     (the user if it has none), with num_seeds > 1 the first tokens, hop 0, are the num_seeds latest
     (fewer if it has fewer), newest first, and the user is a hop 1 token. Either way the first hop
-    holds the latest visible row of each of the user's chains that is not a seed.
+    holds the latest visible row of each of the user's chains that is not a seed (the anchors; with
+    anchors="none" they are not added: tokens come only from the seeds and what the walk reaches from them).
     start="latest-per-type": the hop-0 seeds are the latest visible row of each of the user's chains,
     that is one seed per activity table the user has (up to 6), newest first; num_seeds is not used.
 
@@ -726,6 +727,8 @@ def sample_walk(G, seeds, cutoff, K, rng, max_hops, cap1=1000, lookback=None, st
         roots = seed_v[seed_r == 0]
     keep = ~np.isin(anchor_b * G.n + anchor_v, seed_b * G.n + seed_v)
     anchor_b, anchor_v = anchor_b[keep], anchor_v[keep]
+    if anchors == "none":  # no latest-row-of-each-chain injection into hop 1
+        anchor_b, anchor_v = anchor_b[:0], anchor_v[:0]
     n_seed = np.bincount(seed_b, minlength=B)
 
     seen = np.sort(seed_b * G.n + seed_v)
@@ -1358,7 +1361,7 @@ def fit(make_model, S, train_ids, args, epochs, val_ids=None):
 
 def tokenize(G, groups, cutoffs, K, seed, budget="uniform", order="random", action_edges="none", lookback=None,
              max_hops=None, chain_seed="user", exclude_push=False, num_seeds=1, fk_order="random", related=0,
-             others="all"):
+             others="all", anchors="chain"):
     """Tokens of every example, cached on disk (sampling is the slow part). max_hops, related and others are
     used by the chain structure (sample_walk)."""
     mode = () if budget == "uniform" else (budget, order)
@@ -1369,6 +1372,7 @@ def tokenize(G, groups, cutoffs, K, seed, budget="uniform", order="random", acti
     mode += () if fk_order == "random" else (("fk_order", fk_order),)
     mode += () if not related else (("related-all", related),)
     mode += () if others == "all" else (("others", others),)
+    mode += () if anchors == "chain" else (("anchors", anchors),)
     mode += () if action_edges == "none" else (("action_edges", action_edges),)
     mode += () if not lookback else (("lookback", lookback),)
     key = hashlib.md5(repr((K, seed, cutoffs.tolist(), [g.tolist() for g in groups], G.n) + mode)
@@ -1385,7 +1389,7 @@ def tokenize(G, groups, cutoffs, K, seed, budget="uniform", order="random", acti
         if G.structure == "chain":
             nd, hp, pt = sample_walk(G, seeds, cutoffs[w], K, rng, max_hops, lookback=lookback, start=chain_seed,
                                      exclude_push=exclude_push, num_seeds=num_seeds, fk_order=fk_order,
-                                     related=related, others=others)
+                                     related=related, others=others, anchors=anchors)
         else:
             nd, hp, pt = sample_tokens(G, seeds, cutoffs[w], K, rng, budget=budget, order=order, lookback=lookback,
                                        exclude_push=exclude_push, fk_order=fk_order)
@@ -1460,6 +1464,10 @@ def main():
                          "user's PRs / issues, reviews of the user's PRs, and issues opened in a repository where "
                          "the user pushed or was assigned an issue; the users themselves, repositories and the "
                          "user's own rows are not filtered")
+    ap.add_argument("--chain-anchors", choices=["chain", "none"], default="chain",
+                    help="with --graph-structure chain: chain = hop 1 also holds the latest visible row of each of "
+                         "the user's chains that is not a seed; none = no such rows, tokens come only from the "
+                         "seeds and what the walk reaches from them")
     ap.add_argument("--recency-attn", action="store_true",
                     help="with --graph-structure chain: attend more to recent actions, in the local attention "
                          "and the readout, with a learned decay; the tokens do not change")
@@ -1518,6 +1526,8 @@ def main():
         ap.error("--other-actions context needs --graph-structure chain")
     if args.other_actions != "all" and args.related_rows:
         ap.error("--other-actions context does not work with --related-rows (related rows are not filtered)")
+    if args.chain_anchors != "chain" and args.graph_structure != "chain":
+        ap.error("--chain-anchors none needs --graph-structure chain")
     if args.recency_attn and args.graph_structure != "chain":
         ap.error("--recency-attn needs --graph-structure chain")
     if args.recency_days <= 0:
@@ -1579,7 +1589,7 @@ def main():
     nodes, hops, paths, edges = tokenize(G, seeds, cutoffs, args.num_neighbors, args.seed, args.path_budget,
                                          args.path_order, args.action_edges, args.lookback_days, args.max_hops,
                                          args.chain_seed, args.exclude_push, args.num_seeds, args.fk_order,
-                                         args.related_rows, args.other_actions)
+                                         args.related_rows, args.other_actions, args.chain_anchors)
     ids = {w: np.arange(sizes[i], sizes[i + 1]) for i, w in enumerate(all_weeks)}
     is_test = np.zeros(n, bool)
     is_test[test_cidx] = True
