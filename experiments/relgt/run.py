@@ -581,6 +581,17 @@ def context_filter(G, seeds, own_b, own_v, visible):
     return allowed
 
 
+def nopush_filter(G, seeds):
+    """--other-actions nopush: allowed(b, v) is False only for a Pushes row of a user other than the example's."""
+    t_push = TABLES.index("Pushes")
+
+    def allowed(b, v):
+        a = G.actor[v]
+        return (G.ntype[v] != t_push) | (a < 0) | (a == seeds[b])
+
+    return allowed
+
+
 def sample_walk(G, seeds, cutoff, K, rng, max_hops, cap1=1000, lookback=None, start="user", exclude_push=False,
                 num_seeds=1, fk_order="random", related=0, others="all", anchors="chain"):
     """--graph-structure chain: K tokens per example by a breadth-first walk over the visible graph,
@@ -609,6 +620,7 @@ def sample_walk(G, seeds, cutoff, K, rng, max_hops, cap1=1000, lookback=None, st
     issue. Every other row of another user (pushes, PRs, other issues and comments) is left out, the walk
     does not reach it through shared repositories or the other user's chains. Users, repositories and the
     user's own rows are not filtered. "all": no filter.
+    others="nopush": only the Pushes rows of other users are left out; everything else is as with "all".
 
     related > 0: every token that is an issue, issue comment, PR review or PR review comment (seed, walk
     row or related row) comes with up to related rows RELATED to it (related_rows: an issue's comments,
@@ -705,8 +717,12 @@ def sample_walk(G, seeds, cutoff, K, rng, max_hops, cap1=1000, lookback=None, st
     b_, a_ = b_[m], a_[m]
     last = np.r_[(b_[1:] != b_[:-1]) | (G.ntype[a_[1:]] != G.ntype[a_[:-1]]), True][:len(a_)]  # per chain
     anchor_b, anchor_v = b_[last], a_[last]
-    other_allowed = (context_filter(G, seeds, b_, a_, visible) if others == "context"
-                     else lambda b, v: np.ones(len(v), bool))
+    if others == "context":
+        other_allowed = context_filter(G, seeds, b_, a_, visible)
+    elif others == "nopush":
+        other_allowed = nopush_filter(G, seeds)
+    else:
+        other_allowed = lambda b, v: np.ones(len(v), bool)
     roots = seeds.copy()
     seed_b, seed_v, seed_r = np.arange(B), seeds, np.zeros(B, np.int64)  # example, node, rank (0 = newest)
     if start in ("latest", "latest-per-type") and len(anchor_b):
@@ -1458,12 +1474,12 @@ def main():
                          "comment token comes with up to N rows related to it through its foreign keys (its "
                          "issue, PR or review, thread, replies), newest first; a walk row is taken only if they "
                          "fit too; 0 = off")
-    ap.add_argument("--other-actions", choices=["all", "context"], default="all",
+    ap.add_argument("--other-actions", choices=["all", "context", "nopush"], default="all",
                     help="with --graph-structure chain: which activity rows of OTHER users can be tokens. all: any "
                          "(reached through shared repositories, issues, PRs). context: only comments on the "
                          "user's PRs / issues, reviews of the user's PRs, and issues opened in a repository where "
                          "the user pushed or was assigned an issue; the users themselves, repositories and the "
-                         "user's own rows are not filtered")
+                         "user's own rows are not filtered. nopush: as all, except the pushes of other users")
     ap.add_argument("--chain-anchors", choices=["chain", "none"], default="chain",
                     help="with --graph-structure chain: chain = hop 1 also holds the latest visible row of each of "
                          "the user's chains that is not a seed; none = no such rows, tokens come only from the "
