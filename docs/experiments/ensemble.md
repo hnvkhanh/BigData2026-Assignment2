@@ -211,7 +211,8 @@ tune week; the push rule moves the score by about 1 point (`prev-week` is the su
 Not supported: that mixing models beats the best bag, and that history features help (intervals include 0).
 
 Not done:
-- No second holdout week. The older holdout runs saved only `metrics.json`, so a second week means
+- A second holdout week is set up as [relgt_bag_second_week](relgt_bag_second_week.md) (week 10-03, results
+  pending). No second holdout week yet. The older holdout runs saved only `metrics.json`, so a second week means
   retraining (`HO_WEEK="<UTC start of scored week>" bash runs/ensemble_ho0927.sh`, ~2.5 h on two GPUs; for the
   bagging check alone `CONFIGS="relgt_chain" QUEUE_A="relgt_chain" QUEUE_B=""`, ~30 min a seed). The week
   still has to be chosen and checked for enough labelled data and outage handling.

@@ -421,7 +421,7 @@ def visible_nodes(G, cutoff, lookback=None, exclude_push=False):
 
 
 def sample_tokens(G, seeds, cutoff, K, rng, cap1=5000, cap2=1000, budget="uniform", order="random",
-                  lookback=None, exclude_push=False, fk_order="random"):
+                  lookback=None, exclude_push=False, fk_order="random", pad=False):
     """K tokens (node, hop) per seed from its 1- and 2-hop neighbours visible before the cutoff.
 
     fk_order="recent" prefers newer rows: the caps keep the newest neighbours and the K-1 tokens
@@ -477,7 +477,12 @@ def sample_tokens(G, seeds, cutoff, K, rng, cap1=5000, cap2=1000, budget="unifor
     has = cnt > 0
     pos = (start[:, None] + pick)[has]
     nodes[has, 1:], hops[has, 1:], paths[has, 1:] = v[pos], hop[pos], path[pos]
-    if (~has).any():
+    if pad:  # --pad-tokens: no neighbour left = no token; the slots after the last one are padding
+        empty = np.arange(K - 1)[None, :] >= cnt[:, None]
+        nodes[:, 1:][empty] = np.broadcast_to(seeds[:, None], (len(seeds), K - 1))[empty]  # any valid node
+        hops[:, 1:][empty] = MAX_HOP
+        paths[:, 1:][empty] = N_PATHS + 1
+    elif (~has).any():
         nodes[~has, 1:] = rng.choice(np.flatnonzero(visible), size=((~has).sum(), K - 1))
         hops[~has, 1:] = MAX_HOP
         paths[~has, 1:] = N_PATHS + 1
@@ -593,7 +598,7 @@ def nopush_filter(G, seeds):
 
 
 def sample_walk(G, seeds, cutoff, K, rng, max_hops, cap1=1000, lookback=None, start="user", exclude_push=False,
-                num_seeds=1, fk_order="random", related=0, others="all", anchors="chain"):
+                num_seeds=1, fk_order="random", related=0, others="all", anchors="chain", pad=False):
     """--graph-structure chain: K tokens per example by a breadth-first walk over the visible graph,
     nearest hops first, up to max_hops; a hop with more new nodes than the example's remaining budget
     gives a random subset. Every node reached is a token once; if they do not fill K the rest repeat
@@ -821,7 +826,12 @@ def sample_walk(G, seeds, cutoff, K, rng, max_hops, cap1=1000, lookback=None, st
     has = cnt > 0
     pos = (start_[:, None] + pick)[has]
     nodes[has, 1:], hops[has, 1:], paths[has, 1:] = v[pos], hop[pos], path[pos]
-    if (~has).any():
+    if pad:  # --pad-tokens: no neighbour left = no token; the slots after the seeds and the sampled rows are padding
+        empty = np.arange(1, K)[None, :] >= (n_seed + cnt)[:, None]
+        nodes[:, 1:][empty] = np.broadcast_to(seeds[:, None], (B, K - 1))[empty]  # any valid node
+        hops[:, 1:][empty] = max_hops + 1
+        paths[:, 1:][empty] = N_PATHS + 1
+    elif (~has).any():
         nodes[~has, 1:] = rng.choice(np.flatnonzero(visible), size=((~has).sum(), K - 1))
         hops[~has, 1:] = max_hops + 1
         paths[~has, 1:] = N_PATHS + 1
@@ -829,14 +839,16 @@ def sample_walk(G, seeds, cutoff, K, rng, max_hops, cap1=1000, lookback=None, st
     return nodes, hops, paths
 
 
-def action_chain(G, nodes, by_repo):
+def action_chain(G, nodes, by_repo, pad=None):
     """(seed row, token i, token j) linking each seed's activity tokens of the same actor (and
     repository if by_repo) in row-time order, i the earlier one. Only sampled, visible tokens
-    are chained, so an edge never reveals a row the example cannot see."""
+    are chained, so an edge never reveals a row the example cannot see. pad (--pad-tokens): [B, K]
+    padding slots, which are not tokens."""
     K = nodes.shape[1]
     flat = nodes.ravel()
     group = G.repo[flat] if by_repo else np.zeros(len(flat), np.int64)
-    pos = np.flatnonzero((G.actor[flat] >= 0) & (group >= 0))
+    real = np.ones(len(flat), bool) if pad is None else ~pad.ravel()
+    pos = np.flatnonzero((G.actor[flat] >= 0) & (group >= 0) & real)
     row, actor, group = pos // K, G.actor[flat[pos]], group[pos]
     o = np.lexsort((G.time[flat[pos]], group, actor, row))
     pos, row, actor, group = pos[o], row[o], actor[o], group[o]
@@ -846,7 +858,7 @@ def action_chain(G, nodes, by_repo):
     return a // K, a % K, b % K
 
 
-def subgraph_edges(G, nodes, action_edges="none", users=None, visible=None):
+def subgraph_edges(G, nodes, action_edges="none", users=None, visible=None, pad=None):
     """Edges among each seed's K tokens: (seed row, token i, token j, relation), both directions.
 
     The relation of the edge from the referencing row to the referenced one is its FK index, the
@@ -860,8 +872,13 @@ def subgraph_edges(G, nodes, action_edges="none", users=None, visible=None):
     flat = nodes.ravel()
     p, f = expand(G.fptr, G.fadj, np.arange(B * K), flat)
     rel = expand(G.fptr, G.frel, np.arange(B * K), flat)[1]
-    row = p // K
     keys = np.repeat(np.arange(B), K) * G.n + flat
+    if pad is not None:  # padding slots (--pad-tokens) have no edges: no key, no edges out of them
+        padf = pad.ravel()
+        keys = np.where(padf, -1, keys)
+        ok = ~padf[p]
+        p, f, rel = p[ok], f[ok], rel[ok]
+    row = p // K
     order = np.argsort(keys)
     q = np.minimum(np.searchsorted(keys[order], row * G.n + f), len(keys) - 1)
     hit = keys[order][q] == row * G.n + f
@@ -869,7 +886,8 @@ def subgraph_edges(G, nodes, action_edges="none", users=None, visible=None):
     if users is not None and G.structure == "chain":
         row_all = np.repeat(np.arange(B), K)
         actor, nxt = G.actor[flat], G.next_row[flat]
-        pos = np.flatnonzero((actor >= 0) & ((actor != users[row_all]) | (nxt < 0) | ~visible[nxt]))
+        pos = np.flatnonzero((actor >= 0) & ((actor != users[row_all]) | (nxt < 0) | ~visible[nxt])
+                             & (np.ones(len(flat), bool) if pad is None else ~pad.ravel()))
         target = row_all[pos] * G.n + actor[pos]
         q = np.minimum(np.searchsorted(keys[order], target), len(keys) - 1)
         hit = keys[order][q] == target
@@ -879,7 +897,7 @@ def subgraph_edges(G, nodes, action_edges="none", users=None, visible=None):
         rel = np.r_[rel, G.actor_rel[G.ntype[flat[pos[hit]]]]]
     rs, is_, js, rels = [r, r], [i, j], [j, i], [rel, np.where(rel < N_REL, rel + N_REL, rel + 1)]
     for offset, by_repo in ACTION_CHAINS[action_edges]:
-        r, i, j = action_chain(G, nodes, by_repo)
+        r, i, j = action_chain(G, nodes, by_repo, pad)
         fwd = np.full(len(r), 2 * N_REL + offset, np.int64)
         rs += [r, r]
         is_ += [i, j]
@@ -1125,7 +1143,9 @@ class LocalModule(nn.Module):
         self.final_ln = nn.LayerNorm(d)
         self.attn_layer = nn.Linear(2 * d, 1)
 
-    def forward(self, x_set, bias=None, seed_mask=None, readout_bias=None):
+    def forward(self, x_set, bias=None, seed_mask=None, readout_bias=None, pad=None):
+        """pad (--pad-tokens): [B, K] padding slots, left out of the readout. A finite fill value, not -inf, so an
+        example whose neighbours are all padding gets zero weights, not a NaN softmax."""
         x = self.att_embeddings_nope(x_set)
         for layer in self.layers:
             x = layer(x, bias)
@@ -1136,13 +1156,21 @@ class LocalModule(nn.Module):
             logits = self.attn_layer(torch.cat([node.expand_as(x), x], 2))
             if readout_bias is not None:
                 logits = logits + readout_bias
+            if pad is not None:
+                skip = m | pad.unsqueeze(-1)
+                w = F.softmax(logits.masked_fill(skip, -1e9), dim=1) * (~skip)
+                return (node + (x * w).sum(1, keepdim=True)).squeeze(1)
             logits = logits.masked_fill(m, -math.inf)
             return (node + (x * F.softmax(logits, dim=1)).sum(1, keepdim=True)).squeeze(1)
         node, nbr = x[:, :1], x[:, 1:]
         logits = self.attn_layer(torch.cat([node.expand_as(nbr), nbr], 2))
         if readout_bias is not None:
             logits = logits + readout_bias[:, 1:]
-        w = F.softmax(logits, dim=1)
+        if pad is not None:
+            skip = pad[:, 1:].unsqueeze(-1)
+            w = F.softmax(logits.masked_fill(skip, -1e9), dim=1) * (~skip)
+        else:
+            w = F.softmax(logits, dim=1)
         return (node + (nbr * w).sum(1, keepdim=True)).squeeze(1)
 
 
@@ -1209,10 +1237,10 @@ class RelGTLayer(nn.Module):
             self.c_idx[seed_idx] = self.vq.update(q_x.detach())
         return out
 
-    def forward(self, x_set, x, seed_idx, bias=None, seed_mask=None, readout_bias=None):
+    def forward(self, x_set, x, seed_idx, bias=None, seed_mask=None, readout_bias=None, pad=None):
         out = []
         if self.conv_type != "global":
-            out.append(self.layer_norm_local(self.local_module(x_set, bias, seed_mask, readout_bias)))
+            out.append(self.layer_norm_local(self.local_module(x_set, bias, seed_mask, readout_bias, pad)))
         if self.conv_type != "local":
             out.append(self.layer_norm_global(self.global_forward(x, seed_idx)))
         return torch.cat(out, 1)
@@ -1224,9 +1252,10 @@ class RelGT(nn.Module):
     def __init__(self, G, cutoffs, week_day, num_seeds, n_out, channels=128, local_layers=1, heads=4,
                  dropout=0.3, num_centroids=1024, conv_type="full", ablate="none", n_seed_feats=0,
                  path_token=False, rel_pe=False, attn_bias=False, action_edges=False, chain=False,
-                 max_hop=MAX_HOP, multi_seed=False, recency_days=None, time_emb="sin"):
+                 max_hop=MAX_HOP, multi_seed=False, recency_days=None, time_emb="sin", pad=False):
         super().__init__()
         c = channels
+        self.pad_hop = max_hop if pad else None  # --pad-tokens: the fallback hop marks the padding slots
         self.multi_seed = multi_seed  # several hop-0 tokens per example (--num-seeds > 1)
         n_rel = N_ALL_REL if chain else 2 * N_REL + (2 * N_ACTION_REL if action_edges else 0)
         self.rows = RowEncoder(G, cutoffs, week_day, c, dropout)
@@ -1275,11 +1304,15 @@ class RelGT(nn.Module):
         if self.recency is not None:
             recent, readout_bias = self.recency(age, types)
             bias = recent if bias is None else bias + recent
+        pad = None if self.pad_hop is None else hops == self.pad_hop  # [B, K]; the seed is never padding
+        if pad is not None:  # no token attends to a padding slot
+            no_pad = torch.zeros(B, 1, 1, K, device=nodes.device).masked_fill(pad[:, None, None, :], -math.inf)
+            bias = no_pad if bias is None else bias + no_pad
         query = x_set[:, 0]  # to the global codebook
         if seed_mask is not None:
             m = seed_mask.unsqueeze(-1)
             query = (x_set * m).sum(1) / m.sum(1)
-        out = self.ff(self.conv(x_set, query, seed_idx, bias, seed_mask, readout_bias))
+        out = self.ff(self.conv(x_set, query, seed_idx, bias, seed_mask, readout_bias, pad))
         return self.head(out)
 
 
@@ -1377,9 +1410,10 @@ def fit(make_model, S, train_ids, args, epochs, val_ids=None):
 
 def tokenize(G, groups, cutoffs, K, seed, budget="uniform", order="random", action_edges="none", lookback=None,
              max_hops=None, chain_seed="user", exclude_push=False, num_seeds=1, fk_order="random", related=0,
-             others="all", anchors="chain"):
+             others="all", anchors="chain", pad=False):
     """Tokens of every example, cached on disk (sampling is the slow part). max_hops, related and others are
-    used by the chain structure (sample_walk)."""
+    used by the chain structure (sample_walk). pad (--pad-tokens): an example with fewer than K tokens keeps its
+    last slots as padding (hop = the fallback hop) instead of repeating its tokens / drawing random nodes."""
     mode = () if budget == "uniform" else (budget, order)
     mode += () if G.structure == "fk" else (("structure", G.structure, "latest-owner", max_hops),)
     mode += () if chain_seed == "user" else (("chain_seed", chain_seed),)
@@ -1391,6 +1425,7 @@ def tokenize(G, groups, cutoffs, K, seed, budget="uniform", order="random", acti
     mode += () if anchors == "chain" else (("anchors", anchors),)
     mode += () if action_edges == "none" else (("action_edges", action_edges),)
     mode += () if not lookback else (("lookback", lookback),)
+    mode += () if not pad else (("pad",),)
     key = hashlib.md5(repr((K, seed, cutoffs.tolist(), [g.tolist() for g in groups], G.n) + mode)
                       .encode()).hexdigest()
     path = CACHE_DIR / f"tokens2_K{K}_{key[:12]}.npz"  # 2: with token paths and edge relations
@@ -1405,11 +1440,13 @@ def tokenize(G, groups, cutoffs, K, seed, budget="uniform", order="random", acti
         if G.structure == "chain":
             nd, hp, pt = sample_walk(G, seeds, cutoffs[w], K, rng, max_hops, lookback=lookback, start=chain_seed,
                                      exclude_push=exclude_push, num_seeds=num_seeds, fk_order=fk_order,
-                                     related=related, others=others, anchors=anchors)
+                                     related=related, others=others, anchors=anchors, pad=pad)
         else:
             nd, hp, pt = sample_tokens(G, seeds, cutoffs[w], K, rng, budget=budget, order=order, lookback=lookback,
-                                       exclude_push=exclude_push, fk_order=fk_order)
-        r, i, j, rel = subgraph_edges(G, nd, action_edges, seeds, visible_nodes(G, cutoffs[w], lookback, exclude_push))
+                                       exclude_push=exclude_push, fk_order=fk_order, pad=pad)
+        pad_hop = max_hops + 1 if G.structure == "chain" else MAX_HOP
+        r, i, j, rel = subgraph_edges(G, nd, action_edges, seeds, visible_nodes(G, cutoffs[w], lookback, exclude_push),
+                                      pad=(hp == pad_hop) if pad else None)
         nodes.append(nd.astype(np.int32))
         hops.append(hp)
         paths.append(pt)
@@ -1484,6 +1521,11 @@ def main():
                     help="with --graph-structure chain: chain = hop 1 also holds the latest visible row of each of "
                          "the user's chains that is not a seed; none = no such rows, tokens come only from the "
                          "seeds and what the walk reaches from them")
+    ap.add_argument("--pad-tokens", action="store_true",
+                    help="when an example has fewer than K tokens (no visible neighbour left to add) its last slots "
+                         "are padding: masked out of attention and of the readout, and without subgraph edges. "
+                         "Default: they repeat random tokens of the example (some neighbours, but not all) or, with "
+                         "no neighbour at all, random visible nodes")
     ap.add_argument("--recency-attn", action="store_true",
                     help="with --graph-structure chain: attend more to recent actions, in the local attention "
                          "and the readout, with a learned decay; the tokens do not change")
@@ -1527,6 +1569,11 @@ def main():
     for stage, what in [("train", "training"), ("val", "validation / thresholds"), ("final", "final fit")]:
         g.add_argument(f"--{stage}-users", choices=USER_SETS, default="all",
                        help=f"users whose examples are used for {what}")
+    g.add_argument("--train-pool", choices=["eligible", "cohort"], default="eligible",
+                   help="eligible: the examples of every week are its eligible users (>= 3 records in the 90 days "
+                        "before the shifted selection time). cohort: the training and final-fit weeks also take every "
+                        "other cohort user as an example (no exclusion). Early stopping, decision shares, holdout "
+                        "and test still use the eligible users, so scores stay comparable")
     g.add_argument("--test-pre-june", action="store_true",
                    help="shortcut: test users only for every stage and --end 2026-06-01 (unless --end is given)")
     ap.add_argument("--name", default="default", help="output sub-directory")
@@ -1560,6 +1607,8 @@ def main():
         ap.error("--labels does not work with --review-aux")
     if args.labels and args.exclude_push_label:
         ap.error("--labels already leaves out the labels not listed; drop --exclude-push-label")
+    if args.train_pool == "cohort" and (args.train_users != "all" or args.final_users != "all" or args.test_pre_june):
+        ap.error("--train-pool cohort needs --train-users all and --final-users all (and no --test-pre-june)")
     if args.test_pre_june:
         args.train_users = args.val_users = args.final_users = "test"
         args.end = args.end or "2026-06-01"
@@ -1589,14 +1638,21 @@ def main():
                          for t in TABLES] for s in all_weeks], np.float32)
     week_day = np.array([(s - base.DATA_START) / DAY for s in all_weeks], np.float32)
 
-    # Examples: eligible users of every labelled week, then the test users.
-    cidx, week, y = [], [], []
+    # Examples: eligible users of every labelled week, then the test users. --train-pool cohort puts every other
+    # cohort user after the eligible ones of the same week, for the weeks of the training and final fits (the seed
+    # groups of tokenize() are per week); cidx_el keeps the eligible part, which validation / holdout / test use.
+    pool_weeks = set(train_weeks) | set(final_weeks) if args.train_pool == "cohort" else set()
+    cidx, cidx_el, week, y = [], [], [], []
     for i, w in enumerate(weeks):
-        m = np.flatnonzero(tables[w].eligible.values)
-        cidx.append(m)
-        week.append(np.full(len(m), i))
-        y.append(tables[w][[f"y_{k}" for k in EVENT_COLS]].values[m])
+        elig = tables[w].eligible.values
+        m = np.flatnonzero(elig)
+        full = np.concatenate([m, np.flatnonzero(~elig)]) if w in pool_weeks else m
+        cidx.append(full)
+        cidx_el.append(m)
+        week.append(np.full(len(full), i))
+        y.append(tables[w][[f"y_{k}" for k in EVENT_COLS]].values[full])
     cidx.append(test_cidx)
+    cidx_el.append(test_cidx)
     week.append(np.full(len(test_cidx), len(weeks)))
     y.append(np.full((len(test_cidx), len(EVENT_COLS)), np.nan))
     sizes = np.cumsum([0] + [len(c) for c in cidx])
@@ -1616,12 +1672,13 @@ def main():
     nodes, hops, paths, edges = tokenize(G, seeds, cutoffs, args.num_neighbors, args.seed, args.path_budget,
                                          args.path_order, args.action_edges, args.lookback_days, args.max_hops,
                                          args.chain_seed, args.exclude_push, args.num_seeds, args.fk_order,
-                                         args.related_rows, args.other_actions, args.chain_anchors)
-    ids = {w: np.arange(sizes[i], sizes[i + 1]) for i, w in enumerate(all_weeks)}
+                                         args.related_rows, args.other_actions, args.chain_anchors, args.pad_tokens)
+    ids = {w: np.arange(sizes[i], sizes[i] + len(cidx_el[i])) for i, w in enumerate(all_weeks)}  # eligible users
+    extra_ids = {w: np.arange(sizes[i] + len(cidx_el[i]), sizes[i + 1]) for i, w in enumerate(all_weeks)}
     is_test = np.zeros(n, bool)
     is_test[test_cidx] = True
     user_sets = {"all": np.ones(n, bool), "test": is_test, "exclude-test": ~is_test}
-    cid = dict(zip(all_weeks, cidx))  # cohort index of each week's examples
+    cid = dict(zip(all_weeks, cidx_el))  # cohort index of each week's eligible examples
 
     def pick(wks, mode):
         """Boolean masks (per week) of the examples of the chosen user set."""
@@ -1636,6 +1693,12 @@ def main():
     all_ids = select(final_weeks, args.final_users)
     if not len(train_ids) or not len(val_ids) or not len(all_ids):
         raise SystemExit("no examples for the chosen weeks and user sets")
+    n_eligible = len(train_ids)
+    if args.train_pool == "cohort":  # the other cohort users of the training / final-fit weeks
+        train_ids = np.concatenate([train_ids] + [extra_ids[w] for w in train_weeks])
+        all_ids = np.concatenate([all_ids] + [extra_ids[w] for w in final_weeks])
+        print(f"--train-pool cohort: {n_eligible:,} eligible + {len(train_ids) - n_eligible:,} other cohort "
+              f"training examples")
     print(f"{len(train_ids):,} training examples, {len(val_ids):,} validation, {len(ids[base.TEST_START]):,} test")
 
     # Per-user seed features: log1p, standardised on the training examples.
@@ -1669,7 +1732,7 @@ def main():
                      max_hop=args.max_hops + 1 if args.graph_structure == "chain" else MAX_HOP,
                      multi_seed=args.num_seeds > 1 or args.chain_seed == "latest-per-type",
                      recency_days=args.recency_days if args.recency_attn else None,
-                     time_emb=args.time_emb).to(device)
+                     time_emb=args.time_emb, pad=args.pad_tokens).to(device)
 
     print(f"model parameters: {sum(p.numel() for p in make_model().parameters()):,}")
     model, best_epoch, history = fit(make_model, S, train_ids, args, args.epochs, val_ids=val_ids)
