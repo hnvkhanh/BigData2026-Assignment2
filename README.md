@@ -119,10 +119,89 @@ python assignment2/scripts/evaluate.py --pred experiments/relgt/outputs/relgt_ch
 (step 1 above) is a valid submission too, but it is the weaker, unbagged model. The 54.06 above is a holdout-week
 result of the ensemble script; the submission bag has not been scored on a holdout week.
 
-## 5. Troubleshooting
+## 5. Ablation studies
+
+Each ablation changes one setting of `relgt_chain` / `relgt_chain_recent` and keeps the rest of the protocol of
+section 3: same weeks, 15 epochs, seeds 0-2, runs named `<cfg>_ens0926_s<seed>`. Every script takes the options of
+section 3 (`-Gpus`, `-Seeds`, `-Configs`, `-Smoke`, `-SkipRuns`, ...) and ends with `summarize_runs.py` and the seed-bag
+comparison. To compare with the reference, first run `relgt_chain` and `relgt_chain_recent` (section 3, `-Configs
+relgt_chain,relgt_chain_recent`). The scripts don't rerun the reference configs.
+
+### 5.1 Does leaving out other users' actions help? (`--other-actions`)
+
+On the chain graph the token walk also reaches other users' rows through shared repositories, issues and PRs.
+`--other-actions context` keeps another user's row only when it is context for the user: a comment on, or a review of,
+the user's own PR or issue, or an issue opened in a repository the user pushes to or is assigned in. All other rows of
+other users are dropped. Details: [docs/experiments/relgt_ctx.md](docs/experiments/relgt_ctx.md).
+
+```powershell
+.\runs\relgt_ctx_ho0927.ps1              # relgt_chain_ctx, relgt_chain_ctx_recent x seeds 0-2, GPUs 0 and 1
+.\runs\relgt_ctx_ho0927.ps1 -Seeds 0     # one seed per config
+.\runs\relgt_ctx_ho0927.ps1 -Smoke       # pipeline check
+.\runs\relgt_ctx_ho0927.ps1 -SkipRuns    # only the summaries
+```
+
+One run by hand:
+
+```bash
+python experiments/relgt/run.py --graph-structure chain --chain-seed latest --num-seeds 16 --other-actions context \
+    --fk-order recent --epochs 15 --end "2026-10-03 16:00" --holdout-weeks 1 --val-start "2026-09-19 16:00" \
+    --val-end "2026-09-26 16:00" --seed 0 --name relgt_chain_ctx_recent_ens0926_s0
+```
+
+Compare (also run by the script):
+
+```bash
+python experiments/ensemble/run.py --suffix ens0926 relgt_chain relgt_chain_ctx relgt_chain_recent relgt_chain_ctx_recent
+```
+
+Result: no gain. The per-seed mean is 52.58 against 52.59 (`ctx` vs `relgt_chain`) and 52.91 against 53.41 (`ctx_recent` vs
+`relgt_chain_recent`), and issue and review comments lose the most.
+
+A milder variant drops only other users' **pushes** (`--other-actions nopush`; their PRs, issues, comments and reviews
+stay). Its script `.\runs\relgt_nopush_ho0927.ps1` runs `relgt_chain_nopush` and `relgt_chain_nopush_recent`, with seed
+42 by default (add `-Seeds 0 1 2` for a bag). It has no results write-up yet. `--other-actions` needs
+`--graph-structure chain` and can't be combined with `--related-rows`.
+
+### 5.2 Seeding at the latest action of each type (`--chain-seed latest-per-type`)
+
+The reference seeds the walk at the user's 16 newest actions of any type, and 73% of those seeds are pushes.
+`--chain-seed latest-per-type` seeds instead at the newest action of **each** action type (PR, issue, issue comment, PR
+review, PR review comment, push), which gives up to 6 seeds, newest first. The walk gets the token slots that the
+16-seed mode spent on seeds. Details: [docs/experiments/relgt_seedtype.md](docs/experiments/relgt_seedtype.md).
+
+```powershell
+.\runs\relgt_seedtype_ho0927.ps1              # relgt_chain_type, relgt_chain_type_recent x seeds 0-2, GPUs 0 and 1
+.\runs\relgt_seedtype_ho0927.ps1 -Seeds 0     # one seed per config
+.\runs\relgt_seedtype_ho0927.ps1 -Smoke       # pipeline check
+.\runs\relgt_seedtype_ho0927.ps1 -SkipRuns    # only the summaries
+```
+
+One run by hand (no `--num-seeds`: the number of seeds is the number of action types the user has):
+
+```bash
+python experiments/relgt/run.py --graph-structure chain --chain-seed latest-per-type --fk-order recent \
+    --epochs 15 --end "2026-10-03 16:00" --holdout-weeks 1 --val-start "2026-09-19 16:00" \
+    --val-end "2026-09-26 16:00" --seed 0 --name relgt_chain_type_recent_ens0926_s0
+```
+
+Compare (also run by the script):
+
+```bash
+python experiments/ensemble/run.py --suffix ens0926 relgt_chain relgt_chain_type relgt_chain_recent relgt_chain_type_recent
+```
+
+Result: no gain. The per-seed mean is 52.48 against 52.59 and 52.53 against 53.41, and the validation models are
+clearly worse (about 50.0 against 52.1-52.3).
+
+The other ablations (token sampling components, hops, related rows, pooling, ...) each have their own
+`runs/relgt_*_ho0927.ps1` script and a write-up in [docs/experiments/](docs/experiments/).
+
+## 6. Troubleshooting
 
 - *Out of memory*: lower `--batch-size` (default 512), or give the job a free GPU with `-Gpus`.
-- *`unknown config`*: `-Configs` takes `relgt_chain`, `relgt_chain_recent`, `relgt_fk`, `relgt_fk_recent`.
+- *`unknown config`*: `sampling_ho0927.ps1 -Configs` takes `relgt_chain`, `relgt_chain_recent`, `relgt_fk`,
+  `relgt_fk_recent`; each ablation script takes the configs in its header comment.
 - *The script waits with "gpu busy"*: another program uses more than `-FreeMiB` MiB on it; free the card or
   raise `-FreeMiB`.
 - *Rerun from scratch*: delete `experiments/relgt/outputs/<run>/` (and `experiments/relgt/cache/` to resample
