@@ -1744,9 +1744,28 @@ def main():
     if model.recency is not None:  # per head, then the readout
         metrics["recency_decay"] = model.recency.decay().tolist()
         print("learned recency decay: " + " ".join(f"{d:.2f}" for d in metrics["recency_decay"]))
-    usel = pick(val_weeks, args.val_users)
-    val_p = {w: predict(model, S, ids[w][usel[w]])[:, :len(EVENT_COLS)] for w in val_weeks}
-    for w in val_weeks:  # never predicted
+    # A label with no known value in the validation weeks (push, whose data ends at FEED_END, when the
+    # validation weeks are the last labelled ones) is tuned on the latest earlier weeks that have it. Those
+    # are training weeks of the validation model, so its share of positives is an in-sample estimate.
+    def known(w, k):
+        return not np.isnan(tables[w][f"y_{k}"].values[tables[w].eligible.values]).all()
+
+    tune_weeks = {}
+    for j, k in enumerate(EVENT_COLS):
+        if off[j] or any(known(w, k) for w in val_weeks):
+            tune_weeks[k] = list(val_weeks)
+            continue
+        earlier = [w for w in sorted(train_weeks) if w < min(val_weeks) and known(w, k)]
+        tune_weeks[k] = earlier[-len(val_weeks):]
+        if not tune_weeks[k]:
+            raise SystemExit(f"{k}: no labelled week to tune the threshold on")
+        print(f"{k}: no labels in the validation weeks, tuned on the training weeks "
+              f"{[str(w)[:10] for w in tune_weeks[k]]}")
+    metrics["tune_weeks"] = {k: [str(w)[:10] for w in ws] for k, ws in tune_weeks.items()}
+    pred_weeks = sorted({w for ws in tune_weeks.values() for w in ws} | set(val_weeks))
+    usel = pick(pred_weeks, args.val_users)
+    val_p = {w: predict(model, S, ids[w][usel[w]])[:, :len(EVENT_COLS)] for w in pred_weeks}
+    for w in pred_weeks:  # never predicted
         val_p[w][:, off] = -1.0
     rates, pooled, thr = {}, {}, np.zeros(len(EVENT_COLS))
     for j, k in enumerate(EVENT_COLS):
@@ -1756,8 +1775,8 @@ def main():
             print(f"{k:18s} not predicted")
             continue
         yv = np.concatenate([tables[w][f"y_{k}"].values[tables[w].eligible.values][usel[w]]
-                             for w in val_weeks])
-        pv = np.concatenate([val_p[w][:, j] for w in val_weeks])
+                             for w in tune_weeks[k]])
+        pv = np.concatenate([val_p[w][:, j] for w in tune_weeks[k]])
         m = ~np.isnan(yv)
         pooled[k] = pv[m]
         thr[j], f1 = base.best_threshold(yv[m], pv[m])
@@ -1780,26 +1799,33 @@ def main():
         r = {"week": str(w), "users": int(usel[w].sum()), **base.scores(pred, truth)}
         metrics["validation"].append(r)
         print(f"validation {str(w)[:10]}: score {100 * r['score']:.2f}")
-    metrics["val_score_mean"] = float(np.mean([r["score"] for r in metrics["validation"]]))
-    print(f"mean validation score {100 * metrics['val_score_mean']:.2f}")
+    if metrics["validation"]:
+        metrics["val_score_mean"] = float(np.mean([r["score"] for r in metrics["validation"]]))
+        print(f"mean validation score {100 * metrics['val_score_mean']:.2f}")
+    else:
+        print("no validation week has all 6 labels: no validation score")
 
     # Thresholds tuned jointly on the score over the same weeks (experiments/gnn_review); kept if better.
     def labels(w):
         return tables[w][[f"y_{k}" for k in EVENT_COLS]].values[tables[w].eligible.values][usel[w]]
 
     full = [w for w in val_weeks if not np.isnan(labels(w)).any()]
-    if args.labels:  # a joint 6-label score means nothing for a single-label model
-        joint = thr.copy()
-    else:
-        joint, _ = review.joint_thresholds(np.concatenate([labels(w) for w in full]).astype(bool),
-                                           np.concatenate([val_p[w] for w in full]), thr, False)
-        joint[off] = np.inf
     metrics["variants"] = {}
-    for v, t in [("per-label F1 thresholds", thr), ("joint thresholds", joint)]:
-        ws = [review.score(labels(w).astype(bool), val_p[w] >= t) for w in full]
-        metrics["variants"][v] = {"weekly": ws, "mean": float(np.mean(ws)), "thresholds": t.tolist()}
-        print(f"  {v:25s} " + "  ".join(f"{100 * s:.2f}" for s in ws) + f"   mean {100 * np.mean(ws):.2f}")
-    metrics["chosen"] = max(metrics["variants"], key=lambda v: metrics["variants"][v]["mean"])
+    if not full:  # no week to score the joint thresholds on (e.g. push unlabelled in every validation week)
+        metrics["variants"]["per-label F1 thresholds"] = {"weekly": [], "mean": None, "thresholds": thr.tolist()}
+        metrics["chosen"] = "per-label F1 thresholds"
+    else:
+        if args.labels:  # a joint 6-label score means nothing for a single-label model
+            joint = thr.copy()
+        else:
+            joint, _ = review.joint_thresholds(np.concatenate([labels(w) for w in full]).astype(bool),
+                                               np.concatenate([val_p[w] for w in full]), thr, False)
+            joint[off] = np.inf
+        for v, t in [("per-label F1 thresholds", thr), ("joint thresholds", joint)]:
+            ws = [review.score(labels(w).astype(bool), val_p[w] >= t) for w in full]
+            metrics["variants"][v] = {"weekly": ws, "mean": float(np.mean(ws)), "thresholds": t.tolist()}
+            print(f"  {v:25s} " + "  ".join(f"{100 * s:.2f}" for s in ws) + f"   mean {100 * np.mean(ws):.2f}")
+        metrics["chosen"] = max(metrics["variants"], key=lambda v: metrics["variants"][v]["mean"])
     chosen = np.array(metrics["variants"][metrics["chosen"]]["thresholds"])
     rates = {k: float((pooled[k] >= chosen[j]).mean()) for j, k in enumerate(EVENT_COLS)}
     print(f"chosen: {metrics['chosen']}")

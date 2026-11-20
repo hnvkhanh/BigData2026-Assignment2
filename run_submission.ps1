@@ -36,7 +36,7 @@ $pfx = ""; $fast = @("--epochs", "15")
 if ($Smoke) { $pfx = "smoke_"; $Seeds = @(0); $fast = @("--epochs", "1", "--max-steps-per-epoch", "30") }
 $logDir = "experiments\relgt\outputs\logs"
 New-Item -ItemType Directory -Force $logDir | Out-Null
-$runs = $Seeds | ForEach-Object { "${pfx}${Name}_test_s$_" }
+$runs = @($Seeds | ForEach-Object { "${pfx}${Name}_test_s$_" })   # @(): an array even for one seed
 $bag = "${pfx}${Name}_bag"
 
 function Now { Get-Date -Format "yyyy-MM-dd HH:mm:ss" }
