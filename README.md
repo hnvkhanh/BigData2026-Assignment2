@@ -13,15 +13,18 @@ We gratefully acknowledge GH Archive as the data source.
 ## 1. Setup
 
 ```bash
-pip install -r requirements.txt            # needs a CUDA build of torch for a reasonable run time
+pip install torch==2.14.1 --index-url https://download.pytorch.org/whl/cu130   # CUDA 13.0 build, as used
+pip install -r requirements.txt
 git clone --depth 1 https://github.com/nycubigdata-2026fall/BigData2026-Assignment2.git assignment2
-python scripts/download_gharchive.py --out data/gharchive --cohort-only   # GH Archive hours, 2025-12-01 (UTC) to now
+python scripts/download_gharchive.py --out data/gharchive --cohort-only --start 2025-12-01 --end 2026-11-16T09:00
 python assignment2/scripts/preprocess.py --raw data/gharchive --out data  # writes the tables to data/db/
 ```
 
+- **Use exactly this download range** (UTC; the last hour fetched is 2026-11-16 08:00-09:00) to reproduce the
+  submitted output. The code derives the training / validation weeks and each table's visibility cutoff from the
+  last moment in the data, so a different range trains a different model.
 - `assignment2/` (course data) must sit at the repo root; the tables are read from `data/db/`.
-  `download_gharchive.py` takes `--start` / `--end` (UTC hours) to change the range; `--cohort-only` keeps only
-  the lines `preprocess.py` uses. See *Setup* in [WRITEUP.md](WRITEUP.md).
+  `--cohort-only` keeps only the lines `preprocess.py` uses. See *Setup* in [WRITEUP.md](WRITEUP.md).
 - One GPU with a few GB free is enough. A run takes about 15-25 min of training, plus a one-off token sampling
   of about 6.5 min per seed for this config (cached in `experiments/relgt/cache/`, so a rerun is faster).
 - Python: the scripts use `python` from the active environment; PowerShell scripts fall back to
@@ -116,6 +119,11 @@ row per user of `assignment2/submission/test_input.csv`, six 0/1 columns). The f
 python assignment2/scripts/evaluate.py --pred experiments/relgt/outputs/relgt_chain_recent_bag/output.csv \
     --input assignment2/submission/test_input.csv
 ```
+
+**Reproducibility.** With the data range of section 1 and the pinned versions in `requirements.txt`, the
+seeds (0-2) fix the token sampling and the training order, but GPU kernels are not bit-exact (deterministic
+algorithms are not forced), so a rerun can differ from the submitted `output_314561007.csv` for a few users near
+each activity's cut.
 
 `evaluate.py` only checks the format here: the test labels do not exist yet. A single run's `output.csv`
 (step 1 above) is a valid submission too, but it is the weaker, unbagged model. The 54.06 above is a holdout-week

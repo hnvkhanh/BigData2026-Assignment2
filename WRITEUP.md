@@ -45,15 +45,17 @@ To run the best RelGT variant (chain graph + `--fk-order recent`) see [README.md
 ## Setup
 
 ```bash
+pip install torch==2.14.1 --index-url https://download.pytorch.org/whl/cu130   # CUDA 13.0 build, as used
 pip install -r requirements.txt
 git clone --depth 1 https://github.com/nycubigdata-2026fall/BigData2026-Assignment2.git assignment2
-python scripts/download_gharchive.py --out data/gharchive --cohort-only   # GH Archive hours, 2025-12-01 (UTC) to now
+python scripts/download_gharchive.py --out data/gharchive --cohort-only --start 2025-12-01 --end 2026-11-16T09:00
 python assignment2/scripts/preprocess.py --raw data/gharchive --out data  # writes the tables to data/db/
 ```
 
 `assignment2/` (the course data) is not committed; it must sit at the repo root. The tables are read
-from `data/db/`. `download_gharchive.py` fetches hours from `--start` (default `2025-12-01`, UTC) up to
-`--end` (default: now); `--cohort-only` keeps only the lines `preprocess.py` uses, which saves disk.
+from `data/db/`. The download range above (UTC, `--end` exclusive) is the one the submission was built from;
+keep it to reproduce the submitted output, since the training / validation weeks and the visibility cutoffs
+follow the last moment in the data. `--cohort-only` keeps only the lines `preprocess.py` uses, which saves disk.
 
 ## Repository layout
 

@@ -1,9 +1,10 @@
-pandas
+# Versions used for the submitted output (output_314561007.csv); other versions may change the results.
+pandas==3.1.1
 pyarrow
-numpy
+numpy==2.5.5
 lightgbm>=4.0
 scikit-learn
-torch
+torch==2.14.1  # CUDA 13.0 build: pip install torch==2.14.1 --index-url https://download.pytorch.org/whl/cu130
 dash>=2.17
 plotly>=5.0
 graphviz
