@@ -15,11 +15,13 @@ We gratefully acknowledge GH Archive as the data source.
 ```bash
 pip install -r requirements.txt            # needs a CUDA build of torch for a reasonable run time
 git clone --depth 1 https://github.com/nycubigdata-2026fall/BigData2026-Assignment2.git assignment2
+python scripts/download_gharchive.py --out data/gharchive --cohort-only   # GH Archive hours, 2025-12-01 (UTC) to now
+python assignment2/scripts/preprocess.py --raw data/gharchive --out data  # writes the tables to data/db/
 ```
 
-- `assignment2/` (course data) must sit at the repo root and the tables must exist in `data/db/` (built with
-  `assignment2/scripts/preprocess.py --out data`, from GH Archive hours fetched by
-  `python scripts/download_gharchive.py --out data/gharchive --cohort-only`). See *Setup* in [WRITEUP.md](WRITEUP.md).
+- `assignment2/` (course data) must sit at the repo root; the tables are read from `data/db/`.
+  `download_gharchive.py` takes `--start` / `--end` (UTC hours) to change the range; `--cohort-only` keeps only
+  the lines `preprocess.py` uses. See *Setup* in [WRITEUP.md](WRITEUP.md).
 - One GPU with a few GB free is enough. A run takes about 15-25 min of training, plus a one-off token sampling
   of about 6.5 min per seed for this config (cached in `experiments/relgt/cache/`, so a rerun is faster).
 - Python: the scripts use `python` from the active environment; PowerShell scripts fall back to

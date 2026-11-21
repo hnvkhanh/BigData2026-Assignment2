@@ -47,11 +47,13 @@ To run the best RelGT variant (chain graph + `--fk-order recent`) see [README.md
 ```bash
 pip install -r requirements.txt
 git clone --depth 1 https://github.com/nycubigdata-2026fall/BigData2026-Assignment2.git assignment2
+python scripts/download_gharchive.py --out data/gharchive --cohort-only   # GH Archive hours, 2025-12-01 (UTC) to now
+python assignment2/scripts/preprocess.py --raw data/gharchive --out data  # writes the tables to data/db/
 ```
 
 `assignment2/` (the course data) is not committed; it must sit at the repo root. The tables are read
-from `data/db/`, built by the course's `assignment2/scripts/preprocess.py --out data` from GH Archive
-hour files (`scripts/download_gharchive.py --out data/gharchive --cohort-only` fetches them).
+from `data/db/`. `download_gharchive.py` fetches hours from `--start` (default `2025-12-01`, UTC) up to
+`--end` (default: now); `--cohort-only` keeps only the lines `preprocess.py` uses, which saves disk.
 
 ## Repository layout
 
